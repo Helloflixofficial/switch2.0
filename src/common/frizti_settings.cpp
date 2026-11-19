@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <fmt/format.h>
 #include "common/frizti_settings.h"
 
@@ -117,21 +118,67 @@ std::vector<Change> ReconcileGlobal(std::span<BasicSetting* const> settings, con
     return changes;
 }
 
-std::vector<Change> ReconcilePerGame([[maybe_unused]] std::span<BasicSetting* const> settings,
-                                     [[maybe_unused]] const Record& record,
-                                     [[maybe_unused]] bool full) {
-    // Preserve custom per-game configurations
-    return {};
+std::vector<Change> ReconcilePerGame(std::span<BasicSetting* const> settings, const Record& record,
+                                     bool full) {
+    std::vector<Change> changes;
+    for (BasicSetting* const setting : settings) {
+        if (setting->UsingGlobal()) {
+            continue;
+        }
+        if (!full) {
+            // A missing entry means Frizti never wrote an override for it.
+            const auto it = record.per_game.find(setting->GetLabel());
+            if (it != record.per_game.end() && it->second == setting->ToString()) {
+                continue;
+            }
+        }
+        const std::string from = setting->Canonicalize();
+        setting->SetGlobal(true);
+        changes.push_back({fmt::format("{:016X} {}", OcarinaOfTimeProgramId, setting->GetLabel()),
+                           from, std::string{UseGlobal}});
+    }
+    return changes;
 }
 
-std::vector<Moved> FoldPerGame([[maybe_unused]] std::span<BasicSetting* const> settings) {
-    // Preserve custom per-game configurations
-    return {};
+std::vector<Moved> FoldPerGame(std::span<BasicSetting* const> settings) {
+    std::vector<Moved> moved;
+    for (BasicSetting* const setting : settings) {
+        if (!setting->Switchable() || !setting->Save() || setting->UsingGlobal()) {
+            continue;
+        }
+        const std::string value = setting->ToString();
+        setting->SetGlobal(true);
+        if (setting->ToString() == value) {
+            continue; // the override matched the main value
+        }
+        const std::string from = setting->Canonicalize();
+        setting->LoadString(value);
+        moved.push_back({setting, from, setting->Canonicalize()});
+    }
+    return moved;
 }
 
-std::vector<Change> FoldPerGamePlayers([[maybe_unused]] Values& values) {
-    // Preserve custom per-game configurations
-    return {};
+std::vector<Change> FoldPerGamePlayers(Values& values) {
+    std::vector<Change> changes;
+    const bool was_global = values.players.UsingGlobal();
+    values.players.SetGlobal(false);
+    auto& custom = values.players.GetValue();
+    auto& global = values.players.GetValue(true);
+    for (size_t index = 0; index < custom.size(); ++index) {
+        if (custom[index].profile_name.empty()) {
+            continue; // this player already uses the main controls
+        }
+        const std::string from = global[index].profile_name;
+        global[index] = custom[index];
+        custom[index].profile_name.clear();
+        if (from != global[index].profile_name) {
+            changes.push_back({fmt::format("player_{}_profile", index),
+                               from.empty() ? std::string{"own"} : from,
+                               global[index].profile_name});
+        }
+    }
+    values.players.SetGlobal(was_global);
+    return changes;
 }
 
 std::vector<Change> FixDockedController(Values& values) {
@@ -159,6 +206,25 @@ std::map<std::string, std::string> PerGameValues(std::span<BasicSetting* const> 
                        setting->UsingGlobal() ? std::string{UseGlobal} : setting->ToString());
     }
     return values;
+}
+
+StartupApply DecideStartup(u32 stored, u32 recorded, std::string_view prompt) {
+    if (prompt == "ask") {
+        return StartupApply::Ask;
+    }
+    if ((std::min)(stored, recorded) >= Revision) {
+        return StartupApply::Reconcile;
+    }
+    // frizti.ini says this revision was handled (answered) already, only qt-config.ini lost it:
+    // as before the prompt, the tuned values again.
+    if (recorded >= Revision) {
+        return StartupApply::Full;
+    }
+    // Nothing from an earlier Fritchii: a fresh install or another build's config.
+    if (stored == 0 && recorded == 0) {
+        return StartupApply::Full;
+    }
+    return prompt == "0" ? StartupApply::Reconcile : StartupApply::Ask;
 }
 
 std::string FormatChanges(std::span<const Change> changes) {

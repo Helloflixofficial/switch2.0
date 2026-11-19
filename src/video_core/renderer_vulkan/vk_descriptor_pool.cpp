@@ -25,7 +25,6 @@ constexpr s32 SCORE_THRESHOLD = 3;
 
 struct DescriptorBank {
     DescriptorBankInfo info;
-    std::mutex mutex;
     std::vector<vk::DescriptorPool> pools;
 };
 
@@ -63,7 +62,7 @@ static DescriptorBankInfo MakeBankInfo(std::span<const Shader::Info> infos) {
 static void AllocatePool(const Device& device, DescriptorBank& bank) {
     std::array<VkDescriptorPoolSize, 8> pool_sizes;
     size_t pool_cursor{};
-    const u32 sets_per_pool = (std::max)(device.GetSetsPerPool(), 256u);
+    const u32 sets_per_pool = device.GetSetsPerPool();
     const auto add = [&](VkDescriptorType type, u32 count) {
         if (count > 0) {
             pool_sizes[pool_cursor++] = {
@@ -81,12 +80,6 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
     add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info.images);
     add(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, info.sampled_images);
     add(VK_DESCRIPTOR_TYPE_SAMPLER, info.samplers);
-    if (pool_cursor == 0) {
-        pool_sizes[pool_cursor++] = {
-            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = sets_per_pool,
-        };
-    }
     VideoCommon::Churn::Add(VideoCommon::Churn::DescriptorPools);
     bank.pools.push_back(device.GetLogical().CreateDescriptorPool({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -122,7 +115,6 @@ void DescriptorAllocator::Allocate(size_t begin, size_t end) {
 
 vk::DescriptorSets DescriptorAllocator::AllocateDescriptors(size_t count) {
     const std::vector<VkDescriptorSetLayout> layouts(count, layout);
-    std::scoped_lock lock{bank->mutex};
     VkDescriptorSetAllocateInfo allocate_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .pNext = nullptr,

@@ -1,86 +1,62 @@
-# Switch 2.0 (Fritchii Edition)
+<!--
+# SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
 
-Experimental, high-performance Nintendo Switch and Switch 2 emulator in C++, custom-tuned for **The Legend of Zelda: Ocarina of Time** and modern hardware.
+# SPDX-License-Identifier: GPL-2.0-or-later
+-->
 
----
+<p align="center">
+  <img src="dist/fritchii.png" alt="Fritchii" width="256">
+</p>
 
-## ⚡ Optimized for NVIDIA GeForce RTX 3050 (4GB VRAM) & 8GB RAM
+# Fritchii
 
-This fork includes dedicated optimizations and stability fixes tailored specifically for 4GB VRAM GPUs (like the **NVIDIA GeForce RTX 3050 Laptop / Desktop**) and 8GB system RAM:
+Fritchii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++, tuned for The Legend of Zelda: Ocarina of Time. Fritchii is not affiliated with Nintendo.
 
-### 🛡️ Crash & Stability Fixes
-- **Thread-Safe Descriptor Allocation**: Added synchronization and emergency fallback pools in `vk_descriptor_pool.cpp` to prevent `VK_ERROR_OUT_OF_POOL_MEMORY` crashes when opening menus, maps, and inventories.
-- **Zero FPS Menu Freeze Fix**: Enabled `EDEN_NX2_ASYNC_DISCARD=1` and `EDEN_NX2_WARM_WHILE_PLAYING=1` so background pipelines compile without stalling the GPU thread.
-- **Null Safety in Texture & LRU Cache**: Bounds-checked image eviction and view creation to prevent random crashes during map transitions and teleportation.
+Fritchii is a modified version of GPL-licensed software: see [LICENSE.txt](LICENSE.txt) and the copyright notices in the source files.
 
-### 🚀 60 FPS Performance Tuning
-- **Anti-Texture Thrashing Engine**: 
-  - `EDEN_NX2_TC_MIN_AGE=120`: Protects recently used textures from premature eviction.
-  - `EDEN_NX2_TC_EXPECTED_MIB=2800` & `EDEN_NX2_TC_CRITICAL_MIB=3300`: Prevents aggressive GC loops on 4GB VRAM cards.
-  - `FRITCHII_TC_COLLECT_EVICTABLE=1`: Protects ASTC textures from wasteful eviction cycles.
-  - `FRITCHII_LOST_WRITEBACK=4096`: Stops large framebuffer textures from being dropped without writeback.
-- **Optimized Compute ASTC Decoding**: Eliminates real-time 440ms ASTC compute stalls.
-- **Silenced High-Frequency Disk Logs**: Eliminated thousands of runtime logging calls per session to maximize CPU headroom.
-- **High Refresh Frame Pacing**: Dynamic FPS unlocked with `frame_pacing_mode=0` (Auto) and `oot_high_refresh=true` for smooth 60 FPS gameplay.
+## Downloads and setup
 
----
+Builds are on the [releases page](https://github.com/Frizti/Fritchii/releases).
 
-## 💻 Tested Hardware Profile
+On Windows, extract the entire build archive and run **lichii.exe** (the executable keeps that name for now). Only use games and system files you have legally obtained. Games, keys and firmware are not included.
 
-- **GPU**: NVIDIA GeForce RTX 3050 Laptop (4 GB GDDR6)
-- **CPU**: AMD Ryzen 7 5800H (8 Cores, 16 Threads)
-- **RAM**: 8 GB DDR4 (Single Channel)
-- **Target Game**: *The Legend of Zelda: Ocarina of Time* (NUP format, Title ID `0400486024DEC000`)
-- **Performance**: Smooth 30 - 60 FPS native
+### Existing saves and settings
 
----
+Fritchii keeps its own profile: `%APPDATA%\fritchii` on Windows, and the `fritchii` directories under `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME` and `$XDG_CACHE_HOME` on Linux and macOS. An existing portable `user/` directory still takes priority and is not imported or changed.
 
-## 🎮 Recommended Settings (4GB VRAM)
+On the first launch Fritchii copies your newest existing profile (an earlier Fritchii or Eden in `%APPDATA%\eden`, Lichii 150+ in `%APPDATA%\lichii`, else yuzu, suyu, sudachi or citron) into its folder and shows what it copied. Settings, keys, mods and saves are copied; caches are not, so shaders are prepared again once. The old folder is never changed. If the emulator using it is still open, close it and start Fritchii again. An interrupted copy is put back and retried on the next launch.
 
-| Setting | Value | Reason |
-|---|---|---|
-| **Resolution** | 1x Native (720p/1080p) | Saves VRAM on 4GB cards |
-| **GPU Accuracy** | Low | Maximum draw performance |
-| **DMA Accuracy** | Unsafe | Highest transfer speed |
-| **VRAM Usage Mode** | Conservative | Keeps memory under 4GB cap |
-| **Scaling Filter** | Nearest Neighbor / Bilinear | Lightest GPU overhead |
-| **Frame Pacing Mode** | Target_Auto | Smooth presentation at display refresh |
-| **High Refresh** | Enabled (60Hz) | Unlocks smooth 60 FPS |
+## Compatibility and issue reports
 
-> **Tip**: In **Properties -> Add-Ons**, ensure **"Max Resolution (built-in)"** and **"Texture Pool x2 (built-in)"** are **unchecked** on 4GB VRAM GPUs to avoid VRAM overflow.
+Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
 
----
+When [reporting an issue](https://github.com/Frizti/Fritchii/issues), include:
 
-## 📦 Portable Standalone Run
+- The exact build, game version, CPU, GPU and driver version.
+- Relevant settings and steps to reproduce the problem.
+- A screenshot and the log from the affected session (Help > Export Log), after checking it for personal information.
 
-To run without installation:
-1. Place `fritchii.exe` and `nx2_switches.txt` in a folder.
-2. Create a folder named `user` in the same directory (triggers portable mode).
-3. Put your configs and keys in `user/config/` and `user/keys/`.
-4. Run `fritchii.exe`.
+Do not upload game files, keys, firmware or private account information. Questions and help: [discord.gg/fritchii](https://discord.gg/fritchii).
 
----
+## Building and contributing
 
-## 🛠️ Building from Source
+See the [build guide](docs/Build.md) and [coding guidelines](docs/Coding.md). Some internal build target names still use older names: the GUI build target is `yuzu`, and its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
 
-Requirements:
-- Visual Studio 2022 (MSVC v143+) with C++20 support
-- CMake 3.25+
-- Ninja build system
-- Vulkan SDK 1.3+
+Keep changes focused and distinguish code-level checks from actual gameplay testing.
 
-```cmd
-git clone https://github.com/Helloflixofficial/switch2.0.git
-cd switch2.0
-mkdir build
-cmake -B build -GNinja -DCMAKE_BUILD_TYPE=Release
-ninja -C build yuzu -j 4
-```
+## Artwork
 
-Output binary: `build\bin\fritchii.exe`.
+The Fritchii logo, the pear (`dist/fritchii.png`, `dist/fritchii.ico`), was made for Fritchii by Freshdyno.
 
----
+## Credits and license
 
-## 📜 License
+Fritchii is a modified version of GPL-licensed software. The original copyright notices and third-party licenses are kept in the source files; see [LICENSE.txt](LICENSE.txt) for the license terms.
 
-Fritchii is an experimental, modified version of GPL-licensed software. See [LICENSE.txt](LICENSE.txt) for license terms. Not affiliated with Nintendo.
+Dynamic FPS by Dark, bundled with his permission.
+
+### Fritchii shader precompile recipe
+
+The shader precompile recipes (the `*.nx2recipe` files in the `recipes` folder) were made by Frizti for Fritchii. They are not part of the GPL-licensed source code and are all rights reserved: **to use them in your own build, fork or package, you need Frizti's direct permission first. Ask Frizti by direct message on Discord.** See [LICENSES/Fritchii-Recipe.txt](LICENSES/Fritchii-Recipe.txt).
+
+The precompile system itself (`src/video_core/nx2_precompile.*`, `src/yuzu/fritchii/precompile_gate.h`) is GPL code with additional terms under GPLv3 section 7: keep the credit "Shader precompile system by Frizti (Fritchii)", mark modified versions, and don't use the Fritchii name for other builds. See [LICENSES/Fritchii-Additional-Terms.txt](LICENSES/Fritchii-Additional-Terms.txt). If you want to use it, please ask Frizti on Discord first.

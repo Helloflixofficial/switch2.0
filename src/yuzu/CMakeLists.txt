@@ -214,6 +214,8 @@ add_executable(yuzu
     fritchii/known_issues.h
     fritchii/max_resolution.cpp
     fritchii/max_resolution.h
+    fritchii/occlusion_offer.cpp
+    fritchii/occlusion_offer.h
     fritchii/fritchii.qrc
     fritchii/fritchii_ui.cpp
     fritchii/fritchii_ui.h
@@ -449,7 +451,6 @@ endif()
 
 # Remember that the linker is incredibly stupid.
 target_link_libraries(yuzu PRIVATE OpenSSL::SSL OpenSSL::Crypto SDL3::SDL3)
-target_link_options(yuzu PRIVATE "/MAP:bin/fritchii.map")
 
 # NX archive conversion and editing (nx_tools.cpp) runs nxformat in the process, linked statically.
 if (TARGET nxformat::static_nozstd)

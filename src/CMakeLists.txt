@@ -105,23 +105,23 @@ if (MSVC AND NOT CXX_CLANG)
         /external:anglebrackets # Treats all headers included by #include <header>, where the header file is enclosed in angle brackets (< >), as external headers
         /external:W0            # Sets the default warning level to 0 for external headers, effectively disabling warnings for them.
 
-        /wd4062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
-        /wd4189 # 'identifier': local variable is initialized but not referenced
-        /wd4265 # 'class': class has virtual functions, but destructor is not virtual
-        /wd4388 # 'expression': signed/unsigned mismatch
-        /wd4389 # 'operator': signed/unsigned mismatch
+        /we4062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
+        /we4189 # 'identifier': local variable is initialized but not referenced
+        /we4265 # 'class': class has virtual functions, but destructor is not virtual
+        /we4388 # 'expression': signed/unsigned mismatch
+        /we4389 # 'operator': signed/unsigned mismatch
         /wd4456 # Declaration of 'identifier' hides previous local declaration
         /wd4457 # Declaration of 'identifier' hides function parameter
         /wd4458 # Declaration of 'identifier' hides class member
         /wd4459 # Declaration of 'identifier' hides global declaration
-        /wd4505 # 'function': unreferenced local function has been removed
-        /wd4547 # 'operator': operator before comma has no effect; expected operator with side-effect
-        /wd4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
-        /wd4555 # Expression has no effect; expected expression with side-effect
-        /wd4826 # Conversion from 'type1' to 'type2' is sign-extended. This may cause unexpected runtime behavior.
-        /wd5038 # data member 'member1' will be initialized after data member 'member2'
-        /wd5233 # explicit lambda capture 'identifier' is not used
-        /wd5245 # 'function': unreferenced function with internal linkage has been removed
+        /w4505 # 'function': unreferenced local function has been removed
+        /we4547 # 'operator': operator before comma has no effect; expected operator with side-effect
+        /we4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
+        /we4555 # Expression has no effect; expected expression with side-effect
+        /we4826 # Conversion from 'type1' to 'type2' is sign-extended. This may cause unexpected runtime behavior.
+        /we5038 # data member 'member1' will be initialized after data member 'member2'
+        /we5233 # explicit lambda capture 'identifier' is not used
+        /we5245 # 'function': unreferenced function with internal linkage has been removed
 
         /wd4100 # 'identifier': unreferenced formal parameter
         /wd4324 # 'struct_name': structure was padded due to __declspec(align())
@@ -130,7 +130,7 @@ if (MSVC AND NOT CXX_CLANG)
 
         $<$<CONFIG:Release>:/GS->   # No stack buffer overflow checks
         /Gy                         # Enable function level linking
-        /GR                         # Enable run time type information (required for dynamic_cast)
+        /GR-                        # Disable run time type information
     )
 
     if (NOT CXX_CLANG)

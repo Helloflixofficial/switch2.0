@@ -363,10 +363,10 @@ int ScoreCandidateTitle(const std::string& candidate, const std::string& query) 
     return score;
 }
 
-// Fritchii originally hid tabs for OoT to force global settings.
-// We keep every tab enabled for all games so user can configure custom graphics/CPU/system.
-bool SettingsInOnePlace([[maybe_unused]] u64 title_id) {
-    return false;
+// Fritchii keeps one place for OoT's settings (Emulation > Configure): its game settings show
+// only the add-ons (mods) and never write a per-game override. Other games keep every tab.
+bool SettingsInOnePlace(u64 title_id) {
+    return title_id == Settings::Frizti::OcarinaOfTimeProgramId;
 }
 
 } // namespace
@@ -421,8 +421,8 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     setWindowTitle(tr("Properties"));
     if (FritchiiUi::Enabled()) {
         setWindowTitle(tr("Game Settings"));
-        ui->tabWidget->setTabText(tab_index(graphics_advanced_tab.get()), tr("Adv. Graphics"));
-        ui->tabWidget->setTabText(tab_index(graphics_extensions_tab.get()), tr("Ext. Graphics"));
+        ui->tabWidget->setTabText(tab_index(graphics_advanced_tab.get()), tr("Advanced Graphics"));
+        ui->tabWidget->setTabText(tab_index(graphics_extensions_tab.get()), tr("Graphics Extras"));
         ui->tabWidget->setTabText(tab_index(input_tab.get()), tr("Controls"));
     }
 

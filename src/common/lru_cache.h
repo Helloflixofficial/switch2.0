@@ -39,9 +39,6 @@ public:
     }
 
     void Touch(size_t id, TickType tick) {
-        if (id >= item_pool.size()) {
-            return;
-        }
         auto& item = item_pool[id];
         if (item.tick >= tick) {
             return;
@@ -56,16 +53,10 @@ public:
 
     /// The tick the item was inserted or last touched at.
     [[nodiscard]] TickType Tick(size_t id) const {
-        if (id >= item_pool.size()) {
-            return 0;
-        }
         return item_pool[id].tick;
     }
 
     void Free(size_t id) {
-        if (id >= item_pool.size()) {
-            return;
-        }
         auto& item = item_pool[id];
         Detach(item);
         item.prev = nullptr;
