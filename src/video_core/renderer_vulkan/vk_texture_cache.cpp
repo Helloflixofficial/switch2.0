@@ -6131,10 +6131,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
         vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true);
+        if (!decode) {
+            decode = memory_allocator.TryCreateImage(decode_ci, false);
+        }
         if (!decode && !free_transcodes.empty()) {
             // The GPU is done with these: their memory goes back to the driver now.
             free_transcodes.clear();
-            decode = memory_allocator.TryCreateImage(decode_ci, true);
+            decode = memory_allocator.TryCreateImage(decode_ci, false);
         }
         if (!decode) {
             static u32 logged{};

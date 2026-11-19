@@ -105,7 +105,15 @@ DescriptorAllocator::DescriptorAllocator(const Device& device_, MasterSemaphore&
 
 VkDescriptorSet DescriptorAllocator::Commit() {
     const size_t index = CommitResource();
-    return sets[index / SETS_GROW_RATE][index % SETS_GROW_RATE];
+    const size_t pool_idx = index / SETS_GROW_RATE;
+    const size_t sub_idx = index % SETS_GROW_RATE;
+    if (pool_idx < sets.size() && sub_idx < sets[pool_idx].size()) {
+        return sets[pool_idx][sub_idx];
+    }
+    if (!sets.empty() && !sets[0].empty()) {
+        return sets[0][0];
+    }
+    return VK_NULL_HANDLE;
 }
 
 void DescriptorAllocator::Allocate(size_t begin, size_t end) {
@@ -122,42 +130,49 @@ vk::DescriptorSets DescriptorAllocator::AllocateDescriptors(size_t count) {
         .descriptorSetCount = static_cast<u32>(count),
         .pSetLayouts = layouts.data(),
     };
-    vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
-    if (!new_sets.IsOutOfPoolMemory()) {
-        return new_sets;
-    }
+    try {
+        vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
+        if (!new_sets.IsOutOfPoolMemory() && !new_sets.empty()) {
+            return new_sets;
+        }
+    } catch (const vk::Exception&) {}
+
     // Our current pool is out of memory. Allocate a new one and retry
-    AllocatePool(*device, *bank);
-    allocate_info.descriptorPool = *bank->pools.back();
-    new_sets = bank->pools.back().Allocate(allocate_info);
-    if (!new_sets.IsOutOfPoolMemory()) {
-        return new_sets;
-    }
+    try {
+        AllocatePool(*device, *bank);
+        allocate_info.descriptorPool = *bank->pools.back();
+        vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
+        if (!new_sets.IsOutOfPoolMemory() && !new_sets.empty()) {
+            return new_sets;
+        }
+    } catch (const vk::Exception&) {}
+
     // Fallback: If bank pool still cannot satisfy allocation, allocate an emergency pool
-    std::array<VkDescriptorPoolSize, 8> fallback_sizes = {{
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<u32>(count * 32)},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<u32>(count * 32)},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, static_cast<u32>(count * 32)},
-        {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, static_cast<u32>(count * 32)},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<u32>(count * 32)},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, static_cast<u32>(count * 32)},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, static_cast<u32>(count * 32)},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, static_cast<u32>(count * 32)},
-    }};
-    bank->pools.push_back(device->GetLogical().CreateDescriptorPool({
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .maxSets = static_cast<u32>(count * 4),
-        .poolSizeCount = static_cast<u32>(fallback_sizes.size()),
-        .pPoolSizes = fallback_sizes.data(),
-    }));
-    allocate_info.descriptorPool = *bank->pools.back();
-    new_sets = bank->pools.back().Allocate(allocate_info);
-    if (!new_sets.IsOutOfPoolMemory()) {
+    try {
+        std::array<VkDescriptorPoolSize, 8> fallback_sizes = {{
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<u32>(count * 32)},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<u32>(count * 32)},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, static_cast<u32>(count * 32)},
+            {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, static_cast<u32>(count * 32)},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<u32>(count * 32)},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, static_cast<u32>(count * 32)},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, static_cast<u32>(count * 32)},
+            {VK_DESCRIPTOR_TYPE_SAMPLER, static_cast<u32>(count * 32)},
+        }};
+        bank->pools.push_back(device->GetLogical().CreateDescriptorPool({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = static_cast<u32>(count * 4),
+            .poolSizeCount = static_cast<u32>(fallback_sizes.size()),
+            .pPoolSizes = fallback_sizes.data(),
+        }));
+        allocate_info.descriptorPool = *bank->pools.back();
+        vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
         return new_sets;
-    }
-    return new_sets;
+    } catch (const vk::Exception&) {}
+
+    return {};
 }
 
 DescriptorPool::DescriptorPool(const Device& device_, Scheduler& scheduler) {}

@@ -639,6 +639,11 @@ public:
         return num;
     }
 
+    /// Returns true if empty.
+    bool empty() const noexcept {
+        return num == 0;
+    }
+
     /// Returns a pointer to the array of allocations.
     AllocationType const* data() const noexcept {
         return allocations.get();

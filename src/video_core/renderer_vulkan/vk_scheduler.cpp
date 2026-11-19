@@ -814,11 +814,23 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // FRITCHII_SLOW_GPU: the command buffer wrappers count this submission's commands
             // (null while off; the submission's SlowGpu::End clears it).
             vk::t_cmd_stats = slow_gpu.Counting();
-            work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            try {
+                work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
 
-            // If the chunk was a submission, reallocate the command buffer.
-            if (has_submit) {
-                AllocateWorkerCommandBuffer();
+                // If the chunk was a submission, reallocate the command buffer.
+                if (has_submit) {
+                    AllocateWorkerCommandBuffer();
+                }
+            } catch (const std::exception& ex) {
+                LOG_CRITICAL(Render_Vulkan, "VulkanWorker recovered from exception: {}", ex.what());
+                if (has_submit) {
+                    AllocateWorkerCommandBuffer();
+                }
+            } catch (...) {
+                LOG_CRITICAL(Render_Vulkan, "VulkanWorker recovered from unknown exception");
+                if (has_submit) {
+                    AllocateWorkerCommandBuffer();
+                }
             }
             if (price_start != 0) [[unlikely]] {
                 const u64 executed = Price::Ticks();
