@@ -413,11 +413,19 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     }
     static const u64 old_age = [] {
         const char* value = std::getenv("EDEN_NX2_TC_OLD_AGE");
-        return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 600ULL;
     }();
-    if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
+    const bool should_evict_old =
+        old_age != 0 && frame_tick > old_age &&
+        (high_priority_mode || total_used_memory > (1400ULL << 20));
+    if (should_evict_old) {
         evict_old_costly = true;
         Collect(old_age);
+        evict_old_costly = false;
+    }
+    if (total_used_memory > (1600ULL << 20) && frame_tick > 300) {
+        evict_old_costly = true;
+        Collect(300);
         evict_old_costly = false;
     }
     Collect();

@@ -13,7 +13,7 @@ namespace VideoCommon {
 /// collector's thresholds sit under what a scene can use: Mario Kart World's races need about
 /// 5.5-6.3 GB against a 5 GiB critical threshold, and deleting images unused for 10 frames there
 /// made about 42 images again every frame (back thread 25 -> 35 ms per frame).
-constexpr u64 MinEvictionAge = 150;
+constexpr u64 MinEvictionAge = 60;
 
 /// Frames since its last use before the collector may delete an image. `mode_age` is the age the
 /// collector's mode asks for; it applies as is only when memory is short: an image could not be
@@ -25,7 +25,8 @@ constexpr u64 MinEvictionAge = 150;
     if (out_of_memory || limit == 0 || usage >= limit) {
         return mode_age;
     }
-    return (std::max)({mode_age, MinEvictionAge, override_age});
+    const u64 floor_age = override_age != 0 ? override_age : MinEvictionAge;
+    return (std::max)(mode_age, floor_age);
 }
 
 /// How far the budget RetentionBudget follows may rise at each budget check (every 30 frames).
