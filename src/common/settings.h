@@ -705,7 +705,7 @@ struct Values {
     // Ask: the desktop app asks at launch while the game has no finished precache; where nothing
     // asks, as Off.
     SwitchableSetting<PrecacheShaders> precache_shaders{linkage,
-                                                        PrecacheShaders::Off,
+                                                        PrecacheShaders::Ask,
                                                         "precache_shaders",
                                                         Category::RendererAdvanced,
                                                         Specialization::Default,
@@ -714,7 +714,7 @@ struct Values {
 
     // Build every cached graphics pipeline while the game loads, not only those recent sessions
     // used, and keep them built, up to the pipelines kept in memory (a quarter of the RAM).
-    SwitchableSetting<bool> build_all_cached_shaders{linkage, false, "build_all_cached_shaders",
+    SwitchableSetting<bool> build_all_cached_shaders{linkage, true, "build_all_cached_shaders",
                                                      Category::RendererAdvanced};
 
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
