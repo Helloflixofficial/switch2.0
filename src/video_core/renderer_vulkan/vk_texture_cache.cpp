@@ -5495,14 +5495,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             decode = make_decode(batch);
         }
         if (!decode && !reused) {
+            free_transcodes.clear();
             static u32 logged{};
             if (logged++ < 32) {
                 LOG_ERROR(Render_Vulkan,
-                          "No memory to decode ASTC image {:#x} ({}x{}, {} levels); uploading it "
-                          "again when it is next used",
+                          "No memory to decode ASTC image {:#x} ({}x{}, {} levels); skipping transcode",
                           image.gpu_addr, width, height, levels);
             }
-            image.flags |= VideoCommon::ImageFlagBits::CpuModified;
             TransitionImageLayout(image);
             return;
         }

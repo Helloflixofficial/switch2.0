@@ -31,6 +31,7 @@
 #include "common/memory_detect.h"
 #include <ranges>
 #include "video_core/vulkan_common/unbacked_fallback.h"
+#include "video_core/small_card.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -270,6 +271,21 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     const bool huge = IsTooLargeToBack(texels, bytes);
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_SUCCESS && allocation != VK_NULL_HANDLE && !device.IsIntegrated()) {
+        VkMemoryPropertyFlags prop_flags{};
+        vmaGetAllocationMemoryProperties(allocator, allocation, &prop_flags);
+        if ((prop_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+            if (VideoCore::SmallCard::Active() &&
+                (spill_pending.load(std::memory_order_relaxed) > (u64{64} << 20) ||
+                 spilled_bytes.load(std::memory_order_relaxed) > (u64{128} << 20))) {
+                vmaDestroyImage(allocator, handle, allocation);
+                handle = VK_NULL_HANDLE;
+                allocation = VK_NULL_HANDLE;
+                result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                pressure_events.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.

@@ -179,7 +179,9 @@ struct Memory::Impl {
             return false;
         }
         auto* pointer = GetPointerImpl(GetInteger(addr), [] {}, [&] {
-            HandleRasterizerDownload(GetInteger(addr), sizeof(u32));
+            if (Settings::ReactiveFlushing() || ReadTrapArmed(GetInteger(addr) & 0xffffffffffffULL, sizeof(u32))) {
+                HandleRasterizerDownload(GetInteger(addr), sizeof(u32));
+            }
         });
         if (!pointer) {
             return false;
@@ -323,7 +325,9 @@ struct Memory::Impl {
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, const u8* const ptr) {
             if (!unsafe) {
-                HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount);
+                if (Settings::ReactiveFlushing() || ReadTrapArmed(GetInteger(current_vaddr), copy_amount)) {
+                    HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount);
+                }
             }
             std::memcpy(reinterpret_cast<u8*>(buffer) + offset, ptr, copy_amount);
         });
@@ -391,7 +395,9 @@ struct Memory::Impl {
             WriteBlockImpl(dest_addr + offset, ptr, copy_amount, false);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount);
+            if (Settings::ReactiveFlushing() || ReadTrapArmed(GetInteger(current_vaddr), copy_amount)) {
+                HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount);
+            }
             WriteBlockImpl(dest_addr + offset, ptr, copy_amount, false);
         });
     }
@@ -786,7 +792,7 @@ struct Memory::Impl {
             }
             ++UnmappedReadFlag();
         }, [&]() {
-            if (!ReadTrapsEnabled() || ReadTrapArmed(addr & 0xffffffffffffULL, sizeof(T))) {
+            if (Settings::ReactiveFlushing() || ReadTrapArmed(addr & 0xffffffffffffULL, sizeof(T))) {
                 HandleRasterizerDownload(addr, sizeof(T));
             }
         }); ptr) [[likely]] {

@@ -15,6 +15,7 @@
 #include <vector>
 #include <queue>
 
+#include "common/logging.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "common/unique_function.h"
@@ -72,10 +73,16 @@ public:
                         task = std::move(requests.front());
                         requests.pop();
                     }
-                    if constexpr (with_state) {
-                        task(&state);
-                    } else {
-                        task();
+                    try {
+                        if constexpr (with_state) {
+                            task(&state);
+                        } else {
+                            task();
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR(Common, "Worker thread '{}' caught exception: {}", thread_name, e.what());
+                    } catch (...) {
+                        LOG_ERROR(Common, "Worker thread '{}' caught unknown exception", thread_name);
                     }
                     // Draining an executed task includes releasing its captured resources.
                     task = {};
