@@ -41,6 +41,7 @@ add_library(
     core_pinning.h
     demangle.cpp
     demangle.h
+    fritchii_switch_defaults.cpp
     device_power_state.cpp
     device_power_state.h
     display_hdr.cpp

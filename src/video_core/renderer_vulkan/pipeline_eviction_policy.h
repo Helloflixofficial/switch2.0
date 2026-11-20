@@ -13,20 +13,23 @@
 namespace Vulkan {
 
 /// Built graphics pipelines kept when the memory query fails.
-inline constexpr size_t DefaultKeptPipelines = 4096;
+inline constexpr size_t DefaultKeptPipelines = 8192;
+inline constexpr size_t MinKeptPipelines = 8192;
 
 /// Host memory one built graphics pipeline holds, rounded up: building OoT's 12,900 cached
 /// pipelines at boot added 3.4 GiB of committed memory (~0.27 MiB each, NVIDIA).
 inline constexpr u64 PipelineBytes = 300 * 1024;
 
 /// Built graphics pipelines kept on a machine with `total_memory` bytes of RAM before unused ones
-/// are destroyed: as many as fit in a quarter of it (8 GiB: 6,990; 32 GiB: 27,962). A failed
-/// memory query (`total_memory` 0) gives DefaultKeptPipelines.
+/// are destroyed: as many as fit in a third of it (8 GiB: ~9,300; 32 GiB: 37,282), with a minimum
+/// of MinKeptPipelines to prevent new-area and revisit stuttering. A failed memory query
+/// (`total_memory` 0) gives DefaultKeptPipelines.
 constexpr size_t KeptPipelinesForMemory(u64 total_memory) {
     if (total_memory == 0) {
         return DefaultKeptPipelines;
     }
-    return static_cast<size_t>(total_memory / 4 / PipelineBytes);
+    const size_t calculated = static_cast<size_t>(total_memory / 3 / PipelineBytes);
+    return (std::max)(calculated, MinKeptPipelines);
 }
 
 /// Without a kept limit (`kept` 0, Android), prebuilt pipelines no draw has used stay up to this

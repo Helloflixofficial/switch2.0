@@ -913,8 +913,8 @@ u64 IrBytes(std::span<const Shader::IR::Program> programs) {
     return bytes;
 }
 
-// A graphics pipeline unused for this many frames (~2.5 min at 60 FPS) may be destroyed.
-constexpr u64 EvictAfterFrames = 9000;
+// A graphics pipeline unused for this many frames (~20 min at 60 FPS) may be destroyed.
+constexpr u64 EvictAfterFrames = 72000;
 
 /// Built graphics pipelines kept before unused ones are destroyed (KeptPipelinesForMemory). 0 on
 /// Android, where driver memory is short: every pipeline unused for EvictAfterFrames is destroyed

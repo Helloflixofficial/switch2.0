@@ -69,7 +69,7 @@ inline std::atomic<u32> g_refused_scale_percent{0};
 }
 
 [[nodiscard]] inline int Mode() {
-    return Nx2Debug::SwitchValue(g_small_card, "FRITCHII_SMALL_CARD", 0);
+    return Nx2Debug::SwitchValue(g_small_card, "FRITCHII_SMALL_CARD", 2);
 }
 
 /// Whether the profile is on now (live: the debug server's switch can flip it).

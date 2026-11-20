@@ -1302,8 +1302,13 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     Maxwell3D::Regs::RenderTargetConfig tonemapped{};
     {
         std::scoped_lock lock{bypass->mutex};
-        if (bypass->latest_address.exchange(0, std::memory_order_relaxed) != 0) {
+        const u64 addr = bypass->latest_address.exchange(0, std::memory_order_relaxed);
+        if (addr != 0) {
             tonemapped = bypass->latest_draw;
+            bypass->last_valid_draw = tonemapped;
+        } else if (bypass->last_valid_draw.Address() != 0) {
+            // Keep using the last valid tonemapped image during pause / map / toolbar UI draws
+            tonemapped = bypass->last_valid_draw;
         }
     }
     const Texture::TextureFormat input_format =

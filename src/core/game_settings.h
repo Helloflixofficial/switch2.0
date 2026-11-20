@@ -47,6 +47,7 @@ enum class TitleID : std::uint64_t {
     NinjaGaidenRagebound = 0x0100781020710000ULL,
     DuskbloodsNetworkTest = 0x0400D1D02399A000ULL,
     DonkeyKongBananza = 0x040074A01BF12000ULL,
+    OcarinaOfTime = 0x0400486024DEC000ULL,
 };
 
 struct EnvironmentInfo {

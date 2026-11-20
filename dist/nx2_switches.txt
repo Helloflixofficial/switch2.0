@@ -30,16 +30,21 @@ EDEN_NX2_FENCE_BATCH=1
 EDEN_NX2_FRAMES_AHEAD=1
 
 # --- Memory & Stability guards ---
+FRITCHII_SMALL_CARD=2
 EDEN_NX2_TC_MIN_AGE=45
-EDEN_NX2_TC_EXPECTED_MIB=1600
-EDEN_NX2_TC_CRITICAL_MIB=2100
+# Dynamic memory sizing avoids 7.5GB PCIe spill on 4GB VRAM cards
+#EDEN_NX2_TC_EXPECTED_MIB=1600
+#EDEN_NX2_TC_CRITICAL_MIB=2100
 
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
 
-# Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
-#EDEN_NX2_NO_REACTIVE=1
+# Drop reactive-flushing read traps on Switch 2 programs (eliminates 27k+ OnCPURead stalls on Ocarina of Time HUD/map)
+EDEN_NX2_NO_REACTIVE=1
+
+# Compile unbuilt pipelines asynchronously without GPU stalls when entering new areas
+EDEN_NX2_ASYNC_DISCARD=1
 
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0

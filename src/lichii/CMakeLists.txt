@@ -506,8 +506,5 @@ if (TARGET nxformat::static_nozstd)
     target_link_libraries(lichii PRIVATE nxformat::static_nozstd)
     target_compile_definitions(lichii PRIVATE LICHII_NX_TOOLS)
 endif()
-add_custom_command(TARGET lichii POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:lichii>" "$<TARGET_FILE_DIR:lichii>/fritchii.exe"
-    COMMENT "Copying lichii.exe to fritchii.exe"
-)
+set_target_properties(lichii PROPERTIES OUTPUT_NAME "fritchii")
 create_target_directory_groups(lichii)

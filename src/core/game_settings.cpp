@@ -140,6 +140,11 @@ void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& rend
             // there, and the bloom spreads it into large glows with black dots (#1418, #1739).
             Settings::values.keep_cpu_inner_invalidation = true;
             break;
+        case TitleID::OcarinaOfTime:
+            // Ocarina of Time polls GPU-cached memory heavily for HUD/map/toolbar. Reactive flushing
+            // traps every read, causing 27k+ OnCPURead stalls.
+            Settings::values.use_reactive_flushing.SetValue(false);
+            break;
         default:
             break;
     }

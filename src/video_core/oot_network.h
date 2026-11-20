@@ -60,6 +60,7 @@ struct BypassState {
     /// Render target 0 of the latest draw IsTonemapCandidate accepted since the last output pass,
     /// under mutex. Valid while latest_address is not 0.
     Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig latest_draw{};
+    Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig last_valid_draw{};
     std::atomic<u64> latest_address{};
     /// The input's size and the output's address at the latest output pass, 0 until one is seen.
     std::atomic<u32> input_width{};
