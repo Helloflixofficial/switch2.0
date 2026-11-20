@@ -33,7 +33,6 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/texture_cache/writeback_switches.h"
-#include "video_core/small_card.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -1199,19 +1198,6 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
-    if (VideoCore::SmallCard::Active()) {
-        critical_memory = (std::min)(critical_memory, u64{1100_MiB});
-        expected_memory = (std::min)(expected_memory, u64{800_MiB});
-        minimum_memory = (std::min)(minimum_memory, u64{500_MiB});
-        retention_limit = (std::min)(retention_limit, u64{900_MiB});
-    } else if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
-        if (runtime.GetDeviceMemoryBudget() <= 4_GiB) {
-            critical_memory = (std::min)(critical_memory, u64{1100_MiB});
-            expected_memory = (std::min)(expected_memory, u64{800_MiB});
-            minimum_memory = (std::min)(minimum_memory, u64{500_MiB});
-            retention_limit = (std::min)(retention_limit, u64{900_MiB});
-        }
-    }
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB raise the collector's thresholds past
     // MaxCriticalMemory, but never past what the device budget allows: set outright, they kept
     // the cache above a shrinking budget (other programs' video memory, out-of-memory margins) and
@@ -1370,7 +1356,7 @@ void TextureCache<P>::TickFrame() {
                         // episode may still have some left after the grace period: use them
                         // all before raising the margin.
                         const u64 since = frame_tick + 1 - spill_collect_tick;
-                        if (spill_forced_collects < MaxSpillCollects || VideoCore::SmallCard::Active() || spill_window_bytes > 64_MiB) {
+                        if (spill_forced_collects < MaxSpillCollects) {
                             if (spill_forced_collects == 0 ||
                                 frame_tick >= spill_last_collect + SpillCollectSpacing) {
                                 spill_last_collect = frame_tick;
@@ -1378,8 +1364,7 @@ void TextureCache<P>::TickFrame() {
                                 ++spill_log_collects;
                                 spill_collect = true;
                             }
-                        }
-                        if (since >= SpillGraceFrames) {
+                        } else if (since >= SpillGraceFrames) {
                             const u64 target = (std::min)(spill_window_bytes + 128_MiB, 768_MiB);
                             if (target > spill_margin) {
                                 spill_margin = target;
@@ -1656,15 +1641,8 @@ void TextureCache<P>::TickFrame() {
     }
     // A forced collect for memory spilled to host memory collects as at the critical threshold
     // for this frame, without the re-upload of images left out that a failed image gets.
-    bool device_pressure = false;
-    if constexpr (requires { runtime.GetDeviceMemoryUsage(); runtime.GetDeviceMemoryBudget(); }) {
-        const u64 budget = runtime.GetDeviceMemoryBudget();
-        if (budget > 0 && runtime.GetDeviceMemoryUsage() + 256_MiB >= budget) {
-            device_pressure = true;
-        }
-    }
-    if (out_of_memory || spill_collect || device_pressure || total_used_memory > minimum_memory) {
-        RunGarbageCollector(out_of_memory || spill_collect || device_pressure);
+    if (out_of_memory || spill_collect || total_used_memory > minimum_memory) {
+        RunGarbageCollector(out_of_memory || spill_collect);
     }
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame

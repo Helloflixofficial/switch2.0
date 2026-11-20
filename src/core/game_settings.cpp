@@ -144,6 +144,8 @@ void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& rend
             // Ocarina of Time polls GPU-cached memory heavily for HUD/map/toolbar. Reactive flushing
             // traps every read, causing 27k+ OnCPURead stalls.
             Settings::values.use_reactive_flushing.SetValue(false);
+            // Skip heavy anti-aliasing tensor network compute passes and use tonemap point copy for smooth FPS:
+            Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::NoSharpening);
             break;
         default:
             break;
