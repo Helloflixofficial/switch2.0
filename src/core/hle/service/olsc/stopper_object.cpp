@@ -7,7 +7,7 @@
 namespace Service::OLSC {
 
 IStopperObject::IStopperObject(Core::System& system_) : ServiceFramework{system_, "IStopperObject"} {
-    // TODO: If ever needed, add cmds
+    // TODO(Maufeat): If ever needed, add cmds
 }
 
 IStopperObject::~IStopperObject() = default;

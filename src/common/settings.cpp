@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <version>
-#include <atomic>
 #if __cpp_lib_chrono >= 201907L
 #include <chrono>
 #include <exception>
@@ -20,7 +19,6 @@
 #include <type_traits>
 #include <fmt/core.h>
 
-#include "common/scm_rev.h"
 #include "common/settings_enums.h"
 #include "common/assert.h"
 #include "common/fs/fs_util.h"
@@ -49,12 +47,10 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
-SWITCHABLE(OotTextureSharpness, false);
-SWITCHABLE(float, true);
-SWITCHABLE(DlssPreset, false);
 SWITCHABLE(NvidiaDlssQuality, false);
-SWITCHABLE(OotRefreshCap, false);
-SWITCHABLE(OotMovieUpscale, false);
+SWITCHABLE(NvidiaDlssPreset, false);
+SWITCHABLE(HdrMode, false);
+SWITCHABLE(HdrSwapchain, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -69,6 +65,7 @@ SWITCHABLE(NvdecEmulation, false);
 SWITCHABLE(Region, true);
 SWITCHABLE(RendererBackend, true);
 SWITCHABLE(ScalingFilter, false);
+SWITCHABLE(FrameGenType, false);
 SWITCHABLE(SpirvOptimizeMode, true);
 SWITCHABLE(TimeZone, true);
 SETTING(VSyncMode, true);
@@ -93,6 +90,7 @@ Values values;
 
 namespace {
 std::atomic<u32> nvidia_dlss_runtime_options{};
+std::atomic<u32> applied_ocarina_render_scale{};
 }
 
 void RefreshNvidiaDlssRuntimeSettings() {
@@ -102,125 +100,33 @@ void RefreshNvidiaDlssRuntimeSettings() {
         std::memory_order_relaxed);
 }
 
-NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
-    const u32 options = nvidia_dlss_runtime_options.load(std::memory_order_relaxed);
-    return {static_cast<NvidiaDlssQuality>(options & 0xff),
-            static_cast<DlssPreset>((options >> 8) & 0xff)};
-}
-
-namespace {
-std::atomic<u32> applied_ocarina_render_scale{};
-std::atomic<bool> ocarina_card_runs_dlss{true};
-}
-
-void SetOcarinaCardRunsDlss(bool runs) {
-    ocarina_card_runs_dlss.store(runs, std::memory_order_relaxed);
-}
-
-bool OcarinaDlssRenderScaleSwitch() {
-    static const bool on = [] {
-        const char* const value = std::getenv("FRITCHII_DLSS_RENDER_SCALE");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
-    return on;
-}
-
-bool OcarinaRenderStepsSwitch() {
-    static const bool on = [] {
-        const char* const value = std::getenv("FRITCHII_OOT_RENDER_STEPS");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
-    return on;
-}
-
-bool OcarinaRenderHeightOffered(u32 height) {
-    // The heights every player gets. To release one (540 and 360 are next), add it here: the
-    // picture menu, its "Below ..." line and the render patch all follow this list.
-    // 1280x720, 1920x1080 and 2560x1440 are the sizes the game is known to draw exactly. The
-    // others are exact scales too (0.25, 0.375, 0.5625, 0.625, 0.875), but the game may round
-    // its scene to a padded target as it does at 0.871 (2276x1280 in 2288x1280), which the
-    // upscaler does not take: only with FRITCHII_OOT_RENDER_STEPS until a run shows their sizes.
-    constexpr std::array<u32, 3> released{720, 1080, 1440};
-    if (std::find(released.begin(), released.end(), height) != released.end()) {
-        return true;
-    }
-    return OcarinaRenderStepsSwitch() &&
-           std::find(OcarinaRenderHeights.begin(), OcarinaRenderHeights.end(), height) !=
-               OcarinaRenderHeights.end();
-}
-
-std::optional<u32> OcarinaRenderHeight() {
-    // The patch changes Max Resolution's fixed-scale path: without Max Resolution it does nothing.
-    if (!IsDockedMode() || !OcarinaMaxResolutionOn()) {
-        return std::nullopt;
-    }
-    const auto aa = values.oot_anti_aliasing.GetValue();
-    const bool fsr = aa == OotAntiAliasing::Fsr3 || aa == OotAntiAliasing::Fsr4;
-    if (!fsr && (!values.nvidia_dlss.GetValue() ||
-                 !ocarina_card_runs_dlss.load(std::memory_order_relaxed))) {
-        // The game's own upscale: it draws its full 1440p. A DLSS "on" saved for another card
-        // counts as off, as in the picture menu.
-        return std::nullopt;
-    }
-    // The picture menu's "Resolution" (oot_render_height): 1440 is the game's own size.
-    if (const u32 chosen = values.oot_render_height.GetValue(); chosen != 0) {
-        if (chosen >= 1440 || !OcarinaRenderHeightOffered(chosen)) {
-            return std::nullopt;
-        }
-        return chosen;
-    }
-    // Not chosen yet: FRITCHII_DLSS_RENDER_SCALE's DLSS qualities, as before. Balanced (0.871)
-    // pads its 2276x1280 scene into 2288x1280 targets, which the upscaler does not take yet: it
-    // keeps 2560x1440.
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
     const auto quality = values.nvidia_dlss_quality.GetValue();
-    if (!OcarinaDlssRenderScaleSwitch() || fsr) {
+    if (!values.nvidia_dlss.GetValue() || !IsDockedMode() ||
+        (quality != NvidiaDlssQuality::Balanced && quality != NvidiaDlssQuality::Performance &&
+         quality != NvidiaDlssQuality::UltraPerformance)) {
         return std::nullopt;
     }
-    if (quality == NvidiaDlssQuality::Performance) {
-        return 1080;
-    }
-    if (quality == NvidiaDlssQuality::UltraPerformance) {
-        return 720;
-    }
-    return std::nullopt;
+    return quality;
 }
 
-void SetAppliedOcarinaRenderHeight(std::optional<u32> height) {
-    applied_ocarina_render_scale.store(height.value_or(0), std::memory_order_relaxed);
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
+    applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
+                                       std::memory_order_relaxed);
 }
 
-std::optional<u32> AppliedOcarinaRenderHeight() {
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
     const u32 value = applied_ocarina_render_scale.load(std::memory_order_relaxed);
     if (value == 0) {
         return std::nullopt;
     }
-    return value;
+    return static_cast<NvidiaDlssQuality>(value - 1);
 }
 
-bool OcarinaMaxResolutionOn() {
-    if (const char* const value = std::getenv("EDEN_NX2_NO_MAX_RES"); value != nullptr) {
-        const std::string_view ab{value};
-        if (ab == "1") {
-            return false;
-        }
-        if (ab == "0") {
-            return true;
-        }
-    }
-    const auto it = values.disabled_addons.find(0x0400486024DEC000ULL);
-    if (it == values.disabled_addons.end()) {
-        return true;
-    }
-    for (const auto& name : it->second) {
-        if (name == "Max Resolution (built-in)") {
-            return false;
-        }
-    }
-    return true;
-}
-
-u32 OcarinaRenderHeightFor(std::optional<u32> height) {
-    return height.value_or(1440);
+NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
+    const u32 options = nvidia_dlss_runtime_options.load(std::memory_order_relaxed);
+    return {static_cast<NvidiaDlssQuality>(options & 0xff),
+            static_cast<NvidiaDlssPreset>((options >> 8) & 0xff)};
 }
 
 std::string GetTimeZoneString(TimeZone time_zone) {
@@ -273,7 +179,7 @@ void LogSettings() {
             }
         }
     }
-    LOG_INFO(Config, "Fritchii Configuration:");
+    LOG_INFO(Config, "Eden Configuration:");
     for (auto const& e : settings_list)
         LOG_INFO(Config, "{}", e);
 #define LOG_PATH(NAME) \
@@ -319,31 +225,10 @@ bool IsGPUFenceBehaviorAccurate() {
     return values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Accurate;
 }
 
-CpuAccuracy EffectiveCpuAccuracy() {
-    static const std::optional<CpuAccuracy> forced = []() -> std::optional<CpuAccuracy> {
-        const char* value = std::getenv("FRITCHII_CPU_ACCURACY");
-        if (value == nullptr || value[0] == 0) {
-            return std::nullopt;
-        }
-        const std::string_view name{value};
-        std::optional<CpuAccuracy> result;
-        if (name == "auto") result = CpuAccuracy::Auto;
-        else if (name == "accurate") result = CpuAccuracy::Accurate;
-        else if (name == "unsafe") result = CpuAccuracy::Unsafe;
-        else if (name == "paranoid") result = CpuAccuracy::Paranoid;
-        else if (name == "debugging") result = CpuAccuracy::Debugging;
-        LOG_WARNING(Common, "FRITCHII_CPU_ACCURACY={}: {}", name,
-                    result ? "the JIT uses it this session (the setting is unchanged)"
-                           : "unknown, ignored");
-        return result;
-    }();
-    return forced ? *forced : values.cpu_accuracy.GetValue();
-}
-
 bool IsFastmemEnabled() {
-    if (EffectiveCpuAccuracy() == Settings::CpuAccuracy::Debugging)
+    if (values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Debugging)
         return bool(values.cpuopt_fastmem);
-    else if (EffectiveCpuAccuracy() == CpuAccuracy::Unsafe)
+    else if (values.cpu_accuracy.GetValue() == CpuAccuracy::Unsafe)
         return bool(values.cpuopt_unsafe_host_mmu);
 #if defined(__linux__) && defined(ARCHITECTURE_arm64)
     // Only 4kb systems support host MMU right now
@@ -390,6 +275,14 @@ static bool current_program_is_switch2 = false;
 
 void SetCurrentProgramIsSwitch2(bool is_switch2) {
     current_program_is_switch2 = is_switch2;
+}
+
+bool ReactiveFlushing() {
+    return values.use_reactive_flushing.GetValue() || values.force_reactive_flushing;
+}
+
+bool SkipCpuInnerInvalidation() {
+    return values.skip_cpu_inner_invalidation.GetValue() && !values.keep_cpu_inner_invalidation;
 }
 
 bool CurrentProgramIsSwitch2() {
@@ -556,34 +449,26 @@ void UpdateRescalingInfo() {
     TranslateResolutionInfo(setup, info);
 }
 
-namespace {
-std::atomic<bool> oot_high_refresh_patched{false};
-} // Anonymous namespace
-
-void SetOotHighRefreshPatched(bool patched) {
-    oot_high_refresh_patched.store(patched, std::memory_order_relaxed);
+u32 FrameGenMultiplier() {
+    return std::clamp(values.frame_gen_multiplier.GetValue(), MIN_FRAME_GEN_MULTIPLIER,
+                      MAX_FRAME_GEN_MULTIPLIER);
 }
 
-bool OotHighRefreshPatched() {
-    return oot_high_refresh_patched.load(std::memory_order_relaxed);
+size_t FrameGenGenerations() {
+    if (!values.frame_gen.GetValue()) {
+        return 0;
+    }
+    return FrameGenMultiplier() - 1;
 }
 
-bool SpeedLimitEnabled() {
-    if (values.use_speed_limit.GetValue()) {
-        return true;
+size_t FrameGenMaxGenerations() {
+    if (!values.frame_gen.GetValue()) {
+        return 0;
     }
-    // Fritchii: Ocarina of Time's logic takes one fixed step per frame (1/60 s, or 1/30 with the
-    // 30 FPS mode), so "Unlocked" above 60 FPS ran the whole game fast, not just smoother
-    // (2026-11-09). It stays at its speed; Turbo and Slow remain the deliberate speed changes.
-    static const bool fritchii = std::string_view{Common::g_build_name} == "Fritchii";
-    constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
-    if (!fritchii || GetCurrentProgramID() != OcarinaOfTime) {
-        return false;
+    if (values.frame_gen_target_rate.GetValue() != 0) {
+        return MAX_FRAME_GEN_MULTIPLIER - 1;
     }
-    // With the high refresh rate patch the step follows real time at any frame rate, so
-    // "Unlocked" presents as fast as the PC can without speeding the game up. The 30 FPS mode
-    // keeps its cap.
-    return !OotHighRefreshPatched() || values.oot_30fps.GetValue();
+    return FrameGenMultiplier() - 1;
 }
 
 void RestoreGlobalState(bool is_powered_on) {

@@ -9,22 +9,19 @@
 
 // Host code ranges of JIT-compiled guest blocks, so the Windows sampler (nx2_sampler) can name
 // the guest code a guest CPU thread runs instead of "(jit)". Dynarmic's perf map feeds it on
-// Windows (on Linux the same names go to perf's /tmp/perf-<pid>.map). It records only while the
-// debug server is configured (EDEN_NX2_DEBUG_SERVER) or EDEN_NX2_JIT_SYMBOLS=1, and never with
-// EDEN_NX2_JIT_SYMBOLS=0.
+// Windows (on Linux the same names go to perf's /tmp/perf-<pid>.map). It records only with
+// EDEN_NX2_JIT_SYMBOLS=1: naming takes a process-wide lock per compiled block.
 namespace Common::JitSymbols {
 
 bool Enabled();
 
 void Register(const void* start, const void* end, std::string_view name);
 
-/// Forgets every range (the JIT cleared its code cache).
-void Clear();
+/// Forgets the ranges that start in [begin, end): that JIT cleared its code cache. Each core has
+/// its own JIT and code buffer, so the other cores' blocks keep their names.
+void Clear(const void* begin, const void* end);
 
 /// The name of the block holding the host address, if one is registered.
 std::optional<std::string> Lookup(const void* address);
-
-/// Writes every registered range as "start end name" lines (hex addresses); false if it can't.
-bool DumpTo(const std::string& path);
 
 } // namespace Common::JitSymbols

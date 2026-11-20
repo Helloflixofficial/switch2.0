@@ -99,10 +99,12 @@ ServerManager::ServerManager(Core::System& system)
 ServerManager::~ServerManager() {
     // Signal stop.
     m_stop_source.request_stop();
-    m_wakeup_event->Signal(m_system.Kernel());
+    if (!m_loop_skipped) {
+        m_wakeup_event->Signal(m_system.Kernel());
 
-    // Wait for processing to stop.
-    m_stopped.Wait();
+        // Wait for processing to stop.
+        m_stopped.Wait();
+    }
     m_threads.clear();
 
     // Clean up ports.
@@ -263,10 +265,20 @@ void ServerManager::StartAdditionalHostThreads(const char* name, size_t num_thre
 
 Result ServerManager::LoopProcess() {
     SCOPE_EXIT {
+        // Join the additional host threads before returning, so the state the caller keeps on its
+        // stack for the services (AM's WindowSystem) outlives any request they are still handling.
+        m_threads.clear();
         m_stopped.Set();
     };
 
     R_RETURN(this->LoopProcessImpl());
+}
+
+void ServerManager::SkipLoop() {
+    m_stop_source.request_stop();
+    m_wakeup_event->Signal(m_system.Kernel());
+    m_threads.clear();
+    m_loop_skipped = true;
 }
 
 void ServerManager::LinkToDeferredList(MultiWaitHolder* holder) {

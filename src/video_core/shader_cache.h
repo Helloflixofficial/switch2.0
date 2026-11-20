@@ -10,6 +10,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
@@ -31,6 +32,10 @@ namespace Tegra::Control {
 struct ChannelState;
 }
 
+namespace VideoCommon::ShaderCacheV2 {
+class Cache;
+}
+
 namespace VideoCommon {
 
 class GenericEnvironment;
@@ -40,24 +45,25 @@ struct ShaderInfo {
     size_t size_bytes{};
     /// Lowered code of a native program, reused when its pipelines are built.
     std::shared_ptr<const LoweredNativeCode> lowered_native;
-    /// Generic inputs a native vertex program reads (its header's input map), two bits per
-    /// attribute as in FixedPipelineState::attribute_types. None for task and mesh programs, all
-    /// set for any other program.
-    u64 vertex_attribute_mask{~u64{0}};
-    /// Native vertex programs: the generic attributes their header says they read.
-    u32 generic_read_mask{~0U};
 };
 
-/// Generic attributes a vertex program's header says it reads (any component of each).
-u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept;
-
-/// ShaderInfo::vertex_attribute_mask of the program in `env` (a runtime or a disk environment).
-/// EDEN_NX2_KEY_ALL_ATTRIBUTES=1 keeps every attribute type in the keys, as before.
-[[nodiscard]] u64 VertexAttributeMaskOf(const Shader::Environment& env);
+/// A program of the current draw or dispatch, read back from GPU memory for a frame dump.
+struct CapturedProgram {
+    /// Maxwell program slot, or 6 for compute
+    u32 slot{};
+    u64 unique_hash{};
+    /// NativeProgramKey of a native program, 0 for a guest Maxwell program
+    u64 native_key{};
+    GPUVAddr address{};
+    /// The 128-byte header of a native graphics program, empty otherwise (a Maxwell program's
+    /// header is the start of its code)
+    std::vector<u8> header;
+    std::vector<u8> code;
+};
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
-    static constexpr u64 YUZU_PAGEBITS = 14;
-    static constexpr u64 YUZU_PAGESIZE = u64(1) << YUZU_PAGEBITS;
+    static constexpr u64 LICHII_PAGEBITS = 14;
+    static constexpr u64 LICHII_PAGESIZE = u64(1) << LICHII_PAGEBITS;
 
     static constexpr size_t NUM_PROGRAMS = 6;
 
@@ -98,6 +104,13 @@ public:
     /// Runs on the thread that owns the cache, between frames.
     void RefreshDebugRejections(bool unrejected);
 
+    /// The programs of the current draw, for the stages with a hash in unique_hashes (the
+    /// pipeline's, after RefreshStages). On the thread that owns the cache, for frame dumps.
+    [[nodiscard]] std::vector<CapturedProgram> CaptureGraphicsPrograms(
+        const std::array<u64, NUM_PROGRAMS>& unique_hashes) const;
+    /// The program of the dispatch about to run, or nothing when it is not cached.
+    [[nodiscard]] std::optional<CapturedProgram> CaptureComputeProgram() const;
+
 protected:
     struct GraphicsEnvironments {
         std::array<GraphicsEnvironment, NUM_PROGRAMS> envs;
@@ -119,26 +132,15 @@ protected:
     /// @return Pointer to a valid shader, nullptr on error
     const ShaderInfo* ComputeShader();
 
-    /// One follower (FRITCHII_ONEF_OP_DISPATCH, E): the current compute shader when it is known
-    /// already (no translation, no hook, nothing written); nullptr otherwise. Then
-    /// ComputeShaderKnownChecks runs ComputeShader's checks and hooks for it, exactly once.
-    [[nodiscard]] const ShaderInfo* KnownComputeShader() const;
-    /// ComputeShader's work for a shader KnownComputeShader found: the trap guards and the OoT
-    /// network, DLSS contract and game DLSS hooks (they throw as ComputeShader's do).
-    void ComputeShaderKnownChecks(const ShaderInfo* shader);
-
     /// @brief Collect the current graphics environments
-    /// @param snapshot Take each environment's snapshot (GraphicsEnvironment::TakeSnapshot)
-    /// @return Bytes the snapshots copied
-    size_t GetGraphicsEnvironments(GraphicsEnvironments& result,
-                                   const std::array<u64, NUM_PROGRAMS>& unique_hashes,
-                                   bool snapshot = false);
+    void GetGraphicsEnvironments(GraphicsEnvironments& result,
+                                 const std::array<u64, NUM_PROGRAMS>& unique_hashes);
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
-    /// vertex_attribute_mask of shader_infos, copied so the lookup of every draw doesn't read a
-    /// ShaderInfo that an invalidation may have removed since.
-    std::array<u64, NUM_PROGRAMS> vertex_attribute_masks{};
     bool last_shaders_valid = false;
+
+    /// The v2 cache that records the native programs lowered here, while one is open
+    ShaderCacheV2::Cache* shader_cache_v2{};
 
 private:
     friend struct ShaderCacheTestAccess;
@@ -148,10 +150,6 @@ private:
     /// @param addr Start address of the shader, this doesn't cache for region
     /// @return Pointer to a valid shader, nullptr when nothing is found
     ShaderInfo* TryGet(VAddr addr) const;
-
-    /// ComputeShader's hooks once its shader is known (the OoT network bypass, the DLSS contract
-    /// trace, the game's DLSS): they may throw FireEmblemUpscale::DispatchReplaced.
-    void RunComputeHooks(const ShaderInfo* shader);
 
     /// @brief Register in the cache a given entry
     /// @param data Shader to store in the cache
@@ -216,6 +214,10 @@ private:
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
+    /// Removals that freed programs; RefreshStages looks the stages up again after each one, since
+    /// shader_infos may point at a freed program.
+    std::atomic<u64> removal_serial{};
+    u64 seen_removal_serial{};
 };
 
 } // namespace VideoCommon

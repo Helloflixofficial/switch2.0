@@ -10,6 +10,10 @@ As such, many of the systems implemented are not 100% accurate to the original s
 
 No formal fuzzing or formal verification has been done on the emulator as a whole, this means there may be hundreds of bugs hiding in each subsystem. As such, output may also not correctly match due to those aforementioned issues.
 
+## src/android/
+
+Entire Android frontend, written mostly in Kotlin and generally having asinine hacks (thanks Android) due to the particularly horrific (and particular way) to do things.
+
 ## src/audio_core/
 
 Handles everything related to audio, this is where most of the filtering and processing occurs (CPU intensive task!).
@@ -24,7 +28,7 @@ The [core folder](../src/core) is the main heart of the emulator, while we don't
 
 ## src/dynarmic/
 
-The ARM CPU recompiler; see [its source](../src/dynarmic).
+See [Dynarmic](./dynarmic).
 
 ## src/hid_core/
 

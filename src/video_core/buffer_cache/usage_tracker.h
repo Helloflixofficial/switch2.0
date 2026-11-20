@@ -15,6 +15,7 @@
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_perf.h"
 
 namespace VideoCommon {
@@ -35,7 +36,17 @@ public:
             return;
         }
         tracked = false;
-        std::ranges::fill(pages, 0ULL);
+        // Only Track sets words, and only in [set_begin, set_end): a buffer of hundreds of MiB
+        // bound in part cleared all its words (8 bytes a 4 KiB page) every frame.
+        std::fill(pages.begin() + static_cast<std::ptrdiff_t>(set_begin),
+                  pages.begin() + static_cast<std::ptrdiff_t>(set_end), 0ULL);
+        if (BackX::g_verify && std::ranges::any_of(pages, [](u64 word) { return word != 0; })) {
+            BackX::Mismatch("usage tracker word set outside the tracked extent", set_begin,
+                            set_end);
+            std::ranges::fill(pages, 0ULL);
+        }
+        set_begin = 0;
+        set_end = 0;
         recent.fill({~u64{0}, 0});
         full_begin = 0;
         full_end = 0;
@@ -57,6 +68,9 @@ public:
         if (page_end < page || page_end >= pages.size()) {
             return;
         }
+        // TrackPage and FillPages below set words only in [page, page_end].
+        set_begin = set_end == 0 ? page : (std::min)(set_begin, page);
+        set_end = (std::max)(set_end, page_end + 1);
         TrackPage(page, offset, size);
         if (page == page_end) {
             return;
@@ -97,9 +111,9 @@ private:
         }
         // Pages in [full_begin, full_end) are all ones already (only Reset clears a page): fill
         // around that run and grow it. Keeps tracking a multi-megabyte binding O(1) once filled.
-        if (!Nx2Perf::On(Nx2Perf::Opt::UsageTracker) || end < full_begin || begin > full_end) {
+        if (end < full_begin || begin > full_end) {
             std::fill(pages.begin() + begin, pages.begin() + end, ~u64{0});
-            if (Nx2Perf::On(Nx2Perf::Opt::UsageTracker) && end - begin > full_end - full_begin) {
+            if (end - begin > full_end - full_begin) {
                 full_begin = begin;
                 full_end = end;
             }
@@ -160,10 +174,13 @@ private:
     /// Ranges tracked last, (offset, size).
     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
     size_t recent_cursor{};
-    bool tracked{};
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};
+    /// The words set since the last reset lie in [set_begin, set_end) (none when set_end is 0).
+    size_t set_begin{};
+    size_t set_end{};
+    bool tracked{};
 };
 
 } // namespace VideoCommon

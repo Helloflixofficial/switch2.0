@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Adapted from a ported native_shader.cpp.
+// Adapted from Duck912/eden-fefw native_shader.cpp at 8c6f052.
 #include <array>
 #include <unordered_map>
 #include <catch2/catch_test_macros.hpp>

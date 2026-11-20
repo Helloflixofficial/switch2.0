@@ -3,10 +3,10 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/nx2_hitch.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_file.h"
+#include "core/hle/service/filesystem/fsp/fs_read_trace.h"
 
 namespace Service::FileSystem {
 
@@ -34,6 +34,7 @@ Result IFile::Read(
               size);
 
     // Read the data from the Storage backend
+    const ReadTraceScope trace{ReadTraceSource::File, size};
     R_RETURN(
         backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size));
 }
@@ -44,15 +45,12 @@ Result IFile::Write(
     LOG_DEBUG(Service_FS, "called, option={}, offset={:#x}, length={}", option.value, offset,
               size);
 
-    // Save data writes can hold the game up (hitch attribution).
-    const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::SaveData};
     R_RETURN(backend->Write(offset, buffer.data(), size, option));
 }
 
 Result IFile::Flush() {
     LOG_DEBUG(Service_FS, "called");
 
-    const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::SaveData};
     R_RETURN(backend->Flush());
 }
 

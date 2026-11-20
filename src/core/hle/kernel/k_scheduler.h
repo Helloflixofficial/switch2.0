@@ -35,8 +35,8 @@ class KScopedSchedulerLockAndSleep;
 
 class KScheduler final {
 public:
-    YUZU_NON_COPYABLE(KScheduler);
-    YUZU_NON_MOVEABLE(KScheduler);
+    LICHII_NON_COPYABLE(KScheduler);
+    LICHII_NON_MOVEABLE(KScheduler);
 
     using LockType = KAbstractSchedulerLock<KScheduler>;
 
@@ -120,10 +120,6 @@ private:
         return kernel.GlobalSchedulerContext().m_priority_queue;
     }
     static u64 UpdateHighestPriorityThreadsImpl(KernelCore& kernel);
-
-    // EXP98 1 and 2 (k_scheduler.cpp): the two yields with the per core early return.
-    static void YieldWithoutCoreMigrationExp98(KernelCore& kernel, int mode);
-    static void YieldWithCoreMigrationExp98(KernelCore& kernel, int mode);
 
     static void RescheduleCurrentHLEThread(KernelCore& kernel);
 

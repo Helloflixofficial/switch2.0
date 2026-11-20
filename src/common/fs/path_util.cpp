@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include "common/container/unordered_map.h"
@@ -132,7 +131,6 @@ public:
         LEGACY_PATH(Yuzu, YUZU)
         LEGACY_PATH(Suyu, SUYU)
         LEGACY_PATH(LegacyEden, EDEN_LEGACY)
-        LEGACY_PATH(Lichii, LICHII)
 #undef LEGACY_PATH
 #elif __ANDROID__
         portable = true;
@@ -158,7 +156,6 @@ public:
         LEGACY_PATH(Yuzu, YUZU)
         LEGACY_PATH(Suyu, SUYU)
         LEGACY_PATH(LegacyEden, EDEN_LEGACY)
-        LEGACY_PATH(Lichii, LICHII)
 #undef LEGACY_PATH
 #endif
         // data
@@ -169,6 +166,7 @@ public:
         GenerateEdenPath(EdenPath::KeysDir, eden_path / KEYS_DIR);
         GenerateEdenPath(EdenPath::LoadDir, eden_path / LOAD_DIR);
         GenerateEdenPath(EdenPath::LogDir, eden_path / LOG_DIR);
+        GenerateEdenPath(EdenPath::LosslessDir, eden_path / LOSSLESS_DIR);
         GenerateEdenPath(EdenPath::NANDDir, eden_path / NAND_DIR);
         GenerateEdenPath(EdenPath::PlayTimeDir, eden_path / PLAY_TIME_DIR);
         GenerateEdenPath(EdenPath::PostPresetDir, eden_path / POST_PRESET_DIR);
@@ -344,11 +342,6 @@ fs::path GetExeDirectory() {
 }
 
 fs::path GetAppDataRoamingDirectory() {
-    // Tests only: EDEN_NX2_APPDATA_ROOT stands in for %APPDATA%, so the profile import (v5.8) is
-    // tested on planted profiles in a sandbox, never on the player's own.
-    if (const char* root = std::getenv("EDEN_NX2_APPDATA_ROOT"); root != nullptr && *root != 0) {
-        return fs::path{Common::FS::ToU8String(root)};
-    }
     PWSTR appdata_roaming_path = nullptr;
 
     SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata_roaming_path);

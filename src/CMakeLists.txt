@@ -7,7 +7,7 @@
 include_directories(.)
 
 # Dynarmic
-if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64))
+if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64) AND NOT LICHII_STATIC_ROOM)
     add_subdirectory(dynarmic)
     add_library(dynarmic::dynarmic ALIAS dynarmic)
 endif()
@@ -16,7 +16,7 @@ endif()
 set_property(DIRECTORY APPEND PROPERTY
     COMPILE_DEFINITIONS $<$<CONFIG:Debug>:_DEBUG> $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)
 
-if (YUZU_STATIC_BUILD)
+if (LICHII_STATIC_BUILD)
     add_compile_definitions(QT_STATICPLUGIN)
 endif()
 
@@ -26,9 +26,9 @@ if (NIGHTLY_BUILD)
 endif()
 
 # Legacy (android only)
-if (YUZU_LEGACY)
+if (LICHII_LEGACY)
     message(WARNING "Making legacy build. Performance may suffer.")
-    add_compile_definitions(YUZU_LEGACY)
+    add_compile_definitions(LICHII_LEGACY)
 endif()
 
 # Genshin Spoof (android only)
@@ -86,6 +86,40 @@ if (MSVC AND NOT CXX_CLANG)
     # /Zc:preprocessor    - Enable standards-conforming preprocessor
     # /Zc:throwingNew     - Let codegen assume `operator new` (without std::nothrow) will never return null
     # /GT                 - Supports fiber safety for data allocated using static thread-local storage
+
+    # Diagnostics the project does not accept. ENABLE_WERROR decides whether they are
+    # errors (/we) or warnings at level 4 (/w4), the same way it decides between
+    # -Werror=... and -W... for GCC and Clang below.
+    set(LICHII_MSVC_DIAGNOSTIC_CODES
+        4062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
+        4189 # 'identifier': local variable is initialized but not referenced
+        4265 # 'class': class has virtual functions, but destructor is not virtual
+        4388 # 'expression': signed/unsigned mismatch
+        4389 # 'operator': signed/unsigned mismatch
+        4456 # Declaration of 'identifier' hides previous local declaration
+        4457 # Declaration of 'identifier' hides function parameter
+        4458 # Declaration of 'identifier' hides class member
+        4459 # Declaration of 'identifier' hides global declaration
+        4547 # 'operator': operator before comma has no effect; expected operator with side-effect
+        4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
+        4555 # Expression has no effect; expected expression with side-effect
+        4826 # Conversion from 'type1' to 'type2' is sign-extended. This may cause unexpected runtime behavior.
+        5038 # data member 'member1' will be initialized after data member 'member2'
+        5233 # explicit lambda capture 'identifier' is not used
+        5245 # 'function': unreferenced function with internal linkage has been removed
+    )
+
+    if (ENABLE_WERROR)
+        set(LICHII_MSVC_DIAGNOSTIC_LEVEL /we)
+    else()
+        set(LICHII_MSVC_DIAGNOSTIC_LEVEL /w4)
+    endif()
+
+    unset(LICHII_MSVC_DIAGNOSTICS)
+    foreach (code IN LISTS LICHII_MSVC_DIAGNOSTIC_CODES)
+        list(APPEND LICHII_MSVC_DIAGNOSTICS ${LICHII_MSVC_DIAGNOSTIC_LEVEL}${code})
+    endforeach()
+
     add_compile_options(
         /MP
         /Zm200
@@ -105,23 +139,8 @@ if (MSVC AND NOT CXX_CLANG)
         /external:anglebrackets # Treats all headers included by #include <header>, where the header file is enclosed in angle brackets (< >), as external headers
         /external:W0            # Sets the default warning level to 0 for external headers, effectively disabling warnings for them.
 
-        /we4062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
-        /we4189 # 'identifier': local variable is initialized but not referenced
-        /we4265 # 'class': class has virtual functions, but destructor is not virtual
-        /we4388 # 'expression': signed/unsigned mismatch
-        /we4389 # 'operator': signed/unsigned mismatch
-        /wd4456 # Declaration of 'identifier' hides previous local declaration
-        /wd4457 # Declaration of 'identifier' hides function parameter
-        /wd4458 # Declaration of 'identifier' hides class member
-        /wd4459 # Declaration of 'identifier' hides global declaration
-        /w4505 # 'function': unreferenced local function has been removed
-        /we4547 # 'operator': operator before comma has no effect; expected operator with side-effect
-        /we4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
-        /we4555 # Expression has no effect; expected expression with side-effect
-        /we4826 # Conversion from 'type1' to 'type2' is sign-extended. This may cause unexpected runtime behavior.
-        /we5038 # data member 'member1' will be initialized after data member 'member2'
-        /we5233 # explicit lambda capture 'identifier' is not used
-        /we5245 # 'function': unreferenced function with internal linkage has been removed
+        ${LICHII_MSVC_DIAGNOSTICS} # /we or /w4, see above
+        /w44505 # 'function': unreferenced local function has been removed
 
         /wd4100 # 'identifier': unreferenced formal parameter
         /wd4324 # 'struct_name': structure was padded due to __declspec(align())
@@ -146,13 +165,7 @@ if (MSVC AND NOT CXX_CLANG)
     endif()
 
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG   "/DEBUG /MANIFEST:NO" CACHE STRING "" FORCE)
-    # LICHII_LINK_ICF=OFF keeps identical functions apart, so sampling profiles name them right.
-    option(LICHII_LINK_ICF "Fold identical functions when linking Release builds (MSVC)" ON)
-    if (LICHII_LINK_ICF)
-        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
-    else()
-        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,NOICF" CACHE STRING "" FORCE)
-    endif()
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
 else()
     if (NOT MSVC)
         add_compile_options(
@@ -226,6 +239,13 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-stringop-overflow>)
     endif()
 
+    # GCC 13+ unswitches loops on switch statements and can drop cases from the unswitched copy
+    # (same pass as https://gcc.gnu.org/PR128356). It dropped the split front's macro uploads
+    # in Maxwell3D::FrontCallMultiMethod, so games using macros showed a black screen (#500).
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "13" AND CXX_GCC)
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fno-unswitch-loops>)
+    endif()
+
     # Set file offset size to 64 bits.
     #
     # On modern Unixes, this is typically already the case. The lone exception is
@@ -235,10 +255,10 @@ else()
         add_compile_definitions(_FILE_OFFSET_BITS=64)
     endif()
 
-    if (YUZU_STATIC_BUILD AND NOT APPLE AND NOT MSVC)
+    if (LICHII_STATIC_BUILD AND NOT APPLE AND NOT MSVC)
         add_compile_options(-static)
 
-        # static builds need libpthread, libgcc, and libstdc++ linked explicitly as static
+        # lichii-cmd requires us to explicitly link libpthread, libgcc, and libstdc++ as static
         add_link_options(-Wl,-Bstatic -static -lpthread)
         add_link_options(-static-libgcc -static-libstdc++)
     endif()
@@ -265,6 +285,19 @@ endif()
 add_subdirectory(common)
 add_subdirectory(network)
 
+if (LICHII_ROOM)
+    add_subdirectory(dedicated_room)
+endif()
+
+if (LICHII_ROOM_STANDALONE)
+    add_subdirectory(lichii_room_standalone)
+    set_target_properties(lichii-room PROPERTIES OUTPUT_NAME "eden-room")
+endif()
+
+if (LICHII_STATIC_ROOM)
+    return()
+endif()
+
 add_subdirectory(core)
 add_subdirectory(audio_core)
 add_subdirectory(video_core)
@@ -273,20 +306,57 @@ add_subdirectory(input_common)
 add_subdirectory(frontend_common)
 add_subdirectory(shader_recompiler)
 
-if (YUZU_TESTS)
+if (LICHII_TESTS)
     add_subdirectory(tests)
+endif()
+
+if (LICHII_FUZZERS)
+    add_subdirectory(fuzz)
+endif()
+
+# Version resource for the programs in the Windows zips: antivirus heuristics count an unsigned
+# program without file metadata against it.
+function(lichii_add_version_info target description file_name)
+    if (NOT WIN32)
+        return()
+    endif()
+    if (LICHII_BUILD_TAG MATCHES "^build-([0-9]+)$")
+        set(LICHII_VERSION_NUMBER ${CMAKE_MATCH_1})
+        set(LICHII_VERSION_STRING ${LICHII_BUILD_TAG})
+    else()
+        set(LICHII_VERSION_NUMBER 0)
+        set(LICHII_VERSION_STRING "local build")
+    endif()
+    set(LICHII_FILE_DESCRIPTION ${description})
+    set(LICHII_FILE_NAME ${file_name})
+    set(rc ${CMAKE_CURRENT_BINARY_DIR}/${target}_version.rc)
+    configure_file(${PROJECT_SOURCE_DIR}/dist/version_info.rc.in ${rc} @ONLY)
+    target_sources(${target} PRIVATE ${rc})
+endfunction()
+
+if (LICHII_CMD)
+    add_subdirectory(lichii_cmd)
+    set_target_properties(lichii-cmd PROPERTIES OUTPUT_NAME "eden-cli")
+    lichii_add_version_info(lichii-cmd "Lichii command line" eden-cli.exe)
 endif()
 
 if (ENABLE_QT)
     add_subdirectory(qt_common)
-    add_subdirectory(yuzu)
-    if (WIN32)
-        add_subdirectory(lichii_forwarder)
+    add_subdirectory(lichii)
+    lichii_add_version_info(lichii "Lichii" lichii.exe)
+    if (WIN32 AND ENABLE_UPDATE_CHECKER)
+        add_subdirectory(updater)
+        lichii_add_version_info(lichii-updater "Lichii update installer" lichii-updater.exe)
     endif()
 endif()
 
 if (ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
+endif()
+
+if (ANDROID)
+    add_subdirectory(android/app/src/main/jni)
+    target_include_directories(lichii-android PRIVATE android/app/src/main)
 endif()
 
 include(GenerateDepHashes)

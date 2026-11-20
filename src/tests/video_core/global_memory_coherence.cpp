@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <map>
 #include <set>
 #include <span>
@@ -11,9 +10,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
+#ifdef HAS_OPENGL
 #include "shader_recompiler/backend/glasm/emit_glasm.h"
 #include "shader_recompiler/backend/glsl/emit_glsl.h"
-#include "shader_recompiler/backend/spirv/emit_spirv.h"
+#endif
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
@@ -93,6 +94,34 @@ std::vector<std::vector<u32>> Instructions(const std::vector<u32>& code, u32 opc
     return result;
 }
 
+// Whether a function returns id, directly or through the OpPhis that merge its branches.
+bool ReturnsValue(const std::vector<u32>& code, u32 id) {
+    std::map<u32, std::vector<u32>> incoming;
+    for (const auto& op : Instructions(code, 245)) {
+        for (size_t i = 2; i + 1 < op.size(); i += 2) {
+            incoming[op[1]].push_back(op[i]);
+        }
+    }
+    std::vector<u32> pending;
+    for (const auto& op : Instructions(code, 254)) {
+        if (op.size() == 1) {
+            pending.push_back(op[0]);
+        }
+    }
+    std::set<u32> seen;
+    while (!pending.empty()) {
+        const u32 value = pending.back();
+        pending.pop_back();
+        if (value == id) {
+            return true;
+        }
+        if (seen.insert(value).second && incoming.contains(value)) {
+            pending.insert(pending.end(), incoming[value].begin(), incoming[value].end());
+        }
+    }
+    return false;
+}
+
 struct GlobalAtomicProgram : Program {
     explicit GlobalAtomicProgram(bool native, s64 displacement = 4, bool atomic = true) {
         TestEnvironment env{native};
@@ -132,82 +161,6 @@ struct GlobalAtomicProgram : Program {
         program.info.constant_buffer_descriptors = {{0, 1}, {1, 1}};
     }
 };
-
-// Sets EDEN_NX2_SPIRV_INLINE_GLOBALS for one emission and restores it after.
-struct InlineGlobalsMode {
-    static constexpr const char* name = "EDEN_NX2_SPIRV_INLINE_GLOBALS";
-    std::string previous;
-    bool existed{};
-
-    explicit InlineGlobalsMode(const char* mode) {
-        if (const char* value = std::getenv(name)) {
-            previous = value;
-            existed = true;
-        }
-        Set(mode);
-    }
-
-    static void Set(const char* value) {
-#ifdef _WIN32
-        _putenv_s(name, value ? value : "");
-#else
-        if (value) {
-            setenv(name, value, 1);
-        } else {
-            unsetenv(name);
-        }
-#endif
-    }
-
-    ~InlineGlobalsMode() {
-        Set(existed ? previous.c_str() : nullptr);
-    }
-};
-
-// A global load and store at an address from a constant buffer, with two NVN storage buffers
-// the address can route to.
-std::vector<u32> EmitRoutedGlobals(Stage stage, const char* mode) {
-    const InlineGlobalsMode guard{mode};
-    Program fixture;
-    fixture.program.stage = stage;
-    auto& info = fixture.program.info;
-    info.used_storage_buffer_types = IR::Type::U32;
-    info.storage_buffers_descriptors = {{0, 0x340, 1, true}, {0, 0x400, 1, true}};
-    info.nvn_buffer_base = 0x310;
-    info.nvn_buffer_used.set(3);
-    info.nvn_buffer_used.set(15);
-    info.uses_global_memory = true;
-    info.uses_int64 = true;
-    info.stores_global_memory = true;
-    info.constant_buffer_descriptors = {{0, 1}};
-    info.used_constant_buffer_types = IR::Type::U32 | IR::Type::U32x2;
-    fixture.profile.support_int64 = true;
-    fixture.profile.support_descriptor_aliasing = true;
-    IR::IREmitter ir{fixture.block};
-    const auto address = ir.PackUint2x32(
-        ir.CompositeConstruct(ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x10)), ir.Imm32(0)));
-    ir.WriteGlobal32(address, ir.LoadGlobal32(address));
-    return Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
-}
-
-constexpr u32 SpvOpEntryPoint = 15;
-constexpr u32 SpvOpFunction = 54;
-constexpr u32 SpvOpFunctionCall = 57;
-constexpr u32 SpvOpBranchConditional = 250;
-constexpr u32 SpvOpSwitch = 251;
-constexpr u32 SpvDontInline = 0x2;
-
-// The functions emitted with DontInline.
-std::vector<u32> DontInlineFunctions(const std::vector<u32>& code) {
-    std::vector<u32> result;
-    for (const auto& op : Instructions(code, SpvOpFunction)) {
-        REQUIRE(op.size() == 4);
-        if ((op[2] & SpvDontInline) != 0) {
-            result.push_back(op[1]);
-        }
-    }
-    return result;
-}
 } // namespace
 
 TEST_CASE("Native LDG cache policy reaches every global load width", "[video_core][coherence]") {
@@ -316,6 +269,7 @@ TEST_CASE("Coherent storage aliases and barrier semantics are emitted in SPIR-V"
     }
 }
 
+#ifdef HAS_OPENGL
 TEST_CASE("GLSL and GLASM emit coherent storage and barrier operations",
           "[video_core][coherence]") {
     for (const bool coherent : {false, true}) {
@@ -368,6 +322,7 @@ TEST_CASE("GLSL and GLASM emit coherent storage and barrier operations",
         }
     }
 }
+#endif
 
 TEST_CASE("Joining vertex storage preserves coherent memory requirement", "[video_core][coherence]") {
     for (const bool a : {false, true}) {
@@ -383,7 +338,12 @@ TEST_CASE("Joining vertex storage preserves coherent memory requirement", "[vide
 
 TEST_CASE("Global fallback backends address sparse guest slots through compact bindings",
           "[shader][storage_buffer][nvn]") {
-    for (const u32 backend : {0U, 1U, 2U}) {
+#ifdef HAS_OPENGL
+    constexpr std::array<u32, 3> backends{0U, 1U, 2U};
+#else
+    constexpr std::array<u32, 1> backends{0U};
+#endif
+    for (const u32 backend : backends) {
         CAPTURE(backend);
         Program fixture;
         auto& info = fixture.program.info;
@@ -441,7 +401,9 @@ TEST_CASE("Global fallback backends address sparse guest slots through compact b
                 expected_bindings.insert(first_storage_binding + binding);
             }
             CHECK(accessed_bindings == expected_bindings);
-        } else if (backend == 1) {
+        }
+#ifdef HAS_OPENGL
+        else if (backend == 1) {
             const auto code = Backend::GLSL::EmitGLSL(fixture.profile, fixture.program);
             CHECK(code.find("uint64_t ssbo_addr1=") != std::string::npos);
             CHECK(code.find("uint64_t ssbo_addr2=") != std::string::npos);
@@ -458,125 +420,7 @@ TEST_CASE("Global fallback backends address sparse guest slots through compact b
             CHECK(code.find("ssbo1[RC.x]") != std::string::npos);
             CHECK(code.find("ssbo2[RC.x]") != std::string::npos);
         }
-    }
-}
-
-TEST_CASE("SPIR-V global memory helpers are emitted as DontInline functions",
-          "[video_core][spirv][global_memory]") {
-    Program fixture;
-    auto& info = fixture.program.info;
-    info.used_storage_buffer_types = IR::Type::U32;
-    info.storage_buffers_descriptors = {{0, 0x340, 1, true}, {0, 0x400, 1, true}};
-    info.uses_global_memory = true;
-    info.uses_int64 = true;
-    info.stores_global_memory = true;
-    info.constant_buffer_descriptors = {{0, 1}};
-    info.used_constant_buffer_types = IR::Type::U32x2;
-    info.uses_local_invocation_id = true;
-    fixture.profile.support_int64 = true;
-    fixture.profile.support_descriptor_aliasing = true;
-    IR::IREmitter ir{fixture.block};
-    const auto address =
-        ir.PackUint2x32(ir.CompositeConstruct(ir.LocalInvocationIdX(), ir.Imm32(0)));
-    ir.WriteGlobal32(address, ir.LoadGlobal32(address));
-
-    // DontInline helpers are mode 0 (the default, 1, inlines them).
-    const InlineGlobalsMode mode{"0"};
-    const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
-    constexpr u32 OpEntryPoint = 15;
-    constexpr u32 OpFunction = 54;
-    constexpr u32 OpFunctionCall = 57;
-    constexpr u32 DontInline = 0x2;
-    std::map<u32, u32> controls;
-    for (const auto& op : Instructions(code, OpFunction)) {
-        REQUIRE(op.size() == 4);
-        controls[op[1]] = op[2];
-    }
-    const auto entry_points = Instructions(code, OpEntryPoint);
-    REQUIRE(entry_points.size() == 1);
-    REQUIRE(controls.contains(entry_points[0][1]));
-    CHECK((controls.at(entry_points[0][1]) & DontInline) == 0);
-
-    std::set<u32> callees;
-    for (const auto& op : Instructions(code, OpFunctionCall)) {
-        REQUIRE(op.size() >= 3);
-        callees.insert(op[2]);
-    }
-    REQUIRE(callees.size() == 2);
-    for (const u32 callee : callees) {
-        CAPTURE(callee);
-        REQUIRE(controls.contains(callee));
-        CHECK((controls.at(callee) & DontInline) != 0);
-    }
-}
-
-TEST_CASE("SPIR-V global memory mode 3 searches the buffers in one DontInline function",
-          "[video_core][spirv][global_memory]") {
-    const auto code = EmitRoutedGlobals(Stage::Compute, "3");
-    // Only the search is DontInline: the helpers and the entry point stay inlinable.
-    const auto dont_inline = DontInlineFunctions(code);
-    REQUIRE(dont_inline.size() == 1);
-    const u32 search = dont_inline[0];
-    const auto entry_points = Instructions(code, SpvOpEntryPoint);
-    REQUIRE(entry_points.size() == 1);
-    CHECK(entry_points[0][1] != search);
-
-    // Each of the 32, 64 and 128-bit load and store helpers calls it once.
-    const auto calls = Instructions(code, SpvOpFunctionCall);
-    CHECK(std::ranges::count_if(calls, [&](const auto& op) {
-              REQUIRE(op.size() >= 3);
-              return op[2] == search;
-          }) == 6);
-
-    // and then switches once over the two NVN buffers (selector, default, then value/label pairs).
-    const auto switches = Instructions(code, SpvOpSwitch);
-    REQUIRE(switches.size() == 6);
-    for (const auto& op : switches) {
-        REQUIRE(op.size() == 6);
-        CHECK(op[2] == 0);
-        CHECK(op[4] == 1);
-    }
-
-    // The per-buffer range tests live only in the search; mode 1 repeats them in every helper.
-    const auto search_branches = Instructions(code, SpvOpBranchConditional).size();
-    CHECK(search_branches == 2);
-    const auto inlined = EmitRoutedGlobals(Stage::Compute, "1");
-    CHECK(DontInlineFunctions(inlined).empty());
-    CHECK(Instructions(inlined, SpvOpSwitch).empty());
-    CHECK(Instructions(inlined, SpvOpBranchConditional).size() == 6 * search_branches);
-}
-
-TEST_CASE("SPIR-V global memory mode 3 leaves graphics programs as mode 1 emits them",
-          "[video_core][spirv][global_memory]") {
-    const auto inlined = EmitRoutedGlobals(Stage::Fragment, "1");
-    CHECK_FALSE(Instructions(inlined, SpvOpBranchConditional).empty());
-    CHECK(EmitRoutedGlobals(Stage::Fragment, "3") == inlined);
-}
-
-TEST_CASE("SPIR-V global memory mode 3 routes atomics through the shared search",
-          "[video_core][spirv][global_memory][global_atomic]") {
-    for (const bool native : {false, true}) {
-        CAPTURE(native);
-        const InlineGlobalsMode mode{"3"};
-        GlobalAtomicProgram fixture{native};
-        const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
-        const size_t candidates = native ? 3U : 2U;
-        // One atomic per candidate buffer, each one's old value returned.
-        const auto atomics = Instructions(code, 234);
-        REQUIRE(atomics.size() == candidates);
-        const auto returns = Instructions(code, 254);
-        for (const auto& op : atomics) {
-            REQUIRE(op.size() == 6);
-            CHECK(std::ranges::any_of(returns, [&](const auto& returned) {
-                return returned.size() == 1 && returned[0] == op[1];
-            }));
-        }
-        REQUIRE(DontInlineFunctions(code).size() == 1);
-        const auto switches = Instructions(code, SpvOpSwitch);
-        REQUIRE_FALSE(switches.empty());
-        for (const auto& op : switches) {
-            CHECK(op.size() == 2 + 2 * candidates);
-        }
+#endif
     }
 }
 
@@ -650,8 +494,10 @@ TEST_CASE("Global atomic add preserves native candidate selection and atomic old
             return inst.GetOpcode() == IR::Opcode::GlobalAtomicIAdd32;
         }) == 1);
         const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+        // Both routings pick between the two pointers the address comes from (natively not the
+        // output buffer, which no path of the address reaches)
         const auto atomics = Instructions(code, 234);
-        REQUIRE(atomics.size() == (native ? 3U : 2U));
+        REQUIRE(atomics.size() == 2U);
         std::map<u32, u32> constants;
         std::map<u32, u32> pointer_bases;
         std::map<u32, u32> bindings;
@@ -664,18 +510,34 @@ TEST_CASE("Global atomic add preserves native candidate selection and atomic old
         for (const auto& op : Instructions(code, 71)) {
             if (op.size() == 3 && op[1] == 33) bindings[op[0]] = op[2];
         }
-        const auto returns = Instructions(code, 254);
         std::set<u32> atomic_bindings;
         for (const auto& op : atomics) {
             REQUIRE(op.size() == 6);
             CHECK(constants.at(op[3]) == 1);
             CHECK(constants.at(op[4]) == 0);
-            CHECK(std::ranges::any_of(returns, [&](const auto& returned) {
-                return returned.size() == 1 && returned[0] == op[1];
-            }));
+            CHECK(ReturnsValue(code, op[1]));
             atomic_bindings.insert(bindings.at(pointer_bases.at(op[2])));
         }
-        CHECK(atomic_bindings == (native ? std::set<u32>{2, 3, 4} : std::set<u32>{3, 4}));
+        CHECK(atomic_bindings == (native ? std::set<u32>{2, 3} : std::set<u32>{3, 4}));
+    }
+}
+
+TEST_CASE("Native global routing helpers stay inlinable and route with a branch per buffer",
+          "[shader][spirv][global_atomic][oot]") {
+    // Marked DontInline and routed through one OpSwitch, these helpers made Ocarina of Time's
+    // foliage compute programs draw the far forest unculled and at wrong heights on NVIDIA.
+    for (const bool atomic : {false, true}) {
+        CAPTURE(atomic);
+        GlobalAtomicProgram fixture{true, 4, atomic};
+        REQUIRE(fixture.program.info.native_global_bounds);
+        const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+        CHECK(Instructions(code, 251).empty());
+        const auto functions = Instructions(code, 54);
+        REQUIRE(functions.size() > 1);
+        for (const auto& function : functions) {
+            REQUIRE(function.size() == 4);
+            CHECK(function[2] == 0);
+        }
     }
 }
 
@@ -699,14 +561,11 @@ TEST_CASE("Global unsigned atomic max routes buffers and returns the old value",
             }
             const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
             const auto atomics = Instructions(code, 239);
-            REQUIRE(atomics.size() == (native ? 3U : 2U));
+            REQUIRE(atomics.size() == 2U);
             CHECK(Instructions(code, 234).empty());
-            const auto returns = Instructions(code, 254);
             for (const auto& atomic : atomics) {
                 REQUIRE(atomic.size() == 6);
-                CHECK(std::ranges::any_of(returns, [&](const auto& returned) {
-                    return returned.size() == 1 && returned[0] == atomic[1];
-                }));
+                CHECK(ReturnsValue(code, atomic[1]));
             }
         }
     }
@@ -719,12 +578,9 @@ TEST_CASE("Global atomic routing works without descriptor aliases",
         fixture.profile.support_descriptor_aliasing = false;
         const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
         const auto atomics = Instructions(code, 234);
-        REQUIRE(atomics.size() == (native ? 3U : 2U));
-        const auto returns = Instructions(code, 254);
+        REQUIRE(atomics.size() == 2U);
         for (const auto& op : atomics) {
-            CHECK(std::ranges::any_of(returns, [&](const auto& returned) {
-                return returned.size() == 1 && returned[0] == op[1];
-            }));
+            CHECK(ReturnsValue(code, op[1]));
         }
     }
 }

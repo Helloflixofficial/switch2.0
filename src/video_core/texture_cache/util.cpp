@@ -11,8 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstring>
+#include <latch>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -23,25 +23,26 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/div_ceil.h"
+#include "common/literals.h"
 #include "common/scratch_buffer.h"
 #include "common/settings.h"
-#include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
-#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/texture_cache/formatter.h"
+#include "video_core/texture_cache/host_mip_limits.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/astc.h"
 #include "video_core/textures/bcn.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/textures/unswizzle_worker.h"
+#include "video_core/textures/workers.h"
 
 namespace VideoCommon {
 
@@ -855,6 +856,70 @@ bool IsValidEntry(const Tegra::MemoryManager& gpu_memory, const TICEntry& config
     return gpu_memory.GpuToCpuAddress(address, guest_size_bytes).has_value();
 }
 
+void PrefaultGuestMemory(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, size_t size) {
+    using namespace Common::Literals;
+    // Guest memory is one section mapped twice, and Windows faults once per 4 KiB the first time
+    // these reads go through the backing to a page the guest wrote through its own view, or one
+    // trimmed or hinted cold since: 1.3-1.8 us a page, so Star Fox's cutscene bursts untiled at
+    // 1.7 GB/s. Faults on several threads resolve in parallel (1.6-1.75x on 3 threads). Linux maps
+    // 16 pages per such fault, where touching them first gained nothing.
+#ifdef _WIN32
+    constexpr bool PrefaultPays = true;
+#else
+    constexpr bool PrefaultPays = false;
+#endif
+    constexpr size_t PageSize = 4_KiB;
+    constexpr size_t MinBytes = 1_MiB;
+    if (!PrefaultPays || size < MinBytes) {
+        return;
+    }
+    std::vector<const u8*> pages;
+    if (const u8* const span = gpu_memory.GetSpan(gpu_addr, size)) {
+        const auto begin = Common::AlignDown(reinterpret_cast<uintptr_t>(span), PageSize);
+        const auto end = reinterpret_cast<uintptr_t>(span) + size;
+        pages.reserve(Common::DivCeil(end - begin, PageSize));
+        for (uintptr_t page = begin; page < end; page += PageSize) {
+            pages.push_back(reinterpret_cast<const u8*>(page));
+        }
+    } else {
+        pages.reserve(Common::DivCeil(size, PageSize) + 1);
+        for (GPUVAddr page = gpu_addr; page < gpu_addr + size;
+             page = Common::AlignDown(page, PageSize) + PageSize) {
+            if (const u8* const pointer = gpu_memory.GetPointer(page)) {
+                pages.push_back(pointer);
+            }
+        }
+    }
+    constexpr size_t Batch = 64;
+    constexpr size_t MaxHelpers = 7;
+    std::atomic<size_t> cursor{0};
+    const auto touch = [&] {
+        for (;;) {
+            const size_t first = cursor.fetch_add(Batch, std::memory_order_relaxed);
+            if (first >= pages.size()) {
+                return;
+            }
+            const size_t last = (std::min)(first + Batch, pages.size());
+            for (size_t i = first; i < last; ++i) {
+                static_cast<void>(*static_cast<const volatile u8*>(pages[i]));
+            }
+        }
+    };
+    std::latch helpers{static_cast<std::ptrdiff_t>(MaxHelpers)};
+    size_t queued = 0;
+    auto& workers = Tegra::Texture::GetThreadWorkers();
+    while (queued < MaxHelpers && (queued + 1) * Batch * 2 <= pages.size() &&
+           workers.TryQueueWork([&] {
+               touch();
+               helpers.count_down();
+           })) {
+        ++queued;
+    }
+    helpers.count_down(static_cast<std::ptrdiff_t>(MaxHelpers - queued));
+    touch();
+    helpers.wait();
+}
+
 boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output, Tegra::Texture::UnswizzleWorker* worker) {
@@ -922,21 +987,12 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
             const std::span<u8> dst = output.subspan(host_offset);
             const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);
-            // EDEN_NX2_EXP8 bit 4: large 2D levels untiled in bands on the transcode workers too
-            // (only from the texture cache's own thread, which passes a worker).
-            const bool banded = worker && info.type == ImageType::e2D && info.num_samples == 1 &&
-                                (VideoCore::Nx2Debug::Experiment(8) & 4) != 0 &&
-                                Tegra::Texture::TryUnswizzleBands(
-                                    dst.first(host_bytes_per_layer), src.first(level_sizes[level]),
-                                    1U << bpp_log2, num_tiles.width, num_tiles.height,
-                                    num_tiles.depth, block.height, block.depth, stride_alignment,
-                                    gpu_memory.UsesNativeTiling(), Nx2Perf::Verify());
-            if (!banded && (!worker || !Nx2Perf::On(Nx2Perf::Opt::UnswizzleWorkers) ||
+            if (!worker ||
                 info.type != ImageType::e2D || info.num_samples != 1 ||
                 !worker->TryUnswizzle(
                     dst.first(host_bytes_per_layer), src.first(level_sizes[level]), 1U << bpp_log2,
                     num_tiles.width, num_tiles.height, num_tiles.depth, block.height, block.depth,
-                    stride_alignment, gpu_memory.UsesNativeTiling(), Nx2Perf::Verify()))) {
+                    stride_alignment, gpu_memory.UsesNativeTiling(), Nx2Perf::Verify())) {
                 UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
                                  num_tiles.depth, block.height, block.depth, stride_alignment,
                                  gpu_memory.UsesNativeTiling());
@@ -1276,107 +1332,8 @@ UnswizzlePlan PlanUnswizzleImageRows(
     return plan;
 }
 
-namespace {
-/// FRITCHII_UNSWIZZLE_IN_PLACE's counts for its 10 s line.
-struct InPlaceCounts {
-    std::atomic<u64> in_place{};
-    std::atomic<u64> in_place_bytes{};
-    std::atomic<u64> copied{};
-    std::atomic<u64> copied_bytes{};
-    std::atomic<u64> checked{};
-    std::atomic<u64> mismatched{};
-    std::atomic<s64> last_log_ns{};
-};
-InPlaceCounts g_in_place_counts;
-
-void LogInPlaceCounts(int mode) {
-    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count();
-    s64 last = g_in_place_counts.last_log_ns.load(std::memory_order_relaxed);
-    if (last == 0) {
-        g_in_place_counts.last_log_ns.compare_exchange_strong(last, now,
-                                                              std::memory_order_relaxed);
-        return;
-    }
-    if (now - last < 10'000'000'000 ||
-        !g_in_place_counts.last_log_ns.compare_exchange_strong(last, now,
-                                                               std::memory_order_relaxed)) {
-        return;
-    }
-    const u64 in_place = g_in_place_counts.in_place.exchange(0, std::memory_order_relaxed);
-    const u64 in_place_bytes =
-        g_in_place_counts.in_place_bytes.exchange(0, std::memory_order_relaxed);
-    const u64 copied = g_in_place_counts.copied.exchange(0, std::memory_order_relaxed);
-    const u64 copied_bytes = g_in_place_counts.copied_bytes.exchange(0, std::memory_order_relaxed);
-    const u64 checked = g_in_place_counts.checked.exchange(0, std::memory_order_relaxed);
-    const u64 mismatched = g_in_place_counts.mismatched.exchange(0, std::memory_order_relaxed);
-    if (in_place + copied == 0) {
-        return;
-    }
-    LOG_INFO(HW_GPU,
-             "Unswizzle in place in 10 s (FRITCHII_UNSWIZZLE_IN_PLACE={}): {} runs read in place "
-             "({} MiB), {} copied first ({} MiB); verify {} checked, {} differ (must be 0)",
-             mode, in_place, in_place_bytes >> 20, copied, copied_bytes >> 20, checked,
-             mismatched);
-}
-} // Anonymous namespace
-
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output) {
-    // FRITCHII_UNSWIZZLE_IN_PLACE (live, default 0; port of tomk134/lichii-custom e8e50e797 via
-    // DahBard/Blitchii 43321b8db9, d05a021080 and d3251a67cf): a run that is contiguous in host
-    // memory is untiled straight from guest memory instead of being copied into a vector first
-    // (the copy was ~40% of the GPU thread in a texture-loading hitch in OoT, leaving Link's
-    // house). GetSpan, not IsContinuousRange: the run must be contiguous in host memory too, as
-    // device pages map to guest memory one by one (reading past a run contiguous only in device
-    // memory crashed Blitchii between Hyrule Field and Kokiri Forest). Other runs are copied into
-    // a grow-only scratch buffer. 2 = also untile every in-place run from a copy and compare
-    // (counted on the 10 s line, must be 0; a game write between the two reads can differ).
-    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_unswizzle_in_place,
-                                                      "FRITCHII_UNSWIZZLE_IN_PLACE");
-    if (mode > 0) {
-        static thread_local Common::ScratchBuffer<u8> scratch;
-        static thread_local Common::ScratchBuffer<u8> check;
-        for (const auto& r : plan.runs) {
-            std::span<const u8> input;
-            const u8* const direct = gpu_memory.GetSpan(r.src_addr, r.guest_bytes);
-            if (direct != nullptr) {
-                input = std::span<const u8>{direct, r.guest_bytes};
-                g_in_place_counts.in_place.fetch_add(1, std::memory_order_relaxed);
-                g_in_place_counts.in_place_bytes.fetch_add(r.guest_bytes,
-                                                           std::memory_order_relaxed);
-            } else {
-                scratch.resize_destructive(r.guest_bytes);
-                gpu_memory.ReadBlockUnsafe(r.src_addr, scratch.data(), r.guest_bytes);
-                input = std::span<const u8>{scratch.data(), r.guest_bytes};
-                g_in_place_counts.copied.fetch_add(1, std::memory_order_relaxed);
-                g_in_place_counts.copied_bytes.fetch_add(r.guest_bytes, std::memory_order_relaxed);
-            }
-            const std::span<u8> destination = output.subspan(r.host_offset, r.host_bytes);
-            Tegra::Texture::UnswizzleTexture(destination, input, 1U << plan.bpp_log2,
-                                             r.run_tiles, r.tile_rows, 1, r.block.height,
-                                             r.block.depth, r.run_alignment,
-                                             gpu_memory.UsesNativeTiling());
-            if (mode >= 2 && direct != nullptr) {
-                // The old path's result for the same run, compared with what was just written.
-                scratch.resize_destructive(r.guest_bytes);
-                gpu_memory.ReadBlockUnsafe(r.src_addr, scratch.data(), r.guest_bytes);
-                check.resize_destructive(r.host_bytes);
-                Tegra::Texture::UnswizzleTexture(
-                    std::span<u8>{check.data(), r.host_bytes},
-                    std::span<const u8>{scratch.data(), r.guest_bytes}, 1U << plan.bpp_log2,
-                    r.run_tiles, r.tile_rows, 1, r.block.height, r.block.depth, r.run_alignment,
-                    gpu_memory.UsesNativeTiling());
-                g_in_place_counts.checked.fetch_add(1, std::memory_order_relaxed);
-                if (std::memcmp(check.data(), destination.data(), r.host_bytes) != 0) {
-                    g_in_place_counts.mismatched.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        }
-        LogInPlaceCounts(mode);
-        return;
-    }
     std::vector<u8> run;
     for (const auto& r : plan.runs) {
         run.resize(r.guest_bytes);
@@ -1632,13 +1589,18 @@ boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const I
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer) {
-    const Common::WriteRing::SiteScope write_site{"texture download (SwizzleImage)", true};
-    // The memory seam (SEAM 2/3): a guest write between a held fill and its draw is checked.
-    if (MemReadLog::g_held.load(std::memory_order_relaxed)) [[unlikely]] {
-        MemReadLog::NoteGuestWrite(gpu_memory, gpu_addr, CalculateGuestSizeInBytes(info));
-    }
     const bool is_pitch_linear = info.type == ImageType::Linear;
     for (const BufferImageCopy& copy : copies) {
+        const u32 levels =
+            info.num_samples > 1
+                ? 1
+                : HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
+                                    static_cast<u32>(info.resources.levels));
+        if (!IsHostMipLevel(copy.image_subresource.base_level, levels)) {
+            // The host did not download this tail level. Preserve the guest bytes.
+            continue;
+        }
+
         if (is_pitch_linear) {
             SwizzlePitchLinearImage(gpu_memory, gpu_addr, info, copy, memory);
         } else {
@@ -1649,11 +1611,6 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
 
 bool ScaledImageFits(const ImageInfo& info, const Settings::ResolutionScalingInfo& resolution,
                      u32 max_extent) noexcept {
-    // A scale that does not enlarge the image (1x, 0.5x, 0.75x) always fits: refusing it would
-    // leave the image at its native size, larger than the scaled one.
-    if (resolution.up_scale <= (1U << resolution.down_shift)) {
-        return true;
-    }
     const auto [samples_x, samples_y] = SamplesLog2(info.num_samples);
     const u32 width = resolution.ScaleUp(info.size.width) >> samples_x;
     const u32 height =
@@ -1675,6 +1632,15 @@ bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32
         const Extent3D rhs_size = BlockLinearAlignedSize(rhs, rhs_level);
         return lhs_size.width == rhs_size.width && lhs_size.height == rhs_size.height;
     }
+}
+
+bool IsPaddedSquare(const ImageInfo& info) noexcept {
+    if (info.type != ImageType::e2D || info.num_samples != 1 || info.size.width <= info.size.height) {
+        return false;
+    }
+    ImageInfo square = info;
+    square.size.width = info.size.height;
+    return IsBlockLinearSizeCompatible(info, square, 0, 0, false);
 }
 
 bool IsBlockLinearSizeCompatibleBPPRelaxed(const ImageInfo& lhs, const ImageInfo& rhs,

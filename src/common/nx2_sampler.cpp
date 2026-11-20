@@ -12,12 +12,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -34,13 +36,35 @@ constexpr size_t MaxDepth = 40;
 struct Sample {
     unsigned thread;
     unsigned depth;
+    bool faulted; ///< the walk stopped at an access violation
     std::array<DWORD64, MaxDepth> frames;
 };
 
 struct Target {
     HANDLE handle;
     std::string name;
+    const NT_TIB* tib; ///< the thread's stack bounds, null if unknown
 };
+
+const NT_TIB* ThreadTib(HANDLE handle) {
+    struct BasicInformation {
+        LONG exit_status;
+        PVOID teb;
+        HANDLE client_id[2];
+        KAFFINITY affinity;
+        LONG priority;
+        LONG base_priority;
+    };
+    using QueryFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<QueryFn>(
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread"));
+    BasicInformation info{};
+    if (query == nullptr || query(handle, 0, &info, sizeof(info), nullptr) < 0) {
+        return nullptr;
+    }
+    // The TEB starts with the NT_TIB.
+    return static_cast<const NT_TIB*>(info.teb);
+}
 
 double EnvSeconds(const char* name, double fallback) {
     const char* text = std::getenv(name);
@@ -97,7 +121,7 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
             continue;
         }
         const HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                                             THREAD_QUERY_LIMITED_INFORMATION,
+                                             THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
                                          FALSE, entry.th32ThreadID);
         if (handle == nullptr) {
             continue;
@@ -112,7 +136,7 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
             LocalFree(wide);
         }
         if (Matches(name, patterns)) {
-            targets.push_back({handle, name});
+            targets.push_back({handle, name, ThreadTib(handle)});
         } else {
             CloseHandle(handle);
         }
@@ -121,16 +145,57 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
     return targets;
 }
 
+/// The address range of every loaded module, sorted.
+using Modules = std::vector<std::pair<DWORD64, DWORD64>>;
+
+Modules LoadedModules() {
+    Modules modules;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return modules;
+    }
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL ok = Module32FirstW(snapshot, &entry); ok; ok = Module32NextW(snapshot, &entry)) {
+        const auto begin = reinterpret_cast<DWORD64>(entry.modBaseAddr);
+        modules.emplace_back(begin, begin + entry.modBaseSize);
+    }
+    CloseHandle(snapshot);
+    std::sort(modules.begin(), modules.end());
+    return modules;
+}
+
+bool InModule(const Modules& modules, DWORD64 address) {
+    const auto next = std::upper_bound(modules.begin(), modules.end(),
+                                       std::pair{address, ~DWORD64{0}});
+    return next != modules.begin() && address < std::prev(next)->second;
+}
+
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
-// could be paused holding the heap lock.
-void WalkUnguarded(CONTEXT& context, std::array<DWORD64, MaxDepth>& frames, unsigned& depth) {
-    while (depth < MaxDepth && context.Rip != 0) {
+// could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
+// data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
+// stops once the stack pointer leaves the thread's stack.
+void Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib,
+          const Modules& modules, unsigned& depth) {
+    if (tib == nullptr) {
+        return;
+    }
+    const auto on_stack = [tib](DWORD64 rsp) {
+        return rsp >= reinterpret_cast<DWORD64>(tib->StackLimit) &&
+               rsp + 8 <= reinterpret_cast<DWORD64>(tib->StackBase) && (rsp & 7) == 0;
+    };
+    while (depth < MaxDepth && context.Rip != 0 && on_stack(context.Rsp)) {
         frames[depth++] = context.Rip;
+        // Generated code ends the walk. The JIT's unwind data describes its entry prologue only,
+        // so unwinding from inside a block restores guest values as registers, and the next
+        // frame that reads its stack through a frame pointer crashed the process.
+        if (!InModule(modules, context.Rip)) {
+            break;
+        }
         DWORD64 image_base{};
         const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
         if (function == nullptr) {
-            // A leaf function (no unwind data): its return address is on top of the stack. JIT
-            // code has none either; past the first frame, stop there.
+            // A leaf function (no unwind data): its return address is on top of the stack.
             if (depth != 1) {
                 break;
             }
@@ -145,20 +210,23 @@ void WalkUnguarded(CONTEXT& context, std::array<DWORD64, MaxDepth>& frames, unsi
     }
 }
 
-// A guest core stopped in JIT code (or a thread in driver code) can leave the unwinder a garbage
-// return address and stack pointer: it then faulted inside ntdll on the DebugServer thread and
-// took the emulator down (the AMD tester's `sample` with threads "CPUCore_0,...,CPUCore_5",
-// access violation 0xc0000005). Keep the frames found up to the fault instead, as the sample
-// profile's walker does (nx2_sample_profile.cpp).
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
+// RtlVirtualUnwind also reads through the frame register, which the stack check above doesn't
+// cover: a thread paused in a fiber switch with Rbp 0 made it read address 0, and the access
+// violation took the process down (EDEN_NX2_SAMPLE=CPUCore_*). Such a walk keeps the frames it
+// found.
+unsigned GuardedWalk(const CONTEXT& context, std::array<DWORD64, MaxDepth>& frames,
+                     const NT_TIB* tib, const Modules& modules, bool& faulted) {
     unsigned depth = 0;
+    faulted = false;
 #ifdef _MSC_VER
     __try {
-        WalkUnguarded(context, frames, depth);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Walk(context, frames, tib, modules, depth);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                 : EXCEPTION_CONTINUE_SEARCH) {
+        faulted = true;
     }
 #else
-    WalkUnguarded(context, frames, depth);
+    Walk(context, frames, tib, modules, depth);
 #endif
     return depth;
 }
@@ -167,28 +235,48 @@ struct Symbolizer {
     using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
     using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
     using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+    using SymRefreshModuleListFn = BOOL(WINAPI*)(HANDLE);
 
     Symbolizer() {
-        const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-        if (dbghelp == nullptr) {
-            return;
-        }
-        const auto set_options =
-            reinterpret_cast<SymSetOptionsFn>(GetProcAddress(dbghelp, "SymSetOptions"));
-        const auto initialize =
-            reinterpret_cast<SymInitializeFn>(GetProcAddress(dbghelp, "SymInitialize"));
-        from_address = reinterpret_cast<SymFromAddrFn>(GetProcAddress(dbghelp, "SymFromAddr"));
-        if (set_options == nullptr || initialize == nullptr || from_address == nullptr) {
-            from_address = nullptr;
-            return;
-        }
-        set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-        if (!initialize(GetCurrentProcess(), nullptr, TRUE)) {
-            from_address = nullptr;
-        }
+        // SymInitialize fails once the process is initialized, which left every report after
+        // the first without names. Initialize once and pick up modules loaded since then.
+        static const auto functions = [] {
+            std::pair<SymFromAddrFn, SymRefreshModuleListFn> result{};
+            const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+            if (dbghelp == nullptr) {
+                return result;
+            }
+            const auto set_options =
+                reinterpret_cast<SymSetOptionsFn>(GetProcAddress(dbghelp, "SymSetOptions"));
+            const auto initialize =
+                reinterpret_cast<SymInitializeFn>(GetProcAddress(dbghelp, "SymInitialize"));
+            const auto symbol =
+                reinterpret_cast<SymFromAddrFn>(GetProcAddress(dbghelp, "SymFromAddr"));
+            if (set_options == nullptr || initialize == nullptr || symbol == nullptr) {
+                return result;
+            }
+            set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            if (initialize(GetCurrentProcess(), nullptr, TRUE)) {
+                result = {symbol, reinterpret_cast<SymRefreshModuleListFn>(
+                                      GetProcAddress(dbghelp, "SymRefreshModuleList"))};
+            }
+            return result;
+        }();
+        from_address = functions.first;
+        refresh_modules = functions.second;
     }
 
-    const std::string& Name(DWORD64 address) {
+    /// Picks up modules loaded since the last report; names that fell back to "module!?" get
+    /// another try.
+    void Refresh() {
+        if (refresh_modules != nullptr) {
+            refresh_modules(GetCurrentProcess());
+        }
+        std::erase_if(cache, [](const auto& entry) { return entry.second.ends_with("!?"); });
+    }
+
+    // By value: a JIT name is not cached, and two names may be looked up in one expression.
+    std::string Name(DWORD64 address) {
         const auto [it, is_new] = cache.try_emplace(address);
         if (!is_new) {
             return it->second;
@@ -212,43 +300,43 @@ struct Symbolizer {
             GetModuleFileNameA(module, path, sizeof(path));
             const char* base = std::strrchr(path, '\\');
             it->second = std::string{base != nullptr ? base + 1 : path} + "!?";
-        } else if (auto block = Common::JitSymbols::Lookup(reinterpret_cast<const void*>(address))) {
-            // JIT code is reused for other blocks after a cache clear: don't keep the name.
-            jit_name = std::move(*block);
-            cache.erase(it);
-            return jit_name;
         } else {
-            it->second = "(jit)";
+            // JIT code is reused for other blocks after a cache clear, and a block may be
+            // registered after this report: don't keep a JIT name or the "(jit)" fallback.
+            cache.erase(it);
+            if (auto block = Common::JitSymbols::Lookup(reinterpret_cast<const void*>(address))) {
+                return std::move(*block);
+            }
+            return "(jit)";
         }
         return it->second;
     }
 
     SymFromAddrFn from_address{};
+    SymRefreshModuleListFn refresh_modules{};
     std::unordered_map<DWORD64, std::string> cache;
-    std::string jit_name;
 };
-
-// SymInitialize fails on a second call without SymCleanup, so keep one symbolizer for the
-// sampler and the lock census (DbgHelp is single-threaded: its users hold the mutex).
-std::mutex g_symbolizer_mutex;
-
-Symbolizer& SharedSymbolizer() {
-    static Symbolizer symbolizer;
-    return symbolizer;
-}
 
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
                    const char* path) {
-    const std::scoped_lock symbolizer_lock{g_symbolizer_mutex};
-    Symbolizer& symbolizer = SharedSymbolizer();
+    // SymInitialize fails on a second call without SymCleanup, so keep one symbolizer.
+    static Symbolizer symbolizer;
+    symbolizer.Refresh();
     std::string text;
     for (unsigned thread = 0; thread < targets.size(); ++thread) {
         std::map<std::string, unsigned> self;
         std::map<std::string, unsigned> inclusive;
         std::map<std::string, unsigned> self_caller;
         unsigned total = 0;
+        unsigned faulted = 0;
+        unsigned empty = 0;
         for (const Sample& sample : samples) {
-            if (sample.thread != thread || sample.depth == 0) {
+            if (sample.thread != thread) {
+                continue;
+            }
+            faulted += sample.faulted ? 1 : 0;
+            if (sample.depth == 0) {
+                ++empty;
                 continue;
             }
             ++total;
@@ -279,7 +367,9 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
                              sorted[i].second.c_str());
             }
         };
-        text += fmt::format("=== thread \"{}\": {} samples\n", targets[thread].name, total);
+        text += fmt::format("=== thread \"{}\": {} samples ({} without a stack, {} walks stopped "
+                            "by a fault)\n",
+                            targets[thread].name, total + empty, empty, faulted);
         print("self (where the thread is)", self, 60);
         // The hottest instructions as module offsets, for llvm-symbolizer --relative-address
         // (which line of a function, inlined code included).
@@ -346,6 +436,7 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     if (targets.empty()) {
         return "no thread matches";
     }
+    const Modules modules = LoadedModules();
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
@@ -361,13 +452,19 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
             if (GetThreadContext(handle, &context)) {
                 Sample& sample = samples.emplace_back();
                 sample.thread = i;
-                sample.depth = Walk(context, sample.frames);
+                sample.depth = GuardedWalk(context, sample.frames, targets[i].tib, modules,
+                                           sample.faulted);
             }
             ResumeThread(handle);
         }
         Sleep(1);
     }
+    // DbgHelp is single-threaded: the debug server's `sample` and EDEN_NX2_SAMPLE can report at
+    // the same time.
+    static std::mutex report_mutex;
+    std::unique_lock report_lock{report_mutex};
     std::string text = Report(targets, samples, out.c_str());
+    report_lock.unlock();
     std::fprintf(stderr, "nx2 sampler: %zu samples written to %s\n", samples.size(), out.c_str());
     for (const auto& target : targets) {
         CloseHandle(target.handle);
@@ -379,40 +476,6 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
 
 std::string Sample(const char* names, double seconds, const std::string& out) {
     return SampleThreads(SplitNames(names), seconds, out);
-}
-
-void* OpenThreadForCapture(unsigned os_id) {
-    return OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
-                      FALSE, os_id);
-}
-
-unsigned CaptureSuspended(void* thread, unsigned long long* frames, unsigned max,
-                          bool (*still)(const void*), const void* context) {
-    if (thread == nullptr || max == 0) {
-        return 0;
-    }
-    const HANDLE handle = static_cast<HANDLE>(thread);
-    if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
-        return 0;
-    }
-    unsigned depth = 0;
-    CONTEXT thread_context{};
-    thread_context.ContextFlags = CONTEXT_FULL;
-    // GetThreadContext waits for the suspension to take effect; only then is the test valid.
-    if (GetThreadContext(handle, &thread_context) && (still == nullptr || still(context))) {
-        std::array<DWORD64, MaxDepth> walked{};
-        depth = (std::min)(Walk(thread_context, walked), max);
-        for (unsigned i = 0; i < depth; ++i) {
-            frames[i] = walked[i];
-        }
-    }
-    ResumeThread(handle);
-    return depth;
-}
-
-std::string SymbolName(unsigned long long address) {
-    const std::scoped_lock symbolizer_lock{g_symbolizer_mutex};
-    return SharedSymbolizer().Name(address);
 }
 
 void StartFromEnvironment() {
@@ -433,24 +496,10 @@ void StartFromEnvironment() {
 
 #else
 
-#include <cstdio>
-
 namespace Nx2Sampler {
 void StartFromEnvironment() {}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
-}
-void* OpenThreadForCapture(unsigned) {
-    return nullptr;
-}
-unsigned CaptureSuspended(void*, unsigned long long*, unsigned, bool (*)(const void*),
-                          const void*) {
-    return 0;
-}
-std::string SymbolName(unsigned long long address) {
-    char text[32];
-    std::snprintf(text, sizeof(text), "0x%llx", address);
-    return text;
 }
 } // namespace Nx2Sampler
 

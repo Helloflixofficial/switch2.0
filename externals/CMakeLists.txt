@@ -54,6 +54,12 @@ if (NOT TARGET stb::headers)
 endif()
 
 AddJsonPackage(NAME zbic DOWNLOAD_ONLY)
+
+# xxHash (header only)
+AddJsonPackage(NAME xxhash DOWNLOAD_ONLY)
+add_library(xxhash INTERFACE)
+target_include_directories(xxhash INTERFACE "${xxhash_SOURCE_DIR}")
+
 set(ZBIC_INCLUDE_DIR
     "${zbic_SOURCE_DIR}/src"
     PARENT_SCOPE)
@@ -73,6 +79,10 @@ if (IOS)
     set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF)
 endif()
 AddJsonPackage(httplib)
+
+if (LICHII_STATIC_ROOM)
+    return()
+endif()
 
 # Oaknut
 if (ARCHITECTURE_arm64 OR DYNARMIC_TESTS)
@@ -142,7 +152,23 @@ if(ENABLE_CUBEB)
     endif()
 endif()
 
-if (NOT YUZU_USE_BUNDLED_SDL3)
+# libusb, before SDL3 so a source-built SDL3 can use it
+if (ENABLE_LIBUSB)
+    add_subdirectory(libusb)
+endif()
+
+# The prebuilt Windows SDL3 has no libusb, which SDL's Switch 2 controller driver needs
+if (MSVC AND ENABLE_LIBUSB AND LICHII_USE_BUNDLED_SDL3)
+    message(STATUS "Building SDL3 with libusb for Switch 2 controllers")
+    AddJsonPackage(NAME sdl3 FORCE_BUNDLED_PACKAGE ON OPTIONS
+        "SDL_SHARED OFF"
+        "SDL_STATIC ON"
+        "SDL_INSTALL OFF"
+        "SDL_TEST_LIBRARY OFF"
+        "SDL_HIDAPI ON"
+        "SDL_HIDAPI_LIBUSB ON"
+        "SDL_HIDAPI_LIBUSB_SHARED OFF")
+elseif (NOT LICHII_USE_BUNDLED_SDL3)
     if (NOT WIN32)
         # Yuzu itself needs: Atomic Audio Events Joystick Haptic Sensor Threads Timers
         # Since 2.0.18 Atomic+Threads required for HIDAPI/libusb (see https://github.com/libsdl-org/SDL/issues/5095)
@@ -163,7 +189,7 @@ if (NOT YUZU_USE_BUNDLED_SDL3)
         set(SDL_FILE ON)
     endif()
 
-    AddJsonPackage(sdl3)
+    AddJsonPackage(NAME sdl3 OPTIONS "SDL_INSTALL OFF")
 else()
     message(STATUS "Using bundled SDL3")
     AddJsonPackage(sdl3-ci)
@@ -190,7 +216,7 @@ endif()
 AddJsonPackage(spirv-headers)
 
 # Sirit
-if (YUZU_USE_BUNDLED_SIRIT)
+if (LICHII_USE_BUNDLED_SIRIT)
     AddJsonPackage(sirit-ci)
 else()
     AddJsonPackage(sirit)
@@ -246,7 +272,7 @@ if (ENABLE_RESHADE)
 endif()
 
 # Catch2
-if (YUZU_TESTS OR DYNARMIC_TESTS)
+if (LICHII_TESTS OR DYNARMIC_TESTS)
     AddJsonPackage(catch2)
 endif()
 
@@ -257,11 +283,6 @@ endif()
 
 # Glad
 add_subdirectory(glad)
-
-# libusb
-if (ENABLE_LIBUSB)
-    add_subdirectory(libusb)
-endif()
 
 # VMA
 AddJsonPackage(vulkan-memory-allocator)
@@ -284,7 +305,7 @@ if (ENABLE_WEB_SERVICE OR ENABLE_UPDATE_CHECKER)
 endif()
 
 # FFMpeg
-if (YUZU_USE_EXTERNAL_FFMPEG OR YUZU_USE_BUNDLED_FFMPEG)
+if (LICHII_USE_EXTERNAL_FFMPEG OR LICHII_USE_BUNDLED_FFMPEG)
     add_subdirectory(ffmpeg)
 
     set(FFmpeg_PATH "${FFmpeg_PATH}" PARENT_SCOPE)
@@ -327,7 +348,7 @@ endif()
 # TODO(crueter): Breakpad needs additional fetches
 # https://github.com/google/breakpad/blob/main/DEPS
 # https://github.com/microsoft/vcpkg/blob/master/ports/breakpad/CMakeLists.txt
-if (YUZU_CRASH_DUMPS AND NOT TARGET libbreakpad_client)
+if (LICHII_CRASH_DUMPS AND NOT TARGET libbreakpad_client)
     set(BREAKPAD_WIN32_DEFINES
         NOMINMAX
         UNICODE
@@ -438,12 +459,12 @@ endif()
 
 if (APPLE)
     # moltenvk
-    if (NOT YUZU_USE_BUNDLED_MOLTENVK)
+    if (NOT LICHII_USE_BUNDLED_MOLTENVK)
         find_library(MOLTENVK_LIBRARY MoltenVK)
     endif()
 
     # TODO: kosmickrisp?
-    if (NOT MOLTENVK_LIBRARY OR YUZU_USE_BUNDLED_MOLTENVK)
+    if (NOT MOLTENVK_LIBRARY OR LICHII_USE_BUNDLED_MOLTENVK)
         AddJsonPackage(moltenvk)
 
         set(MOLTENVK_LIBRARY "${moltenvk_SOURCE_DIR}/MoltenVK/dylib/macOS/libMoltenVK.dylib" CACHE STRING "" FORCE)

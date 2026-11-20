@@ -3,7 +3,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <boost/algorithm/string/replace.hpp>
 
@@ -11,31 +15,58 @@
 #include "common/scm_rev.h"
 #include "net.h"
 
+#include "common/fs/fs_util.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 
 #include "common/httplib.h"
 
-#ifdef YUZU_BUNDLED_OPENSSL
-#include <openssl/cert.h>
-#endif
+#include "common/net/ca_store.h"
 
 namespace Common::Net {
 
-std::optional<std::string> ParseSha256Digest(std::string_view digest) {
-    constexpr std::string_view prefix = "sha256:";
-    if (!digest.starts_with(prefix) || digest.size() != prefix.size() + 64) {
-        return std::nullopt;
-    }
-    std::string hex;
-    hex.reserve(64);
-    for (const char c : digest.substr(prefix.size())) {
-        if (!std::isxdigit(static_cast<unsigned char>(c))) {
-            return std::nullopt;
+#ifdef LICHII_BUNDLED_OPENSSL
+std::string BundledCaFile() {
+    namespace fs = std::filesystem;
+    try {
+        const std::string_view contents{kCert, sizeof(kCert) - 1};
+        const auto matches = [&contents](const fs::path& file) {
+            std::ifstream stream{file, std::ios::binary};
+            const std::string on_disk{std::istreambuf_iterator<char>{stream}, {}};
+            return stream && on_disk == contents;
+        };
+
+        const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir);
+        const auto path = dir / "ca-bundle.pem";
+        if (matches(path)) {
+            return Common::FS::PathToUTF8String(path);
         }
-        hex.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+        // Written beside it and renamed, so another instance never reads half a file.
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        const auto temp = fs::path{path}.concat(
+            fmt::format(".{}", std::chrono::steady_clock::now().time_since_epoch().count()));
+        {
+            std::ofstream stream{temp, std::ios::binary | std::ios::trunc};
+            stream.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+            if (!stream) {
+                fs::remove(temp, ec);
+                return {};
+            }
+        }
+        fs::rename(temp, path, ec);
+        if (ec) {
+            fs::remove(temp, ec);
+        }
+        // A failed rename is fine when another instance has just written the same file.
+        return matches(path) ? Common::FS::PathToUTF8String(path) : std::string{};
+    } catch (const std::exception& e) {
+        LOG_WARNING(Common, "Could not write the built-in CA bundle: {}", e.what());
+        return {};
     }
-    return hex;
 }
+#endif
 
 LinuxPackage CurrentLinuxPackage() {
 #ifdef __linux__
@@ -161,8 +192,20 @@ std::optional<Release> Release::FromJson(const nlohmann::json& json, const std::
         if (asset.contains("size") && asset["size"].is_number_unsigned()) {
             info.size = asset["size"].get<u64>();
         }
+        constexpr std::string_view digest_prefix = "sha256:";
         if (asset.contains("digest") && asset["digest"].is_string()) {
-            info.sha256 = ParseSha256Digest(asset["digest"].get<std::string>()).value_or("");
+            const auto digest = asset["digest"].get<std::string>();
+            const std::string_view hex =
+                digest.starts_with(digest_prefix)
+                    ? std::string_view{digest}.substr(digest_prefix.size())
+                    : std::string_view{};
+            if (hex.size() == 64 &&
+                std::ranges::all_of(hex, [](unsigned char c) { return std::isxdigit(c); })) {
+                info.sha256 = std::string{hex};
+                std::ranges::transform(info.sha256, info.sha256.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            }
         }
         rel.asset_info.emplace(url, std::move(info));
     }
@@ -215,9 +258,7 @@ RequestResult Fetch(const std::string& url, const std::string& path) {
         client->set_read_timeout(timeout_seconds);
         client->set_write_timeout(timeout_seconds);
 
-#ifdef YUZU_BUNDLED_OPENSSL
-        client->load_ca_cert_store(kCert, sizeof(kCert));
-#endif
+        Common::Net::ConfigureCaStore(*client);
 
         if (client == nullptr) {
             LOG_ERROR(Common, "Invalid URL {}{}", url, path);
@@ -227,14 +268,15 @@ RequestResult Fetch(const std::string& url, const std::string& path) {
         httplib::Request request{
             .method = "GET",
             .path = path,
-            .headers = {{"Accept", "application/vnd.github+json"}, {"User-Agent", "Fritchii"}},
+            .headers = {{"Accept", "application/vnd.github+json"}, {"User-Agent", "Lichii"}},
         };
 
         client->set_follow_location(true);
         httplib::Result result = client->send(request);
 
         if (!result) {
-            LOG_ERROR(Common, "GET to {}{} returned null", url, path);
+            LOG_ERROR(Common, "GET to {}{} failed: {}", url, path,
+                      httplib::to_string(result.error()));
             return {};
         }
 
@@ -265,7 +307,7 @@ ReleaseList GetReleases() {
     const auto response = Fetch(url, Common::g_build_auto_update_api_path);
 
     if (!response.body) {
-        LOG_WARNING(Common, "Failed to get Fritchii releases");
+        LOG_WARNING(Common, "Failed to get Lichii releases");
         return {.status = response.status};
     }
 

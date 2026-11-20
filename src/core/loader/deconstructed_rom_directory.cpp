@@ -15,6 +15,7 @@
 #include "common/logging.h"
 #include "common/random.h"
 #include "common/settings.h"
+#include "common/string_util.h"
 #include "core/core.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
@@ -111,7 +112,29 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
         }
     }
 
-    const auto build_from = BuildLooseRomFS;
+    const auto build_from = [](const FileSys::VirtualDir& romfs_dir) -> FileSys::VirtualFile {
+        if (romfs_dir == nullptr) {
+            return nullptr;
+        }
+        // Building it walks every file and keeps an object for each (title 1: 206k files, ~150
+        // MiB), so loaders of the same directory share one build while any of them holds it.
+        static std::mutex cache_mutex;
+        static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
+        std::scoped_lock lk{cache_mutex};
+        auto& cached = cache[romfs_dir->GetFullPath()];
+        if (auto built = cached.lock()) {
+            return built;
+        }
+        LOG_INFO(Loader, "Using RomFS directory next to the ExeFS");
+        const auto started = std::chrono::steady_clock::now();
+        auto built = FileSys::CreateRomFS(romfs_dir);
+        LOG_INFO(Loader, "Loose RomFS image ready: elapsed_ms={}",
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count());
+        cached = built;
+        return built;
+    };
 
     if (const auto parent = exefs_dir->GetParentDirectory()) {
         if (const auto romfs_dir = FindLooseRomFSDirectory(parent)) {
@@ -259,33 +282,6 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
 
 } // namespace
 
-FileSys::VirtualFile BuildLooseRomFS(const FileSys::VirtualDir& romfs_dir) {
-    if (romfs_dir == nullptr) {
-        return nullptr;
-    }
-    // Building it walks every file and keeps an object for each (title 1: 206k files, ~150
-    // MiB), so loaders of the same directory share one build while any of them holds it. The NX
-    // tree loader's RomFS is the same directory as its executable loader's, so it shares it too.
-    static std::mutex cache_mutex;
-    static std::map<std::string, std::weak_ptr<FileSys::VfsFile>> cache;
-    std::scoped_lock lk{cache_mutex};
-    auto& cached = cache[romfs_dir->GetFullPath()];
-    if (auto built = cached.lock()) {
-        LOG_INFO(Loader, "Loose RomFS image shared with another loader of {}",
-                 romfs_dir->GetFullPath());
-        return built;
-    }
-    LOG_INFO(Loader, "Using RomFS directory next to the ExeFS");
-    const auto started = std::chrono::steady_clock::now();
-    auto built = FileSys::CreateRomFS(romfs_dir);
-    LOG_INFO(Loader, "Loose RomFS image ready: elapsed_ms={}",
-             std::chrono::duration_cast<std::chrono::milliseconds>(
-                 std::chrono::steady_clock::now() - started)
-                 .count());
-    cached = built;
-    return built;
-}
-
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_, bool override_update_)
     : AppLoader(std::move(file_))
     , override_update(override_update_)
@@ -352,6 +348,9 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
     if (nacp_file != nullptr) {
         control.emplace(nacp_file);
         name = control->GetApplicationName();
+    } else if (sidecar_dirs.size() > 1 && Common::ToLower(file_dir->GetName()) == "exefs") {
+        // Without control data, name the game after its folder like the game list does
+        name = sidecar_dirs.back()->GetName();
     }
 
     romfs_exefs_dir = file_dir;
@@ -361,10 +360,11 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
 }
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
-    FileSys::VirtualDir directory, bool override_update_)
+    FileSys::VirtualDir directory, bool override_update_, bool apply_installed_update_)
     : AppLoader(directory->GetFile("main"))
     , dir(std::move(directory))
     , override_update(override_update_)
+    , apply_installed_update(apply_installed_update_)
 {
     romfs_exefs_dir = dir;
 }
@@ -418,7 +418,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     if (override_update) {
         const FileSys::PatchManager patch_manager(
             metadata.GetTitleID(), system.GetFileSystemController(), system.GetContentProvider());
-        dir = patch_manager.PatchExeFS(dir);
+        dir = patch_manager.PatchExeFS(dir, apply_installed_update);
     }
 
     // Reread in case PatchExeFS affected the main.npdm
@@ -607,6 +607,31 @@ ResultStatus AppLoader_DeconstructedRomDirectory::ReadNSOModules(Modules& out_mo
 
     out_modules = this->modules;
     return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_DeconstructedRomDirectory::ReadMainBuildId(
+    Core::System& system, std::array<u8, 0x20>& build_id) {
+    auto exefs = dir ? dir : (file ? file->GetContainingDirectory() : nullptr);
+    if (!exefs) {
+        return ResultStatus::ErrorNoExeFS;
+    }
+    if (override_update) {
+        auto program_id = title_id;
+        if (const auto npdm = exefs->GetFile("main.npdm")) {
+            FileSys::ProgramMetadata program;
+            if (program.Load(npdm) == ResultStatus::Success) {
+                program_id = program.GetTitleID();
+            }
+        }
+        const FileSys::PatchManager manager(program_id, system.GetFileSystemController(),
+                                            system.GetContentProvider());
+        exefs = manager.PatchExeFS(exefs, apply_installed_update);
+    }
+    const auto main = exefs ? exefs->GetFile("main") : nullptr;
+    if (!main) {
+        return ResultStatus::ErrorNoExeFS;
+    }
+    return AppLoader_NSO(main).ReadMainBuildId(system, build_id);
 }
 
 } // namespace Loader

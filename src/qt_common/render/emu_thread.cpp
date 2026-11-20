@@ -9,7 +9,6 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
-#include "video_core/shader_notify.h"
 
 EmuThread::EmuThread() {}
 
@@ -40,7 +39,12 @@ void EmuThread::run() {
     gpu.ReleaseContext();
     gpu.Start();
 
-    QtCommon::system->GetCpuManager().OnGpuReady();
+    // After a close during the shader cache load, the guest cores never start: starting them
+    // then started the services just as they were closed, and a service left halfway (AM, with
+    // its applet manager locked) blocked the next boot. Stopped, the core threads just leave.
+    if (!stop_token.stop_requested()) {
+        QtCommon::system->GetCpuManager().OnGpuReady();
+    }
 
     if (QtCommon::system->DebuggerEnabled()) {
         QtCommon::system->InitializeDebugger();
@@ -49,8 +53,6 @@ void EmuThread::run() {
     while (!stop_token.stop_requested()) {
         std::unique_lock lk{m_should_run_mutex};
         if (m_should_run) {
-            // The shader warm-up waits while the game runs (ShaderNotify::WarmMayBuild).
-            gpu.ShaderNotify().SetEmulationPaused(false);
             QtCommon::system->Run();
             m_stopped.Reset();
 
@@ -68,7 +70,6 @@ void EmuThread::run() {
             }
         } else {
             QtCommon::system->Pause();
-            gpu.ShaderNotify().SetEmulationPaused(true);
             m_stopped.Set();
 
             EmulationPaused(lk);

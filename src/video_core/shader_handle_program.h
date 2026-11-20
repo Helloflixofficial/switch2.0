@@ -125,8 +125,6 @@ void EvaluateTextureHandles(const Shader::Info& info, u32 program, Memory& gpu_m
 class HandleTableNotes {
 public:
     [[nodiscard]] static bool Wanted() noexcept {
-        // Read on first use, not at static initialization: nx2_switches.txt is applied after it.
-        static const bool enabled{std::getenv("EDEN_NX2_HANDLE_TABLE_NOTES") != nullptr};
         return enabled && lines.load(std::memory_order_relaxed) < MAX_LINES;
     }
 
@@ -163,6 +161,7 @@ public:
 
 private:
     static constexpr int MAX_LINES = 64;
+    inline static const bool enabled{std::getenv("EDEN_NX2_HANDLE_TABLE_NOTES") != nullptr};
     inline static std::atomic<int> lines{};
     inline static std::mutex mutex;
     inline static std::unordered_map<u64, std::vector<u32>> seen;

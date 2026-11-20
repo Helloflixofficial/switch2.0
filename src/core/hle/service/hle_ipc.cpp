@@ -303,8 +303,8 @@ Result HLERequestContext::WriteToOutgoingCommandBuffer() {
         current_offset = domain_offset - static_cast<u32>(outgoing_domain_objects.size());
         for (auto& object : outgoing_domain_objects) {
             if (object) {
-                GetManager()->AppendDomainHandler(std::move(object));
-                cmd_buf[current_offset++] = static_cast<u32_le>(GetManager()->DomainHandlerCount());
+                cmd_buf[current_offset++] =
+                    static_cast<u32_le>(GetManager()->AppendDomainHandler(std::move(object)));
             } else {
                 cmd_buf[current_offset++] = 0;
             }
@@ -451,6 +451,23 @@ std::size_t HLERequestContext::WriteBufferC(const void* buffer, std::size_t size
 
     memory.WriteBlock(BufferDescriptorC()[buffer_index].Address(), buffer, size);
     return size;
+}
+
+void HLERequestContext::ReadWriteBufferContents(std::span<u8> out, bool buffer_b,
+                                                std::size_t buffer_index) const {
+    if (buffer_b) {
+        if (buffer_index < BufferDescriptorB().size()) {
+            const auto& descriptor = BufferDescriptorB()[buffer_index];
+            memory.ReadBlock(descriptor.Address(), out.data(),
+                             (std::min)(out.size(), static_cast<std::size_t>(descriptor.Size())));
+        }
+        return;
+    }
+    if (buffer_index < BufferDescriptorC().size()) {
+        const auto& descriptor = BufferDescriptorC()[buffer_index];
+        memory.ReadBlock(descriptor.Address(), out.data(),
+                         (std::min)(out.size(), static_cast<std::size_t>(descriptor.Size())));
+    }
 }
 
 std::size_t HLERequestContext::GetReadBufferSize(std::size_t buffer_index) const {

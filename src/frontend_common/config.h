@@ -5,7 +5,6 @@
 
 #pragma once
 
-#include <functional>
 #include <memory>
 #include <string>
 #include "common/settings.h"
@@ -47,17 +46,6 @@ public:
 
     [[nodiscard]] bool Exists(const std::string& section, const std::string& key) const;
 
-    [[nodiscard]] ConfigType GetType() const {
-        return type;
-    }
-
-    /// Called after each successful write of a config file.
-    static inline std::function<void(const Config&)> on_written;
-
-    /// Writes only the add-on lists (disabled, seen) of the global config, e.g. after new mods
-    /// were disabled (FileSys::PatchManager::SetNewModsCallback).
-    void SaveAddOnValues();
-
 protected:
     explicit Config(ConfigType config_type = ConfigType::GlobalConfig);
 
@@ -97,7 +85,6 @@ protected:
     void ReadDebuggingValues();
     void ReadServiceValues();
     void ReadDisabledAddOnValues();
-    void ReadSeenAddOnValues();
     void ReadMiscellaneousValues();
     void ReadCpuValues();
     void ReadRendererValues();
@@ -130,7 +117,6 @@ protected:
     void SaveDebuggingValues();
     void SaveNetworkValues();
     void SaveDisabledAddOnValues();
-    void SaveSeenAddOnValues();
     void SaveMiscellaneousValues();
     void SaveCpuValues();
     void SaveRendererValues();

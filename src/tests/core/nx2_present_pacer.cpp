@@ -16,6 +16,25 @@ constexpr auto TwoVblanks = 33'333'333ns;
 constexpr auto ThreeVblanks = 50'000'000ns;
 }
 
+TEST_CASE("NX2 FPS limit only lengthens a vblank it is below", "[core][nx2_present_pacer]") {
+    using Service::PacedInterval;
+    // 0 leaves the game's own vblank and swap interval untouched.
+    REQUIRE(PacedInterval(OneVblank, 0) == OneVblank);
+    REQUIRE(PacedInterval(TwoVblanks, 0) == TwoVblanks);
+    // 60 Hz is exactly the one-vblank interval; 120 Hz is faster than the game asked for.
+    REQUIRE(PacedInterval(OneVblank, 60) == OneVblank);
+    REQUIRE(PacedInterval(OneVblank, 120) == OneVblank);
+    REQUIRE(PacedInterval(TwoVblanks, 60) == TwoVblanks);
+    // Lower limits hold a frame for longer: 50, 30, 20 and 15 Hz from one 60 Hz vblank.
+    REQUIRE(PacedInterval(OneVblank, 50) == 20'000'000ns);
+    REQUIRE(PacedInterval(OneVblank, 30) == 33'333'333ns);
+    REQUIRE(PacedInterval(OneVblank, 20) == 50'000'000ns);
+    REQUIRE(PacedInterval(OneVblank, 15) == 66'666'666ns);
+    // A game already pacing at two vblanks keeps that when the limit is not slower still.
+    REQUIRE(PacedInterval(TwoVblanks, 40) == TwoVblanks);
+    REQUIRE(PacedInterval(TwoVblanks, 20) == 50'000'000ns);
+}
+
 TEST_CASE("NX2 interval decreases apply to the current present", "[core][nx2_present_pacer]") {
     Pacer pacer;
     REQUIRE(pacer.Advance(Start, ThreeVblanks).reset);
@@ -88,4 +107,31 @@ TEST_CASE("NX2 fixed-period pacing matches the previous algorithm", "[core][nx2_
             old_next += period;
         }
     }
+}
+
+TEST_CASE("NX2 display vsync starts frames at the display, under the paced rate",
+          "[core][nx2_present_pacer]") {
+    using Service::DisplayVsyncDeadline;
+    // The first frame, or no limit: at once.
+    REQUIRE(DisplayVsyncDeadline(std::nullopt, Start, 112) == Start);
+    REQUIRE(DisplayVsyncDeadline(Start, Start + 1ms, 0) == Start + 1ms);
+    // 112 fps: 8.928571 ms between starts.
+    REQUIRE(DisplayVsyncDeadline(Start, Start + 4ms, 112) == Start + 8'928'571ns);
+    // A display signal after the interval starts the frame at once.
+    REQUIRE(DisplayVsyncDeadline(Start, Start + 10ms, 112) == Start + 10ms);
+    REQUIRE(DisplayVsyncDeadline(Start, Start + 20ms, 30) == Start + 33'333'333ns);
+}
+
+TEST_CASE("NX2 vsync timer steps in only when the display stops", "[core][nx2_present_pacer]") {
+    using Service::TimerVsyncSignals;
+    REQUIRE(TimerVsyncSignals(std::nullopt, 0, Start, OneVblank));
+    REQUIRE_FALSE(TimerVsyncSignals(Start, 0, Start + OneVblank, OneVblank));
+    REQUIRE_FALSE(TimerVsyncSignals(Start, 0, Start + 2 * OneVblank, OneVblank));
+    REQUIRE(TimerVsyncSignals(Start, 0, Start + ThreeVblanks, OneVblank));
+    // A limit above the timer's rate changes nothing.
+    REQUIRE(TimerVsyncSignals(Start, 100, Start + ThreeVblanks, OneVblank));
+    // A 20 fps limit starts frames 50 ms apart: the timer must not fill the gaps.
+    REQUIRE_FALSE(TimerVsyncSignals(Start, 20, Start + ThreeVblanks, OneVblank));
+    REQUIRE_FALSE(TimerVsyncSignals(Start, 20, Start + 100ms, OneVblank));
+    REQUIRE(TimerVsyncSignals(Start, 20, Start + 101ms, OneVblank));
 }

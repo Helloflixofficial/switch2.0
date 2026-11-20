@@ -7,7 +7,7 @@
 
 #include <array>
 #include <cstddef>
-#include <memory>
+#include <span>
 #include <vector>
 
 #include "common/bit_field.h"
@@ -20,16 +20,16 @@ namespace Core {
 class System;
 }
 
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
+}
+
 namespace Tegra {
 class MemoryManager;
 }
 
 namespace VideoCore {
 class RasterizerInterface;
-}
-
-namespace VideoCommon {
-class GpuSplit;
 }
 
 namespace Tegra {
@@ -103,6 +103,8 @@ public:
  */
 
 class MaxwellDMA final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     struct PackedGPUVAddr {
         u32 upper;
@@ -117,6 +119,9 @@ public:
         PackedGPUVAddr address;
         u32 payload;
     };
+    /// The methods of Regs::semaphore (address high and low, payload) and Regs::launch_dma.
+    static constexpr u32 SemaphoreMethod = 0x240 / sizeof(u32);
+    static constexpr u32 LaunchDmaMethod = 0x300 / sizeof(u32);
     static_assert(sizeof(Semaphore) == 12);
 
     struct RenderEnable {
@@ -245,6 +250,21 @@ public:
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// The methods of the register file (CallMethod ignores the ones past it).
+    static constexpr u32 RegisterCount = 0x800;
+    /// Guest memory [address, address + size) a launch writes (size 0: none).
+    struct WriteRange {
+        GPUVAddr address{};
+        u64 size{};
+    };
+    struct LaunchWrites {
+        WriteRange destination; ///< Every byte Launch() may write, whatever layout it picks
+        WriteRange semaphore;   ///< ReleaseSemaphore's
+    };
+    /// What a launch with register file `registers` writes (the split GPU thread's front keeps a
+    /// copy of the registers to place the copies the back makes).
+    [[nodiscard]] static LaunchWrites WritesOfLaunch(std::span<const u32, RegisterCount> registers);
+
     explicit MaxwellDMA(MemoryManager& memory_manager_);
     ~MaxwellDMA() override;
 
@@ -254,13 +274,7 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
-    /// GPU thread split (gpu_split.h): the front calls this with the methods it just sent here.
-    /// It keeps a copy of the registers a launch reads and notes what each launch writes
-    /// (GpuSplit::NoteWriterRange, or NoteUnboundedWriter where the front can't bound it).
-    void FrontMethod(VideoCommon::GpuSplit& split, u32 method, const u32* arguments, u32 amount);
-
 private:
-    void FrontNoteLaunch(VideoCommon::GpuSplit& split, u32 launch);
     /// Performs the copy from the source buffer to the destination buffer as configured in the
     /// registers.
     void Launch();
@@ -281,9 +295,6 @@ private:
     Common::ScratchBuffer<u8> read_buffer;
     Common::ScratchBuffer<u8> write_buffer;
     Common::ScratchBuffer<u8> intermediate_buffer;
-
-    /// The front's copy of the registers below src_params (FrontMethod), made on first use.
-    std::unique_ptr<std::array<u32, 0x200>> front_regs;
 
     static constexpr std::size_t NUM_REGS = 0x800;
     struct Regs {
@@ -341,6 +352,9 @@ private:
     ASSERT_REG_POSITION(src_params, 0x728);
     ASSERT_REG_POSITION(pm_trigger_end, 0x1114);
 #undef ASSERT_REG_POSITION
+    static_assert(SemaphoreMethod * sizeof(u32) == offsetof(Regs, semaphore));
+    static_assert(LaunchDmaMethod * sizeof(u32) == offsetof(Regs, launch_dma));
+    static_assert(RegisterCount == NUM_REGS);
 };
 
 } // namespace Tegra::Engines

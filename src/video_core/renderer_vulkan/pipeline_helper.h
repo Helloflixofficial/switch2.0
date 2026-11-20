@@ -7,15 +7,12 @@
 
 #include <cstddef>
 #include <optional>
-#include <span>
-#include <string>
 
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
-#include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -95,32 +92,13 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
     for (const DescriptorBufferBinding& binding : layout.bindings) {
         for (u32 index = 0; index < binding.count; ++index) {
             const DescriptorUpdateEntry& entry = *(payload++);
-            VkDescriptorAddressInfoEXT address_info{
+            const VkDescriptorAddressInfoEXT address_info{
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT,
                 .pNext = nullptr,
                 .address = entry.address.address,
                 .range = entry.address.range,
                 .format = entry.address.format,
             };
-            const bool buffer_type = binding.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
-                                     binding.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
-                                     binding.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
-                                     binding.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
-            if (buffer_type && address_info.address < 0x1000 &&
-                (address_info.address != 0 || address_info.range != VK_WHOLE_SIZE))
-                [[unlikely]] {
-                // No buffer lives in the first page: address 0 with a real range (or an offset
-                // added to 0) is a missing buffer. The driver would build a descriptor that
-                // reads and writes at device address 0. The null form instead (address 0, whole
-                // size: what MakeBufferEntry already makes for a buffer without an address).
-                vk::NoteNullTarget(binding.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
-                                           binding.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
-                                       ? "storage descriptor at device address 0, made null"
-                                       : "uniform descriptor at device address 0, made null",
-                                   std::source_location::current());
-                address_info.address = 0;
-                address_info.range = VK_WHOLE_SIZE;
-            }
             VkDescriptorGetInfoEXT get_info{
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
                 .pNext = nullptr,
@@ -168,9 +146,17 @@ class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
 
+    /// Whether the layout exceeds the core descriptor limits, which only sets from an
+    /// update-after-bind pool may do: they count against the larger limits of such pools.
+    bool UsesUpdateAfterBindPool() const {
+        return device->UpdateAfterBindSampledLimits() &&
+               ExceedsSampledDescriptorLimits(std::span(bindings.data(), bindings.size()),
+                                              device->CoreSampledLimits());
+    }
+
     bool CanUsePushDescriptor() const noexcept {
-        if (device->PrefersDescriptorSets() || !device->IsKhrPushDescriptorSupported() ||
-            num_descriptors > device->MaxPushDescriptors()) {
+        if (!device->IsKhrPushDescriptorSupported() ||
+            num_descriptors > device->MaxPushDescriptors() || UsesUpdateAfterBindPool()) {
             return false;
         }
         return !device->IsExtDescriptorBufferSupported() ||
@@ -179,8 +165,8 @@ public:
 
     bool CanUseDescriptorBuffer() const noexcept {
         const auto& props = device->DescriptorBufferProperties();
-        if (device->PrefersDescriptorSets() || !device->IsExtDescriptorBufferSupported() ||
-            bindings.empty() || !props.combinedImageSamplerDescriptorSingleArray) {
+        if (!device->IsExtDescriptorBufferSupported() || bindings.empty() ||
+            !props.combinedImageSamplerDescriptorSingleArray || UsesUpdateAfterBindPool()) {
             return false;
         }
         return !props.bufferlessPushDescriptors || !CanUsePushDescriptor();
@@ -216,6 +202,9 @@ public:
         }
         if (use_descriptor_buffer) {
             flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        }
+        if (!use_push_descriptor && !use_descriptor_buffer && UsesUpdateAfterBindPool()) {
+            flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
         }
         boost::container::small_vector<VkDescriptorBindingFlags, 32> binding_flags;
         VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_ci{};
@@ -263,11 +252,11 @@ public:
         });
     }
 
-    VkPushConstantRange PushConstantRange() const {
+    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
-        return VkPushConstantRange{
+        const VkPushConstantRange range{
             .stageFlags = static_cast<VkShaderStageFlags>(
                 is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
                 : mesh_emulation
@@ -279,50 +268,6 @@ public:
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                     static_cast<u32>(sizeof(RenderAreaLayout)),
         };
-    }
-
-    /// Graphics pipeline libraries (EDEN_NX2_GPL): one set per stage, set index = stage index,
-    /// null where the stage has no descriptors or is not part of the library.
-    vk::PipelineLayout CreateIndependentPipelineLayout(
-        std::span<const VkDescriptorSetLayout> set_layouts, bool independent_sets) const {
-        const VkPushConstantRange range{PushConstantRange()};
-        return device->GetLogical().CreatePipelineLayout({
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = independent_sets ? static_cast<VkPipelineLayoutCreateFlags>(
-                                            VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT)
-                                      : VkPipelineLayoutCreateFlags{},
-            .setLayoutCount = static_cast<u32>(set_layouts.size()),
-            .pSetLayouts = set_layouts.data(),
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &range,
-        });
-    }
-
-    /// What CreateDescriptorSetLayout(false) is made of: two layouts with the same signature are
-    /// identically defined (a library's set layout and the linked pipeline's one).
-    std::string SetLayoutSignature() const {
-        std::string signature;
-        const auto add = [&signature](u32 value) {
-            signature.append(reinterpret_cast<const char*>(&value), sizeof(value));
-        };
-        add(device->IsDescriptorBindingPartiallyBoundSupported() ? 1u : 0u);
-        add(static_cast<u32>(bindings.size()));
-        for (const VkDescriptorSetLayoutBinding& entry : bindings) {
-            add(entry.binding);
-            add(static_cast<u32>(entry.descriptorType));
-            add(entry.descriptorCount);
-            add(static_cast<u32>(entry.stageFlags));
-        }
-        return signature;
-    }
-
-    [[nodiscard]] bool Empty() const noexcept {
-        return bindings.empty();
-    }
-
-    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
-        const VkPushConstantRange range{PushConstantRange()};
         return device->GetLogical().CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
@@ -434,20 +379,11 @@ public:
         }
     }
 
-    /// Graphics pipeline libraries: the next texture and image bits are these (the fragment stage
-    /// starts at fixed ones, GPL_FRAGMENT_*_SCALING_BASE).
-    void Seek(u32 texture_index, u32 image_index) noexcept {
-        texture_ptr = words.data() + texture_index / 32;
-        texture_bit = 1u << (texture_index % 32);
-        image_ptr = words.data() + Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS +
-                    image_index / 32;
-        image_bit = 1u << (image_index % 32);
-    }
-
     const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& Data() const noexcept {
         return words;
     }
 
+    /// The words of an earlier draw's pushes (delta draws); push no more.
     void Assign(const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& data) noexcept {
         words = data;
     }
@@ -470,7 +406,7 @@ public:
 /// has no depth comparison on this device (what the sample returns then differs between vendors)
 /// and it is an integer or block-compressed color texture, or its handle was read from memory (a
 /// handle program). A single-channel color texture with a cbuf handle may be one a game compares
-/// on purpose, and keeps its view. Only with EDEN_NX2_LIGHT_TABLE_ARRAYS.
+/// on purpose, and keeps its view.
 [[nodiscard]] inline bool IsUncomparable(const ImageView& image_view, bool read_from_memory) {
     if (image_view.SupportsDepthComparison()) {
         return false;
@@ -482,14 +418,11 @@ public:
            VideoCore::Surface::IsPixelFormatETC2(format);
 }
 
-/// `texture_rescaled`: when given, each texture descriptor's rescaling bit is also stored at
-/// *texture_rescaled, which advances (EDEN_NX2_EXP32 records them with the descriptors).
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views,
-                                 u8** texture_rescaled = nullptr) {
+                                 const VideoCommon::ImageViewInOut*& views) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
@@ -500,7 +433,6 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
             if (desc.is_depth && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
-                VideoCore::Nx2Debug::LightTableArrays() &&
                 IsUncomparable(texture_cache.GetImageView(image_view_id),
                                desc.handle_program != ~0U)) {
                 image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
@@ -518,18 +450,16 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             is_rescaled |= element_rescaled;
         }
         rescaling.PushTexture(is_rescaled);
-        if (texture_rescaled != nullptr) {
-            *((*texture_rescaled)++) = is_rescaled ? 1 : 0;
-        }
     }
     for (const auto& desc : info.image_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             const VkImageView vk_image_view{
                 image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
             if (desc.is_written) {
-                texture_cache.MarkModification(image_view.image_id);
+                texture_cache.MarkStorageWrite(image_view_id);
             }
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};

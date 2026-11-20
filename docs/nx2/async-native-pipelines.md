@@ -1,9 +1,8 @@
 # Native graphics pipeline worker emission
 
-This experimental track moves native graphics SPIR-V emission and shader-module creation from
-GPUBack to `VkPipelineBuilder`. It does **not** move guest-dependent IR translation. The
-`async_pipelines` Nx2Perf switch defaults on. `EDEN_NX2_PERF_OFF=async_pipelines` or
-`EDEN_NX2_PERF_OPT=0` restores the original build path.
+Native graphics SPIR-V emission and shader-module creation run on `VkPipelineBuilder` when
+an emission reservation is available. Guest-dependent IR translation remains on GPUBack.
+Legacy programs and a full reservation budget retain synchronous emission.
 
 ## Why the old path still stalls GPUBack
 
@@ -14,14 +13,27 @@ worker pool. The old "Graphics pipeline built on the GPU thread" timing measures
 part, not the driver compile.
 
 `use_asynchronous_shaders` controls `BuiltPipeline`'s discard policy, not the Vulkan worker pool.
-It defaults off. With it on, legacy draws may be discarded when depth is enabled or both draw
-counts exceed six. That heuristic tries to preserve small, one-time texture-generation draws.
-It does not prove that a draw's output is temporary.
+With it on, legacy draws may be discarded when depth is enabled or both draw counts exceed six.
+That heuristic tries to preserve small, one-time texture-generation draws. It does not prove that
+a draw's output is temporary.
 
-`CanDiscardPendingDraw` therefore rejects discarding **every native draw**, regardless of size or
-depth. Native draws may create persistent lighting, storage data, compute inputs, copied render
-targets, or readback sources. There is no reliable native classification for safe-to-skip draws.
-This track retains that policy whether asynchronous shaders are enabled or disabled.
+Native work follows `native_async_draws` (Wait, Bounded or Skip) and only skips what redraws an
+earlier frame's output: skipping leaves that output a frame old, while skipping work that fills
+something once would lose it for the session.
+
+- A draw may be skipped only when it is depth-tested, writes color, is not a mesh draw, and its
+  render target 0 was first written in an earlier frame (Eglantine #874). Mario Kart World bakes
+  terrain once with depth-tested draws; Star Fox draws each font glyph once without depth.
+- A dispatch (`PipelineCache::SkipUnbuiltDispatch`) may be skipped only when every byte of every
+  buffer range it would mark written already holds GPU writes (a DMA clear or CPU write removes
+  them), and every storage image level it writes was last written by a shader through a storage
+  view, over every layer (`ImageBase::storage_written_levels`; a clear, render pass, copy, alias
+  copy or CPU write resets it). Its outputs then hold earlier shader results; otherwise they would
+  keep a clear value or what the guest left there, which later work might read as counts or
+  indices.
+
+Bounded waits for a skippable draw or dispatch up to what is left of `native_pipeline_wait_ms` this
+frame, then skips. Everything else waits for its build on the Vulkan worker, as before.
 
 ## What runs where
 
@@ -54,10 +66,10 @@ The pipeline cache drains its workers and explicitly destroys graphics pipelines
 pool cache and other build dependencies are still alive. Destruction may claim a queued native
 build; ordinary native draw waits never do.
 
-## Alternative design
+## Upstream alternative
 
-A related change in another build, inspected at its latest revision,
-implements full async translation with detached
+[Eglantine PR #503](https://github.com/Djihads80/Eglantine/pull/503), inspected at
+`7584d618f8dec5fc1fa8c76fde68489ab5f76c9c`, implements full async translation with detached
 environments. Its desktop timeout discards native draws, and its texture snapshots still read
 live descriptor memory later without synchronization. Porting that behavior would violate this
 track's correctness requirements. Making GPUBack wait for the entire translation instead would
@@ -95,4 +107,5 @@ and emission. No Ocarina runtime measurements or Windows build are claimed for t
 The reported 0.2–2.3 seconds per 10 seconds does not establish an FPS improvement. This change
 can overlap only the emission fraction with useful GPUBack work, and queue delays, allocation,
 and remaining draw holds can reduce that benefit. Its actual savings require
-equivalent cold-cache sessions with the switch on and off, not a warmed-cache second run.
+equivalent cold-cache sessions against the original synchronous implementation, not a
+warmed-cache second run.

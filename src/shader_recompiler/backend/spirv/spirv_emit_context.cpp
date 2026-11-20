@@ -4,10 +4,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <cstdlib>
 #include <array>
 #include <bit>
 #include <climits>
+#include <numeric>
+#include <span>
 
 #include <boost/container/static_vector.hpp>
 
@@ -292,7 +293,7 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer_type, spv::StorageClass::Uniform)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
         ctx.Name(id, fmt::format("c{}", desc.index));
         for (size_t i = 0; i < desc.count; ++i) {
             ctx.cbufs[desc.index + i].*member_type = id;
@@ -325,7 +326,7 @@ void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
     for (const StorageBufferDescriptor& desc : info.storage_buffers_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
         ctx.Name(id, fmt::format("ssbo{}", index));
         if (ctx.profile.supported_spirv >= 0x00010400) {
             ctx.interfaces.push_back(id);
@@ -403,7 +404,8 @@ Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_p
         ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1]), spv::StorageClass::Function)};
     const Id word_pointer{is_struct ? ctx.OpAccessChain(element_pointer, base, zero, index)
                                     : ctx.OpAccessChain(element_pointer, base, index)};
-    ctx.OpStore(expected_var, ctx.OpLoad(ctx.U32[1], word_pointer));
+    ctx.OpStore(expected_var, is_shared ? ctx.LoadShared(ctx.U32[1], word_pointer)
+                                        : ctx.OpLoad(ctx.U32[1], word_pointer));
     ctx.OpBranch(loop_header);
     ctx.AddLabel(loop_header);
 
@@ -472,13 +474,13 @@ void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_vie
 }
 
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_,
-                         IR::Program& program, Bindings& bindings)
+                         IR::Program& program, Bindings& bindings, bool vulkan_memory_model_)
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
       requires_coherent_global_memory{program.info.requires_coherent_global_memory},
       requires_coherent_image_memory{program.info.requires_coherent_image_memory},
-      stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
-      image_rescaling_index{bindings.image_scaling_index},
-      descriptor_set{bindings.descriptor_set} {
+      vulkan_memory_model{vulkan_memory_model_}, stage{program.stage},
+      texture_rescaling_index{bindings.texture_scaling_index},
+      image_rescaling_index{bindings.image_scaling_index} {
     const bool is_unified{profile.unified_descriptor_binding};
     u32& uniform_binding{is_unified ? bindings.unified : bindings.uniform_buffer};
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
@@ -492,6 +494,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineLocalMemory(program);
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
+    DefineBarrierVoteFunctions(program);
     DefineConstantBuffers(program.info, uniform_binding);
     DefineConstantBufferIndirectFunctions(program.info);
     DefineStorageBuffers(program.info, storage_binding);
@@ -505,8 +508,6 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineMeshEmulationOutput();
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
-    DefineMeshDrawBase();
-    DefineOcclFlag();
 }
 
 EmitContext::~EmitContext() = default;
@@ -547,6 +548,37 @@ Id EmitContext::BitOffset16(const IR::Value& offset) {
         return Const(((offset.U32() / 2) % 2) * 16);
     }
     return OpBitwiseAnd(U32[1], OpShiftLeftLogical(U32[1], Def(offset), Const(3u)), Const(16u));
+}
+
+Id EmitContext::LoadShared(Id result_type, Id pointer) {
+    if (!vulkan_memory_model) {
+        return OpLoad(result_type, pointer);
+    }
+    const auto access{SharedMemoryAccess(spv::MemoryAccessMask::MakePointerVisible)};
+    return OpLoad(result_type, pointer, std::span<const Sirit::MemoryAccessLiteral>(access));
+}
+
+void EmitContext::StoreShared(Id pointer, Id object) {
+    if (!vulkan_memory_model) {
+        OpStore(pointer, object);
+        return;
+    }
+    const auto access{SharedMemoryAccess(spv::MemoryAccessMask::MakePointerAvailable)};
+    OpStore(pointer, object, std::span<const Sirit::MemoryAccessLiteral>(access));
+}
+
+std::array<Sirit::MemoryAccessLiteral, 2> EmitContext::SharedMemoryAccess(
+    spv::MemoryAccessMask availability) {
+    return {availability | spv::MemoryAccessMask::NonPrivatePointer,
+            Const(static_cast<u32>(spv::Scope::Workgroup)).value};
+}
+
+Id EmitContext::BarrierSemantics(spv::MemorySemanticsMask semantics) {
+    if (vulkan_memory_model) {
+        semantics = semantics | spv::MemorySemanticsMask::MakeAvailable |
+                    spv::MemorySemanticsMask::MakeVisible;
+    }
+    return Const(static_cast<u32>(semantics));
 }
 
 void EmitContext::DefineCommonTypes(const Info& info) {
@@ -686,7 +718,7 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
         const Id bit_offset{OpBitwiseAnd(U32[1], shift_offset, Const(mask))};
         const Id count{Const(size)};
         const Id word_pointer{OpAccessChain(shared_u32, shared_memory_u32, word_offset)};
-        OpStore(expected_var, OpLoad(U32[1], word_pointer));
+        OpStore(expected_var, LoadShared(U32[1], word_pointer));
         OpBranch(loop_header);
 
         AddLabel(loop_header);
@@ -712,6 +744,88 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
     }
     if (program.info.uses_int16) {
         shared_store_u16_func = make_function(16, 16);
+    }
+}
+
+Id EmitContext::GuestBarrierSemantics() {
+    auto semantics{spv::MemorySemanticsMask::AcquireRelease |
+                   spv::MemorySemanticsMask::WorkgroupMemory};
+    if (requires_coherent_global_memory) {
+        semantics = semantics | spv::MemorySemanticsMask::UniformMemory;
+    }
+    if (requires_coherent_image_memory) {
+        semantics = semantics | spv::MemorySemanticsMask::ImageMemory;
+    }
+    return BarrierSemantics(semantics);
+}
+
+Id EmitContext::BarrierVoteWord(Id offset) {
+    const Id index{OpShiftRightLogical(U32[1], offset, Const(2U))};
+    if (uses_explicit_workgroup_layout) {
+        return OpAccessChain(shared_u32, shared_memory_u32, u32_zero_value, index);
+    }
+    return OpAccessChain(shared_u32, shared_memory_u32, index);
+}
+
+void EmitContext::DefineBarrierVoteFunctions(const IR::Program& program) {
+    if (!program.info.uses_barrier_vote) {
+        return;
+    }
+    const Id workgroup{Const(static_cast<u32>(spv::Scope::Workgroup))};
+    const auto begin{[&](Id& func, size_t num_params) {
+        const std::vector<Id> types(num_params, U32[1]);
+        func = OpFunction(void_id, spv::FunctionControlMask::MaskNone,
+                          TypeFunction(void_id, std::span<const Id>(types)));
+        std::vector<Id> params;
+        for (size_t i = 0; i < num_params; ++i) {
+            params.push_back(OpFunctionParameter(U32[1]));
+        }
+        AddLabel();
+        return params;
+    }};
+    // True while the count of every vote so far is a multiple of the workgroup size: each branch
+    // went the same way for the whole workgroup.
+    const auto together{[&](Id offset, Id size) {
+        const Id count{OpAtomicLoad(U32[1], BarrierVoteWord(offset), workgroup, u32_zero_value)};
+        return OpIEqual(U1, OpUMod(U32[1], count, size), u32_zero_value);
+    }};
+    {
+        const auto args{begin(voted_barrier_func, 2)};
+        const Id cond{together(args[0], args[1])};
+        const Id wait_label{OpLabel()};
+        const Id order_label{OpLabel()};
+        const Id merge_label{OpLabel()};
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(cond, wait_label, order_label);
+        AddLabel(wait_label);
+        OpControlBarrier(workgroup, workgroup, GuestBarrierSemantics());
+        OpBranch(merge_label);
+        AddLabel(order_label);
+        OpMemoryBarrier(workgroup, GuestBarrierSemantics());
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+        OpReturn();
+        OpFunctionEnd();
+    }
+    {
+        // The first barrier keeps every invocation's read of the count before any vote's add, the
+        // second every add before the reads that follow.
+        const auto args{begin(barrier_vote_func, 3)};
+        const Id cond{together(args[0], args[1])};
+        const Id vote_label{OpLabel()};
+        const Id merge_label{OpLabel()};
+        const Id semantics{BarrierSemantics(spv::MemorySemanticsMask::AcquireRelease |
+                                            spv::MemorySemanticsMask::WorkgroupMemory)};
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(cond, vote_label, merge_label);
+        AddLabel(vote_label);
+        OpControlBarrier(workgroup, workgroup, semantics);
+        OpAtomicIAdd(U32[1], BarrierVoteWord(args[0]), workgroup, u32_zero_value, args[2]);
+        OpControlBarrier(workgroup, workgroup, semantics);
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+        OpReturn();
+        OpFunctionEnd();
     }
 }
 
@@ -968,218 +1082,228 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
     write_storage_cas_loop_func = func;
 }
 
+const EmitContext::GlobalMemoryFunctions& EmitContext::GlobalMemoryFunctionsOf(
+    const IR::Inst& inst) const {
+    const auto route{global_memory_route.find(&inst)};
+    return global_memory_functions[route == global_memory_route.end() ? 0 : route->second + 1];
+}
+
 /// Defines the functions that route global memory accesses and atomics to the storage buffer
 /// holding the address at run time.
 void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     const Info& info{program.info};
+    // NVIDIA's Linux driver hangs the GPU (Xid 109) in the Ocarina programs of #619 when their
+    // accesses select among their own candidate buffers, and runs them when every access selects
+    // among all bound buffers. The candidate routes exist for ANV's compile time (#1756), and
+    // select_global_memory_buffer is on for the NVIDIA proprietary driver only.
+    if (!profile.select_global_memory_buffer) {
+        global_memory_functions.resize(program.global_memory_routes.size() + 1);
+        global_memory_route = program.global_memory_route;
+    } else {
+        global_memory_functions.resize(1);
+    }
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }
+    // The storage buffer descriptors the functions being defined route among, and those functions
+    std::span<const u32> buffers;
+    GlobalMemoryFunctions* functions{};
     using DefPtr = Id StorageDefinitions::*;
-    // Each helper scans every global storage buffer. Inlined at every call site, a compute shader
-    // with many global accesses takes NVIDIA's compiler seconds (Ocarina of Time: up to 7.6 s each).
-    // DontInline only with EDEN_NX2_SPIRV_INLINE_GLOBALS=0: it builds those shaders faster, but
-    // cost ~2.6 fps walking through Hyrule Field on an RTX 4080 (fresh launches, 55.2/55.3 vs
-    // 57.9/57.8 inlined), and a shader is built once before the driver's cache has it.
-    // =2 (player report 2026-11-18, RTX 3070 on 5.8.4: a 7.6 s freeze mid-combat on a compute shader the
-    // driver had not cached): DontInline for compute programs only, graphics stays inlined.
-    // =3 (idea from tasarren/Lichii): in compute programs the buffer search is one DontInline
-    // function per program and the accesses stay inlinable: each access calls the search once and
-    // switches on the buffer it returns. Graphics programs stay as with =1.
-    // Read per program (main() sets it at boot, before any shader is built) so tests can switch it.
-    const int inline_mode = [] {
-        const char* value = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
-        if (value == nullptr) {
-            return 1;
-        }
-        switch (value[0]) {
-        case '0':
-            return 0;
-        case '2':
-            return 2;
-        case '3':
-            return 3;
-        default:
-            return 1;
-        }
-    }();
-    const bool dont_inline = inline_mode == 0 || (inline_mode == 2 && stage == Stage::Compute);
-    const bool shared_search = inline_mode == 3 && stage == Stage::Compute;
-    const spv::FunctionControlMask function_control =
-        dont_inline ? spv::FunctionControlMask::DontInline : spv::FunctionControlMask::MaskNone;
     const Id zero{u32_zero_value};
-    const size_t num_buffers{info.storage_buffers_descriptors.size()};
-    const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
-    // Base address of storage buffer `index`, aligned down to the binding alignment.
-    const auto base_address{[&](size_t index) {
-        const auto& ssbo{info.storage_buffers_descriptors[index]};
-        const Id words{EmitGetCbufU32x2(*this, IR::Value{ssbo.cbuf_index},
-                                       IR::Value{ssbo.cbuf_offset})};
-        if (ssbo.indirect_offset == ~0U) {
-            return OpBitwiseAnd(U64, OpBitcast(U64, words), Constant(U64, ssbo_align_mask));
+    // The buffer a routed access goes through can differ between invocations, so a pointer chosen
+    // per invocation and the element pointers derived from it are NonUniform.
+    const auto element{[&](Id pointer_type, Id ssbo, Id index) {
+        const Id pointer{OpAccessChain(pointer_type, ssbo, zero, index)};
+        if (non_uniform_ids.contains(ssbo.value)) {
+            Decorate(pointer, spv::Decoration::NonUniform);
+            non_uniform_ids.insert(pointer.value);
         }
-        // The pointer is read through the buffer bound for the constant buffer pointer.
-        const auto holder{std::ranges::find_if(
-            info.storage_buffers_descriptors, [&ssbo](const auto& desc) {
-                return desc.cbuf_index == ssbo.cbuf_index &&
-                       desc.cbuf_offset == ssbo.cbuf_offset && desc.indirect_offset == ~0U;
-            })};
-        if (holder == info.storage_buffers_descriptors.end()) {
-            return Constant(U64, ~u64{0});
-        }
-        const size_t holder_index{static_cast<size_t>(
-            std::distance(info.storage_buffers_descriptors.begin(), holder))};
-        const Id holder_low{OpCompositeExtract(U32[1], words, 0U)};
-        const Id byte{OpIAdd(U32[1],
-                             OpBitwiseAnd(U32[1], holder_low,
-                                          Const(static_cast<u32>(profile.min_ssbo_alignment - 1))),
-                             Const(ssbo.indirect_offset))};
-        const Id word_index{OpShiftRightLogical(U32[1], byte, Const(2U))};
-        const Id storage{ssbos[holder_index].U32};
-        const auto load_word{[&](Id word) {
-            return OpLoad(U32[1], OpAccessChain(storage_types.U32.element, storage, zero, word));
-        }};
-        const Id pointer_words{OpCompositeConstruct(
-            U32[2], load_word(word_index), load_word(OpIAdd(U32[1], word_index, Const(1U))))};
-        return OpBitwiseAnd(U64, OpBitcast(U64, pointer_words), Constant(U64, ssbo_align_mask));
+        return pointer;
     }};
-    // Native pointers carry no NVN size word. The address belongs to the candidate buffer whose
-    // base is the closest one at or below it (bounds come from the binding). Returns that index
-    // (~0U when no base is at or below the address) and fills `bases`; with `best_base` it also
-    // selects the base of that buffer.
-    const auto native_closest{[&](Id addr, std::vector<Id>& bases, Id* best_base) {
-        Id best_index{Const(~0U)};
-        Id best_distance{Constant(U64, ~u64{0})};
-        for (size_t index = 0; index < num_buffers; ++index) {
-            bases[index] = base_address(index);
-            const Id distance{OpISub(U64, addr, bases[index])};
-            const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]),
-                                         OpULessThan(U1, distance, best_distance))};
-            best_distance = OpSelect(U64, better, distance, best_distance);
-            best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
-            if (best_base != nullptr) {
-                *best_base = OpSelect(U64, better, bases[index], *best_base);
+    // Load: no side effects. Write: stores and atomics. PerBuffer: the access needs a uniform
+    // buffer pointer (atomics that call a storage buffer CAS loop function).
+    enum class Routing { Load, Write, PerBuffer };
+    // Routes the access to the candidate buffer that holds the address. NVIDIA inlines the helpers
+    // at every access, and a chain of one selection per buffer hangs its Linux driver in the
+    // Ocarina programs of #619, with or without a return inside each branch. With
+    // select_global_memory_buffer, OpSelect picks the buffer (a variable pointer) and the element
+    // index, and one access goes through them: loads take no branch, and stores and atomics take
+    // one for an address no buffer holds. Otherwise the access takes one branch per candidate
+    // buffer, and every branch merges back so the helper returns once, from its last block.
+    // Finds the candidate buffer of `buffers` that holds addr: its descriptor index (~0U when none)
+    // and base
+    struct Route {
+        std::vector<u32> candidates;
+        Id route;
+        Id route_base;
+    };
+    const auto search{[&](Id addr) {
+        const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+        const auto base_address{[&](size_t index) {
+            const auto& ssbo{info.storage_buffers_descriptors[index]};
+            const Id words{EmitGetCbufU32x2(*this, IR::Value{ssbo.cbuf_index},
+                                           IR::Value{ssbo.cbuf_offset})};
+            if (ssbo.indirect_offset == ~0U) {
+                return OpBitwiseAnd(U64, OpBitcast(U64, words), Constant(U64, ssbo_align_mask));
             }
-        }
-        return best_index;
-    }};
-    // Whether the NVN descriptor `index` (base ssbo_addr, size from its cbuf word) holds addr.
-    const auto nvn_holds{[&](size_t index, Id addr, Id ssbo_addr) {
-        const auto& ssbo{info.storage_buffers_descriptors[index]};
-        const Id size{EmitGetCbufU32(*this, IR::Value{ssbo.cbuf_index},
-                                   IR::Value{ssbo.cbuf_offset + 8})};
-        const Id ssbo_size{OpUConvert(U64, size)};
-        const Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
-        return OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
-                            OpULessThan(U1, addr, ssbo_end));
-    }};
-    // The buffers an address can route to, in the order the routing tries them.
-    std::vector<u32> candidates;
-    for (size_t index = 0; index < num_buffers; ++index) {
-        if (info.native_global_bounds ||
-            UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
-            candidates.push_back(static_cast<u32>(index));
-        }
-    }
-    // =3: returns (buffer index, base low word, base high word); the index is ~0U when no buffer
-    // holds the address. Same comparisons and order as the per-access routing below.
-    Id search_function{};
-    if (shared_search && !candidates.empty()) {
-        search_function = OpFunction(U32[3], spv::FunctionControlMask::DontInline,
-                                     TypeFunction(U32[3], U64));
-        const Id addr{OpFunctionParameter(U64)};
-        AddLabel();
-        const auto route{[&](Id index, Id base) {
-            const Id base_words{OpBitcast(U32[2], base)};
-            return OpCompositeConstruct(U32[3], index, OpCompositeExtract(U32[1], base_words, 0U),
-                                        OpCompositeExtract(U32[1], base_words, 1U));
+            // The pointer is read through the buffer bound for the constant buffer pointer.
+            const auto holder{std::ranges::find_if(
+                info.storage_buffers_descriptors, [&ssbo](const auto& desc) {
+                    return desc.cbuf_index == ssbo.cbuf_index &&
+                           desc.cbuf_offset == ssbo.cbuf_offset && desc.indirect_offset == ~0U;
+                })};
+            if (holder == info.storage_buffers_descriptors.end()) {
+                return Constant(U64, ~u64{0});
+            }
+            const size_t holder_index{static_cast<size_t>(
+                std::distance(info.storage_buffers_descriptors.begin(), holder))};
+            const Id holder_low{OpCompositeExtract(U32[1], words, 0U)};
+            const Id byte{OpIAdd(U32[1],
+                                 OpBitwiseAnd(U32[1], holder_low,
+                                              Const(static_cast<u32>(profile.min_ssbo_alignment - 1))),
+                                 Const(ssbo.indirect_offset))};
+            const Id word_index{OpShiftRightLogical(U32[1], byte, Const(2U))};
+            const Id storage{ssbos[holder_index].U32};
+            const auto load_word{[&](Id word) {
+                return OpLoad(U32[1], OpAccessChain(storage_types.U32.element, storage, zero, word));
+            }};
+            const Id pointer_words{OpCompositeConstruct(
+                U32[2], load_word(word_index), load_word(OpIAdd(U32[1], word_index, Const(1U))))};
+            return OpBitwiseAnd(U64, OpBitcast(U64, pointer_words), Constant(U64, ssbo_align_mask));
         }};
+        std::vector<u32> candidates;
+        std::vector<Id> bases;
+        Id route{Const(~0U)};
+        // The routed buffer's base, so the offset into it is computed once
+        Id route_base{Constant(U64, u64{0})};
         if (info.native_global_bounds) {
-            std::vector<Id> bases(num_buffers);
-            Id best_base{Constant(U64, u64{0})};
-            const Id best_index{native_closest(addr, bases, &best_base)};
-            OpReturnValue(route(best_index, best_base));
+            // Native pointers carry no NVN size word. The address belongs to the candidate buffer
+            // whose base is the closest one at or below it (bounds come from the binding).
+            Id best_distance{Constant(U64, ~u64{0})};
+            for (const u32 index : buffers) {
+                const Id base{base_address(index)};
+                const Id distance{OpISub(U64, addr, base)};
+                const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, base),
+                                             OpULessThan(U1, distance, best_distance))};
+                best_distance = OpSelect(U64, better, distance, best_distance);
+                route = OpSelect(U32[1], better, Const(static_cast<u32>(index)), route);
+                route_base = OpSelect(U64, better, base, route_base);
+                candidates.push_back(static_cast<u32>(index));
+                bases.push_back(base);
+            }
         } else {
-            // The first buffer that holds the address wins, as in the per-access chain.
-            for (const u32 index : candidates) {
+            std::vector<Id> holds;
+            for (const u32 index : buffers) {
+                if (!UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
+                    continue;
+                }
+                const auto& ssbo{info.storage_buffers_descriptors[index]};
                 const Id ssbo_addr{base_address(index)};
-                const Id cond{nvn_holds(index, addr, ssbo_addr)};
-                const Id then_label{OpLabel()};
-                const Id else_label{OpLabel()};
-                OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
-                OpBranchConditional(cond, then_label, else_label);
-                AddLabel(then_label);
-                OpReturnValue(route(Const(index), ssbo_addr));
-                AddLabel(else_label);
+                const Id size{EmitGetCbufU32(*this, IR::Value{ssbo.cbuf_index},
+                                             IR::Value{ssbo.cbuf_offset + 8})};
+                const Id ssbo_end{OpIAdd(U64, ssbo_addr, OpUConvert(U64, size))};
+                holds.push_back(OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
+                                             OpULessThan(U1, addr, ssbo_end)));
+                candidates.push_back(static_cast<u32>(index));
+                bases.push_back(ssbo_addr);
             }
-            OpReturnValue(ConstantComposite(U32[3], Const(~0U), zero, zero));
+            // The first buffer that holds the address wins.
+            for (size_t i = holds.size(); i-- > 0;) {
+                route = OpSelect(U32[1], holds[i], Const(candidates[i]), route);
+                route_base = OpSelect(U64, holds[i], bases[i], route_base);
+            }
         }
-        OpFunctionEnd();
-    }
-    const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
-                               auto&& callback) {
-        AddLabel();
-        if (shared_search) {
-            if (candidates.empty()) {
-                return;
+        return Route{std::move(candidates), route, route_base};
+    }};
+    // With select_global_memory_buffer every access searches all bound buffers. NVIDIA compiles
+    // that search slowly at each inlined access (#1848: ~1.7 s per OoT compute pipeline), so the
+    // search is one function that is not inlined, and the accesses stay inlined.
+    Id search_function{};
+    const auto define_body{[&](DefPtr ssbo_member, Id addr, const StorageTypeDefinition& type_def,
+                               u32 shift, Id result_type, Id fallback, Routing routing,
+                               auto&& callback) -> Id {
+        const Id header_label{AddLabel()};
+        const bool select{routing != Routing::PerBuffer && profile.select_global_memory_buffer};
+        Route found_route;
+        if (select && ValidId(search_function)) {
+            for (const u32 index : buffers) {
+                if (info.native_global_bounds ||
+                    UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
+                    found_route.candidates.push_back(index);
+                }
             }
-            // One call finds the buffer, then one switch does the access on it. An address no
-            // buffer holds takes the default edge to the merge block, the helper's fallback.
-            const Id found{OpFunctionCall(U32[3], search_function, addr)};
-            const Id route{OpCompositeExtract(U32[1], found, 0U)};
-            const Id route_base{OpBitcast(
-                U64, OpCompositeConstruct(U32[2], OpCompositeExtract(U32[1], found, 1U),
-                                          OpCompositeExtract(U32[1], found, 2U)))};
+            const Id result{OpFunctionCall(U32[3], search_function, addr)};
+            found_route.route = OpCompositeExtract(U32[1], result, 0U);
+            found_route.route_base =
+                OpBitcast(U64, OpVectorShuffle(U32[2], result, result, 1U, 2U));
+        } else {
+            found_route = search(addr);
+        }
+        const auto& [candidates, route, route_base] = found_route;
+        const bool has_value{result_type.value != void_id.value};
+        if (routing != Routing::PerBuffer && profile.select_global_memory_buffer) {
+            if (candidates.empty()) {
+                return fallback;
+            }
+            AddCapability(spv::Capability::VariablePointersStorageBuffer);
+            Id ssbo_id{ssbos[candidates[0]].*ssbo_member};
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                const Id routed{OpIEqual(U1, route, Const(candidates[i]))};
+                ssbo_id = OpSelect(type_def.array, routed, ssbos[candidates[i]].*ssbo_member,
+                                   ssbo_id);
+            }
+            Decorate(ssbo_id, spv::Decoration::NonUniform);
+            non_uniform_ids.insert(ssbo_id.value);
+            const Id found{OpINotEqual(U1, route, Const(~0U))};
+            // The offset is the same for every candidate: route_base is the routed buffer's base.
+            const Id offset{OpUConvert(U32[1], OpISub(U64, addr, route_base))};
+            const Id ssbo_index{
+                OpSelect(U32[1], found, OpShiftRightLogical(U32[1], offset, Const(shift)), zero)};
+            if (routing == Routing::Load) {
+                // An address no buffer holds reads element 0 of the first one and returns fallback.
+                const Id result{
+                    callback(element(type_def.element, ssbo_id, ssbo_index), ssbo_id, ssbo_index)};
+                return OpSelect(result_type, found, result, fallback);
+            }
+            const Id then_label{OpLabel()};
+            const Id merge_label{OpLabel()};
+            OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+            OpBranchConditional(found, then_label, merge_label);
+            AddLabel(then_label);
+            const Id result{
+                callback(element(type_def.element, ssbo_id, ssbo_index), ssbo_id, ssbo_index)};
+            OpBranch(merge_label);
+            AddLabel(merge_label);
+            return has_value ? OpPhi(result_type, result, then_label, fallback, header_label)
+                             : Id{};
+        }
+        Id value{fallback};
+        Id predecessor{header_label};
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const Id routed{OpIEqual(U1, route, Const(candidates[i]))};
+            const Id then_label{OpLabel()};
+            const Id merge_label{OpLabel()};
+            OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+            OpBranchConditional(routed, then_label, merge_label);
+            AddLabel(then_label);
+            const Id ssbo_id{ssbos[candidates[i]].*ssbo_member};
             const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, route_base))};
             const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
-            const Id merge_label{OpLabel()};
-            std::vector<Sirit::Literal> literals;
-            std::vector<Id> labels;
-            for (const u32 index : candidates) {
-                literals.push_back(index);
-                labels.push_back(OpLabel());
-            }
-            OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-            OpSwitch(route, merge_label, literals, labels);
-            for (size_t i = 0; i < candidates.size(); ++i) {
-                AddLabel(labels[i]);
-                const Id ssbo_id{ssbos[candidates[i]].*ssbo_member};
-                const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
-                callback(ssbo_pointer, ssbo_id, ssbo_index);
-            }
+            const Id result{
+                callback(element(type_def.element, ssbo_id, ssbo_index), ssbo_id, ssbo_index)};
+            OpBranch(merge_label);
             AddLabel(merge_label);
-            return;
-        }
-        const auto access{[&](size_t index, Id ssbo_addr, Id cond) {
-            const Id then_label{OpLabel()};
-            const Id else_label{OpLabel()};
-            OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
-            OpBranchConditional(cond, then_label, else_label);
-            AddLabel(then_label);
-            const Id ssbo_id{ssbos[index].*ssbo_member};
-            const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
-            const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
-            const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
-            callback(ssbo_pointer, ssbo_id, ssbo_index);
-            AddLabel(else_label);
-        }};
-        if (info.native_global_bounds) {
-            std::vector<Id> bases(num_buffers);
-            const Id best_index{native_closest(addr, bases, nullptr)};
-            for (size_t index = 0; index < num_buffers; ++index) {
-                access(index, bases[index],
-                       OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
+            if (has_value) {
+                value = OpPhi(result_type, result, then_label, value, predecessor);
             }
-            return;
+            predecessor = merge_label;
         }
-        for (const u32 index : candidates) {
-            const Id ssbo_addr{base_address(index)};
-            access(index, ssbo_addr, nvn_holds(index, addr, ssbo_addr));
-        }
+        return value;
     }};
-    const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+    const auto define_load{[&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type,
+                               u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
-        const Id func_id{OpFunction(type, function_control, function_type)};
+        const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         if (!profile.support_descriptor_aliasing && shift > 2) {
             AddLabel();
@@ -1187,7 +1311,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             const u32 count = 1U << (shift - 2);
             for (u32 i = 0; i < count; ++i) {
                 const Id word_address{OpIAdd(U64, addr, Constant(U64, i * sizeof(u32)))};
-                words[i] = OpFunctionCall(U32[1], load_global_func_u32, word_address);
+                words[i] = OpFunctionCall(U32[1], functions->load_u32, word_address);
             }
             OpReturnValue(OpCompositeConstruct(type, std::span{words}.first(count)));
             OpFunctionEnd();
@@ -1199,31 +1323,31 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         // of the buffer found for the address.
         if (shift > 2 && profile.min_ssbo_alignment < (1U << shift)) {
             const u32 count = 1U << (shift - 2);
-            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
-                        [&](Id, Id ssbo_id, Id word_index) {
-                            std::array<Id, 4> words;
-                            for (u32 i = 0; i < count; ++i) {
-                                const Id index{i == 0 ? word_index
-                                                      : OpIAdd(U32[1], word_index, Const(i))};
-                                words[i] = OpLoad(U32[1], OpAccessChain(storage_types.U32.element,
-                                                                         ssbo_id, zero, index));
-                            }
-                            OpReturnValue(
-                                OpCompositeConstruct(type, std::span{words}.first(count)));
-                        });
-            OpReturnValue(ConstantNull(type));
+            OpReturnValue(define_body(
+                &StorageDefinitions::U32, addr, storage_types.U32, 2, type, ConstantNull(type),
+                Routing::Load, [&](Id, Id ssbo_id, Id word_index) {
+                    std::array<Id, 4> words;
+                    for (u32 i = 0; i < count; ++i) {
+                        const Id index{i == 0 ? word_index : OpIAdd(U32[1], word_index, Const(i))};
+                        words[i] =
+                            OpLoad(U32[1], element(storage_types.U32.element, ssbo_id, index));
+                    }
+                    return OpCompositeConstruct(type, std::span{words}.first(count));
+                }));
             OpFunctionEnd();
             return func_id;
         }
-        define_body(ssbo_member, addr, element_pointer, shift,
-                    [&](Id ssbo_pointer, Id, Id) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
-        OpReturnValue(ConstantNull(type));
+        OpReturnValue(define_body(ssbo_member, addr, type_def, shift, type, ConstantNull(type),
+                                  Routing::Load, [&](Id ssbo_pointer, Id, Id) {
+                                      return OpLoad(type, ssbo_pointer);
+                                  }));
         OpFunctionEnd();
         return func_id;
     }};
-    const auto define_write{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+    const auto define_write{[&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type,
+                                u32 shift) {
         const Id function_type{TypeFunction(void_id, U64, type)};
-        const Id func_id{OpFunction(void_id, function_control, function_type)};
+        const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
         if (!profile.support_descriptor_aliasing && shift > 2) {
@@ -1232,7 +1356,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             for (u32 i = 0; i < count; ++i) {
                 const Id word_address{OpIAdd(U64, addr, Constant(U64, i * sizeof(u32)))};
                 const Id word{OpCompositeExtract(U32[1], data, i)};
-                OpFunctionCall(void_id, write_global_func_u32, word_address, word);
+                OpFunctionCall(void_id, functions->write_u32, word_address, word);
             }
             OpReturn();
             OpFunctionEnd();
@@ -1240,96 +1364,205 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }
         if (shift > 2 && profile.min_ssbo_alignment < (1U << shift)) {
             const u32 count = 1U << (shift - 2);
-            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
-                        [&](Id, Id ssbo_id, Id word_index) {
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32, 2, void_id, Id{},
+                        Routing::Write, [&](Id, Id ssbo_id, Id word_index) {
                             for (u32 i = 0; i < count; ++i) {
                                 const Id index{i == 0 ? word_index
                                                       : OpIAdd(U32[1], word_index, Const(i))};
-                                OpStore(OpAccessChain(storage_types.U32.element, ssbo_id, zero,
-                                                      index),
+                                OpStore(element(storage_types.U32.element, ssbo_id, index),
                                         OpCompositeExtract(U32[1], data, i));
                             }
-                            OpReturn();
+                            return Id{};
                         });
             OpReturn();
             OpFunctionEnd();
             return func_id;
         }
-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer, Id, Id) {
-            OpStore(ssbo_pointer, data);
-            OpReturn();
-        });
+        define_body(ssbo_member, addr, type_def, shift, void_id, Id{}, Routing::Write,
+                    [&](Id ssbo_pointer, Id, Id) {
+                        OpStore(ssbo_pointer, data);
+                        return Id{};
+                    });
         OpReturn();
         OpFunctionEnd();
         return func_id;
     }};
     const auto define{
         [&](DefPtr ssbo_member, const StorageTypeDefinition& type_def, Id type, size_t size) {
-            const Id element_type{type_def.element};
             const u32 shift{static_cast<u32>(std::countr_zero(size))};
-            const Id load_func{define_load(ssbo_member, element_type, type, shift)};
-            const Id write_func{define_write(ssbo_member, element_type, type, shift)};
+            const Id load_func{define_load(ssbo_member, type_def, type, shift)};
+            const Id write_func{define_write(ssbo_member, type_def, type, shift)};
             return std::make_pair(load_func, write_func);
         }};
-    std::tie(load_global_func_u32, write_global_func_u32) =
-        define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32));
-    std::tie(load_global_func_u32x2, write_global_func_u32x2) =
-        define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
-    std::tie(load_global_func_u32x4, write_global_func_u32x4) =
-        define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
-
-    if (!std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
-            return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
-        })) {
-        return;
+    // Atomics the storage buffer pass could not track: the same routing, with the operation on
+    // the routed word (INC, DEC and F32 add through their storage buffer CAS loops).
+    using enum GlobalAtomic;
+    const auto kind_of = [](IR::Opcode opcode) -> std::optional<GlobalAtomic> {
+        switch (opcode) {
+        case IR::Opcode::GlobalAtomicIAdd32: return IAdd;
+        case IR::Opcode::GlobalAtomicSMin32: return SMin;
+        case IR::Opcode::GlobalAtomicUMin32: return UMin;
+        case IR::Opcode::GlobalAtomicSMax32: return SMax;
+        case IR::Opcode::GlobalAtomicUMax32: return UMax;
+        case IR::Opcode::GlobalAtomicInc32: return Inc;
+        case IR::Opcode::GlobalAtomicDec32: return Dec;
+        case IR::Opcode::GlobalAtomicAnd32: return And;
+        case IR::Opcode::GlobalAtomicOr32: return Or;
+        case IR::Opcode::GlobalAtomicXor32: return Xor;
+        case IR::Opcode::GlobalAtomicExchange32: return Exchange;
+        case IR::Opcode::GlobalAtomicAddF32: return AddF32;
+        default: return std::nullopt;
+        }
+    };
+    // What each route's accesses use: loads and stores of 32, 64 and 128 bits, and atomics
+    struct Uses {
+        std::array<bool, 3> accesses{};
+        std::array<bool, static_cast<size_t>(Count)> atomics{};
+        bool compare_exchange{};
+    };
+    std::vector<Uses> uses(global_memory_functions.size());
+    for (const IR::Block* const block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            const auto route{global_memory_route.find(&inst)};
+            Uses& use{uses[route == global_memory_route.end() ? 0 : route->second + 1]};
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::LoadGlobal32:
+            case IR::Opcode::WriteGlobal32:
+                use.accesses[0] = true;
+                break;
+            case IR::Opcode::LoadGlobal64:
+            case IR::Opcode::WriteGlobal64:
+                use.accesses[1] = true;
+                break;
+            case IR::Opcode::LoadGlobal128:
+            case IR::Opcode::WriteGlobal128:
+                use.accesses[2] = true;
+                break;
+            case IR::Opcode::GlobalAtomicCompareExchange32:
+                use.compare_exchange = true;
+                break;
+            default:
+                if (const auto kind = kind_of(inst.GetOpcode())) {
+                    use.atomics[static_cast<size_t>(*kind)] = true;
+                }
+                break;
+            }
+        }
     }
-    for (const auto opcode : {IR::Opcode::GlobalAtomicIAdd32, IR::Opcode::GlobalAtomicUMax32}) {
-        if (!std::ranges::any_of(program.blocks, [opcode](const IR::Block* block) {
-                return std::ranges::any_of(block->Instructions(), [opcode](const IR::Inst& inst) {
-                    return inst.GetOpcode() == opcode;
-                });
-            })) {
-            continue;
-        }
-        const Id function_type{TypeFunction(U32[1], U64, U32[1])};
-        const Id function{OpFunction(U32[1], function_control, function_type)};
-        if (opcode == IR::Opcode::GlobalAtomicIAdd32) {
-            atomic_add_global_func_u32 = function;
-        } else {
-            atomic_umax_global_func_u32 = function;
-        }
-        const Id address{OpFunctionParameter(U64)};
-        const Id value{OpFunctionParameter(U32[1])};
-        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
-                    [&](Id pointer, Id, Id) {
-                        OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
-                                          ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
-                                          : OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value));
-                    });
-        OpReturnValue(u32_zero_value);
+    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+    const auto define_atomic{[&](GlobalAtomic kind) {
+        const Id type{kind == AddF32 ? F32[1] : U32[1]};
+        const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone,
+                                    TypeFunction(type, U64, type))};
+        const Id addr{OpFunctionParameter(U64)};
+        const Id value{OpFunctionParameter(type)};
+        const bool calls_cas_loop{kind == Inc || kind == Dec || kind == AddF32};
+        OpReturnValue(define_body(
+            &StorageDefinitions::U32, addr, storage_types.U32, 2, type, ConstantNull(type),
+            calls_cas_loop ? Routing::PerBuffer : Routing::Write, [&](Id pointer, Id ssbo, Id word) {
+                const auto atomic = [&](Id (Sirit::Module::*op)(Id, Id, Id, Id, Id)) {
+                    return (this->*op)(U32[1], pointer, scope, zero, value);
+                };
+                switch (kind) {
+                case IAdd:
+                    return atomic(&Sirit::Module::OpAtomicIAdd);
+                case SMin:
+                    return atomic(&Sirit::Module::OpAtomicSMin);
+                case UMin:
+                    return atomic(&Sirit::Module::OpAtomicUMin);
+                case SMax:
+                    return atomic(&Sirit::Module::OpAtomicSMax);
+                case UMax:
+                    return atomic(&Sirit::Module::OpAtomicUMax);
+                case And:
+                    return atomic(&Sirit::Module::OpAtomicAnd);
+                case Or:
+                    return atomic(&Sirit::Module::OpAtomicOr);
+                case Xor:
+                    return atomic(&Sirit::Module::OpAtomicXor);
+                case Exchange:
+                    return atomic(&Sirit::Module::OpAtomicExchange);
+                case Inc:
+                    return OpFunctionCall(U32[1], increment_cas_ssbo, word, value, ssbo);
+                case Dec:
+                    return OpFunctionCall(U32[1], decrement_cas_ssbo, word, value, ssbo);
+                case AddF32:
+                    return OpFunctionCall(F32[1], f32_add_cas, word, value, ssbo);
+                case Count:
+                    break;
+                }
+                return ConstantNull(type);
+            }));
         OpFunctionEnd();
-    }
-    if (std::ranges::any_of(program.blocks, [](const IR::Block* block) {
-            return std::ranges::any_of(block->Instructions(), [](const IR::Inst& inst) {
-                return inst.GetOpcode() == IR::Opcode::GlobalAtomicCompareExchange32;
-            });
-        })) {
+        return func_id;
+    }};
+    const auto define_compare_exchange{[&] {
         const Id function_type{TypeFunction(U32[1], U64, U32[1], U32[1])};
-        atomic_cas_global_func_u32 = OpFunction(U32[1], function_control, function_type);
+        const Id func_id{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type)};
         const Id address{OpFunctionParameter(U64)};
         const Id comparator{OpFunctionParameter(U32[1])};
         const Id value{OpFunctionParameter(U32[1])};
-        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
-                    [&](Id pointer, Id, Id) {
-                        OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope,
-                                                              u32_zero_value, u32_zero_value,
-                                                              value, comparator));
-                    });
         // No buffer matched: report success so a guest CAS retry loop cannot spin forever.
-        OpReturnValue(comparator);
+        OpReturnValue(define_body(&StorageDefinitions::U32, address, storage_types.U32, 2, U32[1],
+                                  comparator, Routing::Write, [&](Id pointer, Id, Id) {
+                                      return OpAtomicCompareExchange(U32[1], pointer, scope,
+                                                                     u32_zero_value, u32_zero_value,
+                                                                     value, comparator);
+                                  }));
         OpFunctionEnd();
+        return func_id;
+    }};
+    const bool routes_atomics{
+        std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
+            return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
+        })};
+    std::vector<u32> every_buffer(info.storage_buffers_descriptors.size());
+    std::iota(every_buffer.begin(), every_buffer.end(), 0U);
+    for (size_t route = 0; route < global_memory_functions.size(); ++route) {
+        buffers = route == 0 ? std::span<const u32>{every_buffer}
+                             : std::span<const u32>{program.global_memory_routes[route - 1]};
+        functions = &global_memory_functions[route];
+        const Uses& use{uses[route]};
+        // Every access through all buffers gets its functions; the 64 and 128-bit ones read and
+        // write words through the 32-bit ones without descriptor aliasing.
+        const bool all{route == 0};
+        const bool words{!profile.support_descriptor_aliasing &&
+                         (use.accesses[1] || use.accesses[2])};
+        if (profile.select_global_memory_buffer) {
+            search_function = OpFunction(U32[3], spv::FunctionControlMask::DontInline,
+                                         TypeFunction(U32[3], U64));
+            const Id addr{OpFunctionParameter(U64)};
+            AddLabel();
+            const Route found{search(addr)};
+            const Id base_words{OpBitcast(U32[2], found.route_base)};
+            OpReturnValue(OpCompositeConstruct(U32[3], found.route,
+                                               OpCompositeExtract(U32[1], base_words, 0U),
+                                               OpCompositeExtract(U32[1], base_words, 1U)));
+            OpFunctionEnd();
+        }
+        if (all || use.accesses[0] || words) {
+            std::tie(functions->load_u32, functions->write_u32) =
+                define(&StorageDefinitions::U32, storage_types.U32, U32[1], sizeof(u32));
+        }
+        if (all || use.accesses[1]) {
+            std::tie(functions->load_u32x2, functions->write_u32x2) =
+                define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
+        }
+        if (all || use.accesses[2]) {
+            std::tie(functions->load_u32x4, functions->write_u32x4) =
+                define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
+        }
+        if (!routes_atomics) {
+            continue;
+        }
+        for (size_t index = 0; index < use.atomics.size(); ++index) {
+            if (use.atomics[index]) {
+                functions->atomics[index] = define_atomic(static_cast<GlobalAtomic>(index));
+            }
+        }
+        if (use.compare_exchange) {
+            functions->compare_exchange_u32 = define_compare_exchange();
+        }
     }
 }
 
@@ -1345,7 +1578,7 @@ void EmitContext::DefineRescalingInput(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 4> members{};
+    boost::container::static_vector<Id, 3> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1362,28 +1595,9 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
     }
-    if (UsesMeshDrawBase()) {
-        members.push_back(U32[1]);
-        mesh_draw_base_member_index = member_index++;
-    }
-    const bool occl_flag{UsesOcclFlagStore()};
-    if (occl_flag) {
-        members.push_back(TypeInt(64, false));
-        occl_flag_member_index = member_index++;
-    }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
-    if (occl_flag) {
-        MemberDecorate(push_constant_struct, occl_flag_member_index, spv::Decoration::Offset,
-                       OCCL_FLAG_PUSH_OFFSET);
-        MemberName(push_constant_struct, occl_flag_member_index, "occl_flag_slot");
-    }
-    if (UsesMeshDrawBase()) {
-        MemberDecorate(push_constant_struct, mesh_draw_base_member_index, spv::Decoration::Offset,
-                       MeshDrawBaseOffset());
-        MemberName(push_constant_struct, mesh_draw_base_member_index, "mesh_draw_base");
-    }
 
     MemberDecorate(push_constant_struct, rescaling_textures_member_index, spv::Decoration::Offset,
                    static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
@@ -1402,12 +1616,6 @@ void EmitContext::DefineRescalingInputPushConstant() {
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
-    if (UsesMeshDrawBase()) {
-        mesh_draw_base_push_constant = rescaling_push_constants;
-    }
-    if (occl_flag) {
-        occl_flag_push_constant = rescaling_push_constants;
-    }
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
@@ -1425,115 +1633,21 @@ void EmitContext::DefineRescalingInputUniformConstant() {
     }
 }
 
-bool EmitContext::UsesMeshDrawBase() const {
-    return (stage == Stage::Task || stage == Stage::Mesh) && profile.unified_descriptor_binding &&
-           MeshFirstEnabled();
-}
-
-u32 EmitContext::MeshDrawBaseOffset() const {
-    return MESH_DRAW_BASE_OFFSET + static_cast<u32>(stage == Stage::Task
-                                                        ? offsetof(MeshDrawBaseLayout, task)
-                                                        : offsetof(MeshDrawBaseLayout, mesh));
-}
-
-void EmitContext::DefineMeshDrawBase() {
-    // One push constant block per entry point: the rescaling block already holds it if defined.
-    if (!UsesMeshDrawBase() || Sirit::ValidId(mesh_draw_base_push_constant)) {
-        return;
-    }
-    const Id push_constant_struct{TypeStruct(U32[1])};
-    Decorate(push_constant_struct, spv::Decoration::Block);
-    Name(push_constant_struct, "MeshDrawBase");
-    MemberDecorate(push_constant_struct, 0, spv::Decoration::Offset, MeshDrawBaseOffset());
-    MemberName(push_constant_struct, 0, "mesh_draw_base");
-    mesh_draw_base_member_index = 0;
-    const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
-    mesh_draw_base_push_constant = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
-    Name(mesh_draw_base_push_constant, "mesh_draw_base_push_constants");
-    if (profile.supported_spirv >= 0x00010400) {
-        interfaces.push_back(mesh_draw_base_push_constant);
-    }
-}
-
-void EmitContext::DefineOcclFlag() {
-    if (!UsesOcclFlagStore()) {
-        return;
-    }
-    // The slot is written through a physical storage buffer pointer (buffer device address).
-    AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
-    AddCapability(spv::Capability::Int64);
-    if (profile.supported_spirv < 0x00010500) {
-        AddExtension("SPV_KHR_physical_storage_buffer");
-    }
-    SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
-    occl_flag_u64 = TypeInt(64, false);
-    // The slot: a uvec2 behind a physical storage buffer pointer (no struct: see the header).
-    occl_flag_slot_pointer = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[2]);
-    if (!Sirit::ValidId(occl_flag_push_constant)) {
-        // No rescaling or render area block: one of its own.
-        const Id push_constant_struct{TypeStruct(occl_flag_u64)};
-        Decorate(push_constant_struct, spv::Decoration::Block);
-        Name(push_constant_struct, "OcclFlagInfo");
-        MemberDecorate(push_constant_struct, 0, spv::Decoration::Offset, OCCL_FLAG_PUSH_OFFSET);
-        MemberName(push_constant_struct, 0, "occl_flag_slot");
-        occl_flag_member_index = 0;
-        const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
-        occl_flag_push_constant =
-            AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
-        Name(occl_flag_push_constant, "occl_flag_push_constants");
-        if (profile.supported_spirv >= 0x00010400) {
-            interfaces.push_back(occl_flag_push_constant);
-        }
-    }
-    // void occl_flag_store(): the slot gets uvec2(4096, 0) while it still reads 0 (a large
-    // draw's fragments would otherwise all write the same 8 bytes; a stale 0 only repeats it).
-    occl_flag_store_function =
-        OpFunction(void_id, spv::FunctionControlMask::MaskNone, TypeFunction(void_id));
-    AddLabel();
-    const Id push_pointer{TypePointer(spv::StorageClass::PushConstant, occl_flag_u64)};
-    const Id address{OpLoad(occl_flag_u64, OpAccessChain(push_pointer, occl_flag_push_constant,
-                                                         Const(occl_flag_member_index)))};
-    const Id slot{OpConvertUToPtr(occl_flag_slot_pointer, address)};
-    const Id current{OpLoad(U32[2], slot, spv::MemoryAccessMask::Aligned, 8u)};
-    const Id unset{OpIEqual(U1, OpCompositeExtract(U32[1], current, 0u), u32_zero_value)};
-    const Id store_label{OpLabel()};
-    const Id merge_label{OpLabel()};
-    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-    OpBranchConditional(unset, store_label, merge_label);
-    AddLabel(store_label);
-    OpStore(slot, Const(4096u, 0u), spv::MemoryAccessMask::Aligned, 8u);
-    OpBranch(merge_label);
-    AddLabel(merge_label);
-    OpReturn();
-    OpFunctionEnd();
-    Name(occl_flag_store_function, "occl_flag_store");
-}
-
 void EmitContext::DefineRenderArea(const Info& info) {
     if (!info.uses_render_area) {
         return;
     }
 
     if (profile.unified_descriptor_binding) {
-        boost::container::static_vector<Id, 2> members{};
+        boost::container::static_vector<Id, 1> members{};
         u32 member_index{0};
 
         members.push_back(F32[4]);
         render_are_member_index = member_index++;
-        const bool occl_flag{UsesOcclFlagStore() && !Sirit::ValidId(occl_flag_push_constant)};
-        if (occl_flag) {
-            members.push_back(TypeInt(64, false));
-            occl_flag_member_index = member_index++;
-        }
 
         const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
         Decorate(push_constant_struct, spv::Decoration::Block);
         Name(push_constant_struct, "RenderAreaInfo");
-        if (occl_flag) {
-            MemberDecorate(push_constant_struct, occl_flag_member_index, spv::Decoration::Offset,
-                           OCCL_FLAG_PUSH_OFFSET);
-            MemberName(push_constant_struct, occl_flag_member_index, "occl_flag_slot");
-        }
 
         MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset, 0);
         MemberName(push_constant_struct, render_are_member_index, "render_area");
@@ -1542,9 +1656,6 @@ void EmitContext::DefineRenderArea(const Info& info) {
         render_area_push_constant =
             AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
         Name(render_area_push_constant, "render_area_push_constants");
-        if (occl_flag) {
-            occl_flag_push_constant = render_area_push_constant;
-        }
 
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(render_area_push_constant);
@@ -1672,14 +1783,6 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     IR::Type used_types{profile.support_descriptor_aliasing ? info.used_storage_buffer_types
                                                             : IR::Type::U32};
     used_types |= IR::Type::U32;
-    // Float32 atomic adds on an aliased float view of the buffers, in hardware.
-    native_f32_atomic_add = info.uses_atomic_f32_add && profile.support_float32_atomic_add &&
-                            profile.support_descriptor_aliasing;
-    if (native_f32_atomic_add) {
-        used_types |= IR::Type::F32;
-        AddExtension("SPV_EXT_shader_atomic_float_add");
-        AddCapability(spv::Capability::AtomicFloat32AddEXT);
-    }
     if (profile.support_int8 && profile.support_storage_buffer_8bit &&
         True(used_types & IR::Type::U8)) {
         DefineSsbos(*this, storage_types.U8, &StorageDefinitions::U8, info, binding, U8,
@@ -1732,7 +1835,7 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
         decrement_cas_ssbo = CasLoop(*this, Operation::Decrement, storage_types.U32.array,
                                      storage_types.U32.element, U32[1], spv::Scope::Device);
     }
-    if (info.uses_atomic_f32_add && !native_f32_atomic_add) {
+    if (info.uses_atomic_f32_add) {
         f32_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
                               storage_types.U32.element, F32[1], spv::Scope::Device);
     }
@@ -1777,7 +1880,7 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
         }
         const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
+        Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "texbuf"));
         texture_buffers.push_back({
             .id = id,
@@ -1800,7 +1903,7 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
+        Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "imgbuf"));
         if (info.requires_coherent_image_memory) {
             Decorate(id, spv::Decoration::Coherent);
@@ -1828,7 +1931,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
         const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
+        Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "tex"));
         textures.push_back({
             .id = id,
@@ -1858,7 +1961,7 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
+        Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "img"));
         if (info.requires_coherent_image_memory) {
             Decorate(id, spv::Decoration::Coherent);
@@ -1927,12 +2030,6 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupLocalInvocationId);
         if (stage == Stage::Fragment) {
             Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
-        }
-        if (info.uses_subgroup_shuffles && profile.warp_size_potentially_smaller_than_guest) {
-            subgroup_size = DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupSize);
-            if (stage == Stage::Fragment) {
-                Decorate(subgroup_size, spv::Decoration::Flat);
-            }
         }
     }
     if (info.uses_fswzadd) {
@@ -2124,9 +2221,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     // emulation it is plain workgroup memory, copied through the task payload buffer.
     const spv::StorageClass payload_class{as_compute ? spv::StorageClass::Workgroup
                                                      : spv::StorageClass::TaskPayloadWorkgroupEXT};
-    // (The native form keeps its exact SPIR-V, so kept modules of it stay valid.)
-    const Id payload_type{TypeArray(
-        U32[1], Const(as_compute ? (std::max)(mesh_info.payload_words, 1U) : mesh_info.payload_words))};
+    const Id payload_type{TypeArray(U32[1], Const((std::max)(mesh_info.payload_words, 1U)))};
     mesh_payload = DefineVariable(*this, payload_type, std::nullopt, payload_class);
     Name(mesh_payload, "task_payload");
     mesh_payload_u32 = TypePointer(payload_class, U32[1]);
@@ -2155,6 +2250,14 @@ void EmitContext::DefineMesh(const IR::Program& program) {
 
     if (as_compute) {
         return; // the output buffer: DefineMeshEmulationOutput, after the storage buffers
+    }
+    if (profile.has_broken_mesh_user_sgprs) {
+        // On GFX11+, RADV gives a mesh shader user SGPRs only for the grid size and the draw
+        // index. Without them, binding the shader keeps the last vertex shader's draw index
+        // state, and the next mesh draw writes a SET_SH_REG packet that declares more registers
+        // than it holds: the command processor then hangs. MeshEpilogue reads this variable.
+        mesh_num_workgroups = DefineVariable(*this, U32[3], spv::BuiltIn::NumWorkgroups,
+                                             spv::StorageClass::Input);
     }
 
     const Id vertex_count{Const(mesh_info.max_vertices)};

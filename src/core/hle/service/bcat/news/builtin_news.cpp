@@ -28,9 +28,7 @@
 #include <optional>
 #include <thread>
 
-#ifdef YUZU_BUNDLED_OPENSSL
-#include <openssl/cert.h>
-#endif
+#include "common/net/ca_store.h"
 
 namespace Service::News {
 namespace {
@@ -79,7 +77,7 @@ std::vector<u8> TryLoadFromDisk(const std::filesystem::path& path) {
     return data;
 }
 
-// TODO: Migrate to use Common::Net
+// TODO(crueter): Migrate to use Common::Net
 std::vector<u8> DownloadImage(const std::string& url_path, const std::filesystem::path& cache_path) {
     LOG_DEBUG(Service_BCAT, "Downloading image: https://eden-emu.dev{}", url_path);
     try {
@@ -88,9 +86,7 @@ std::vector<u8> DownloadImage(const std::string& url_path, const std::filesystem
         cli.set_connection_timeout(std::chrono::seconds(2));
         cli.set_read_timeout(std::chrono::seconds(2));
 
-#ifdef YUZU_BUNDLED_OPENSSL
-        cli.load_ca_cert_store(kCert, sizeof(kCert));
-#endif
+        Common::Net::ConfigureCaStore(cli);
 
         if (auto res = cli.Get(url_path); res && res->status == 200 && !res->body.empty()) {
             std::vector<u8> data(res->body.begin(), res->body.end());

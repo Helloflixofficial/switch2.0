@@ -38,10 +38,6 @@ struct EventType {
     /// A monotonic sequence number, incremented when this event is
     /// changed externally.
     size_t sequence_number;
-    /// EDEN_NX2_TIMER_SPIN_US: the timer thread spins up to this event instead of waking on the
-    /// OS timer (whose 0.5 ms tick made guest sleeps of 100 us last ~420 us). The kernel's
-    /// hardware timer only (guest sleeps and timeouts); set right after CreateEvent.
-    bool precise = false;
 };
 
 enum class UnscheduleEventType {
@@ -61,18 +57,6 @@ enum class UnscheduleEventType {
  * inside callback:
  *   ScheduleEvent(period_in_ns - ns_late, callback, "whatever")
  */
-/// FRITCHII_JIT_INLINE_CNTPCT (boot, default 0; x86-64): the factor the JIT multiplies the TSC by
-/// for an inline CNTPCT_EL0 read, the wall clock's own; 0 whenever GetClockTicks would differ from
-/// the plain wall clock (CPU clock not Normal, core speed sync, guest thread stats), so the JIT
-/// calls GetCNTPCT then. Read by the JIT as a plain 64-bit load.
-extern std::atomic<u64> g_inline_cntpct_factor;
-
-/// Whether FRITCHII_JIT_INLINE_CNTPCT is set and the wall clock is the TSC (logged once).
-[[nodiscard]] bool InlineCntpctEnabled();
-
-/// Recomputes g_inline_cntpct_factor from the settings (MakeJit, System::ApplySettings).
-void RefreshInlineCntpct();
-
 class CoreTiming {
 public:
     CoreTiming();
@@ -146,6 +130,11 @@ public:
     [[nodiscard]] std::chrono::microseconds GetGlobalTimeUs() const noexcept;
     [[nodiscard]] std::chrono::nanoseconds GetGlobalTimeNs() const noexcept;
 
+    /// Global time (GetGlobalTimeNs) at which emulation last resumed from a pause.
+    [[nodiscard]] std::chrono::nanoseconds GetPauseEndTime() const noexcept {
+        return std::chrono::nanoseconds{pause_end_time.load(std::memory_order_relaxed)};
+    }
+
     /// Checks for events manually and returns time in nanoseconds for next event, threadsafe.
     std::optional<s64> Advance();
 
@@ -157,22 +146,26 @@ public:
 
     void Reset();
 
+    struct NextEvents {
+        std::optional<s64> next;
+        /// The first event that does not loop. Looping events keep their own schedule however late
+        /// they run; a one-shot event's lateness shifts what the guest schedules after it.
+        std::optional<s64> one_shot;
+    };
+    NextEvents AdvanceEvents();
+
+    /// Waits on `event` until next_time: sleeps in the OS, except within the host wait margin of
+    /// a one-shot event, where it waits in hardware.
+    void WaitForEvent(s64 next_time, std::optional<s64> one_shot_time);
+
     using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
     heap_t event_queue;
     s64 global_timer = 0;
 #ifdef _WIN32
     s64 timer_resolution_ns;
-    /// The timer thread's early wake-up for its high resolution wait (see Wake).
-    void* wake_handle{};
 #endif
-    /// Wakes the timer thread: `event`, and on Windows the high resolution wait's wake handle.
-    void Wake();
-    /// Bumped by Wake: ends the timer thread's spin before a precise event (a new earlier event).
-    std::atomic<u32> wake_count{};
-    /// The earliest precise event's time after Advance (max: none). Timer thread only.
-    s64 next_precise_ns = (std::numeric_limits<s64>::max)();
     u64 event_fifo_id = 0;
-    s64 pause_end_time{};
+    std::atomic<s64> pause_end_time{};
     /// Cycle timing
     u64 cpu_ticks{};
     s64 downcount{};
@@ -187,6 +180,9 @@ public:
     std::atomic<bool> wait_set{};
     std::atomic<bool> has_started{};
     bool is_multicore{};
+    /// Logs the timer thread's waits once a second (EDEN_NX2_HOSTTIMING_STATS=1, or the debug
+    /// server's host_timing).
+    std::atomic<bool> host_wait_stats{};
 };
 
 /// Creates a core timing event with the given name and callback.

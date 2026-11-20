@@ -5,9 +5,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
-#include <bit>
-#include <chrono>
-#include <unordered_map>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -23,10 +20,8 @@
 #include "common/assert.h"
 #include "common/atomic_ops.h"
 #include "common/common_types.h"
-#include "common/fritchii_write_ring.h"
 #include "common/heap_tracker.h"
 #include "common/logging.h"
-#include "common/nx2_uniform_keep_pages.h"
 #include "common/page_table.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -41,12 +36,10 @@
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
-#include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
-#include "video_core/nx2_debug_control.h"
-#include "video_core/nx2_write_track.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -69,18 +62,6 @@ struct Memory::Impl {
 
     void SetCurrentPageTable(Kernel::KProcess& process) {
         current_page_table = &process.GetPageTable().GetImpl();
-        if (process.IsApplication()) {
-            // FRITCHII_STORE_MEMO: the epoch is armed once, here, if the switch is on now (after
-            // main() applied nx2_switches.txt, before the game's first instruction).
-            static std::once_flag store_memo_arm;
-            std::call_once(store_memo_arm, [] {
-                const char* value = std::getenv("FRITCHII_STORE_MEMO");
-                if (value != nullptr && std::atoi(value) != 0) {
-                    Common::g_store_memo_armed.store(true, std::memory_order_seq_cst);
-                    LOG_INFO(HW_Memory, "FRITCHII_STORE_MEMO={}: store memo armed at boot", value);
-                }
-            });
-        }
 
         if (process.IsApplication() && Settings::IsFastmemEnabled()) {
             current_page_table->fastmem_arena = system.DeviceMemory().buffer.VirtualBasePointer();
@@ -99,11 +80,11 @@ struct Memory::Impl {
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                          Common::PhysicalAddress target, Common::MemoryPermission perms,
                          bool separate_heap) {
-        ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
-        ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
+        ASSERT_MSG((size & LICHII_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
+        ASSERT_MSG((base & LICHII_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
         ASSERT_MSG(target >= DramMemoryMap::Base, "Out of bounds target: {:016X}",
                    GetInteger(target));
-        MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, target,
+        MapPages(page_table, base / LICHII_PAGESIZE, size / LICHII_PAGESIZE, target,
                  Common::PageType::Memory);
 
         if (current_page_table->fastmem_arena) {
@@ -113,9 +94,9 @@ struct Memory::Impl {
 
     void UnmapRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                      bool separate_heap) {
-        ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
-        ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
-        MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0,
+        ASSERT_MSG((size & LICHII_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
+        ASSERT_MSG((base & LICHII_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
+        MapPages(page_table, base / LICHII_PAGESIZE, size / LICHII_PAGESIZE, 0,
                  Common::PageType::Unmapped);
 
         if (current_page_table->fastmem_arena) {
@@ -125,8 +106,8 @@ struct Memory::Impl {
 
     void ProtectRegion(Common::PageTable& page_table, VAddr vaddr, u64 size,
                        Common::MemoryPermission perms) {
-        ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
-        ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
+        ASSERT_MSG((size & LICHII_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
+        ASSERT_MSG((vaddr & LICHII_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
 
         if (!current_page_table->fastmem_arena) {
             return;
@@ -134,16 +115,9 @@ struct Memory::Impl {
 
         u64 protect_bytes = 0, protect_begin = 0;
 
-        // FRITCHII_RAM_PT_LAZY: read through the committed bits (an uncommitted page is unmapped)
-        // instead of committing the range's table pages to read zeros from them.
-        const bool lazy = Common::RamTableLazy();
-        if (!lazy) {
-            current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr + size) >> YUZU_PAGEBITS, "protect");
-        }
-        for (u64 addr = vaddr; addr < vaddr + size; addr += YUZU_PAGESIZE) {
-            const Common::PageType page_type =
-                lazy ? std::as_const(current_page_table->entries)[addr >> YUZU_PAGEBITS].Type()
-                     : current_page_table->entries.GetUnchecked(addr >> YUZU_PAGEBITS).Type();
+        current_page_table->entries.CommitRegion(vaddr >> LICHII_PAGEBITS, (vaddr + size) >> LICHII_PAGEBITS);
+        for (u64 addr = vaddr; addr < vaddr + size; addr += LICHII_PAGESIZE) {
+            const Common::PageType page_type = current_page_table->entries.GetUnchecked(addr >> LICHII_PAGEBITS).Type();
             switch (page_type) {
             case Common::PageType::RasterizerCachedMemory:
                 if (protect_bytes > 0) {
@@ -154,7 +128,7 @@ struct Memory::Impl {
             default:
                 if (protect_bytes == 0)
                     protect_begin = addr;
-                protect_bytes += YUZU_PAGESIZE;
+                protect_bytes += LICHII_PAGESIZE;
             }
         }
 
@@ -164,13 +138,13 @@ struct Memory::Impl {
     }
 
     [[nodiscard]] u8* GetPointerFromRasterizerCachedMemory(u64 vaddr) const {
-        if (u64 paddr = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Pointer(true); paddr)
+        if (u64 paddr = current_page_table->entries[vaddr >> LICHII_PAGEBITS].Pointer(true); paddr)
             return reinterpret_cast<u8*>(paddr) + vaddr;
         return {};
     }
 
     [[nodiscard]] u8* GetPointerFromDebugMemory(u64 vaddr) const {
-        if (u64 paddr = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Pointer(true); paddr)
+        if (u64 paddr = current_page_table->entries[vaddr >> LICHII_PAGEBITS].Pointer(true); paddr)
             return reinterpret_cast<u8*>(paddr) + vaddr;
         return {};
     }
@@ -297,20 +271,15 @@ struct Memory::Impl {
             return false;
         }
         std::size_t remaining_size = size;
-        std::size_t page_index = addr >> YUZU_PAGEBITS;
-        std::size_t page_offset = addr & YUZU_PAGEMASK;
+        std::size_t page_index = addr >> LICHII_PAGEBITS;
+        std::size_t page_offset = addr & LICHII_PAGEMASK;
         bool user_accessible = true;
 
-        const bool lazy = Common::RamTableLazy(); // FRITCHII_RAM_PT_LAZY, as ProtectRegion
-        if (!lazy) {
-            current_page_table->entries.CommitRegion(page_index, page_index + (size >> YUZU_PAGEBITS) + 1, "walk");
-        }
+        current_page_table->entries.CommitRegion(page_index, page_index + (size >> LICHII_PAGEBITS) + 1);
         while (remaining_size != 0) {
-            const std::size_t copy_amount = (std::min)(std::size_t(YUZU_PAGESIZE) - page_offset, remaining_size);
-            const auto current_vaddr = u64((page_index << YUZU_PAGEBITS) + page_offset);
-            const auto [pointer, type, _] =
-                lazy ? std::as_const(current_page_table->entries)[page_index].PointerTypeBlock()
-                     : current_page_table->entries.GetUnchecked(page_index).PointerTypeBlock();
+            const std::size_t copy_amount = (std::min)(std::size_t(LICHII_PAGESIZE) - page_offset, remaining_size);
+            const auto current_vaddr = u64((page_index << LICHII_PAGEBITS) + page_offset);
+            const auto [pointer, type, _] = current_page_table->entries.GetUnchecked(page_index).PointerTypeBlock();
             switch (type) {
             case Common::PageType::Unmapped: {
                 user_accessible = false;
@@ -318,7 +287,7 @@ struct Memory::Impl {
                 break;
             }
             case Common::PageType::Memory: {
-                u8* mem_ptr = reinterpret_cast<u8*>(pointer + page_offset + (page_index << YUZU_PAGEBITS));
+                u8* mem_ptr = reinterpret_cast<u8*>(pointer + page_offset + (page_index << LICHII_PAGEBITS));
                 on_memory(offset, copy_amount, mem_ptr);
                 break;
             }
@@ -360,29 +329,24 @@ struct Memory::Impl {
         });
     }
 
-    [[nodiscard]] inline const u8* GetSpan(const VAddr addr, const std::size_t size) const noexcept {
-        const auto first = current_page_table->entries[addr >> YUZU_PAGEBITS].Block();
-        const auto last = current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block();
-        if (Common::PageTable::PageEntryData::CanFastSpan(first, last)) {
-            return GetPointerSilent(addr);
-        }
-        if (first != Common::PageTable::PageEntryData::INVALID_BLOCK_ID &&
-            last != Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
+    /// Returns a host pointer to [addr, addr + size) if the whole range is backed by one linear
+    /// host range, nullptr otherwise. Every page of such a range stores the same offset; block ids
+    /// can't prove it, since equal ids at the ends say nothing about a page remapped in between.
+    [[nodiscard]] u8* GetSpan(const VAddr addr, const std::size_t size) const noexcept {
+        // An empty span at the exclusive end of the address space has no page-table entry.
+        if (!AddressSpaceContains(*current_page_table, addr, size) ||
+            addr >= (u64{1} << current_page_table->GetAddressSpaceBits())) {
             return nullptr;
         }
-        return GetContiguousSpan(addr, size);
-    }
-    [[nodiscard]] inline u8* GetSpan(const VAddr addr, const std::size_t size) noexcept {
-        const auto first = current_page_table->entries[addr >> YUZU_PAGEBITS].Block();
-        const auto last = current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block();
-        if (Common::PageTable::PageEntryData::CanFastSpan(first, last)) {
-            return GetPointerSilent(addr);
+        const u64 first_page = addr >> LICHII_PAGEBITS;
+        const u64 last_page = (addr + (size != 0 ? size - 1 : 0)) >> LICHII_PAGEBITS;
+        const uintptr_t offset = current_page_table->entries[first_page].Pointer(true);
+        for (u64 page = first_page + 1; page <= last_page; ++page) {
+            if (current_page_table->entries[page].Pointer(true) != offset) {
+                return nullptr;
+            }
         }
-        if (first != Common::PageTable::PageEntryData::INVALID_BLOCK_ID &&
-            last != Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
-            return nullptr;
-        }
-        return GetContiguousSpan(addr, size);
+        return GetPointerSilent(addr);
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
@@ -395,22 +359,10 @@ struct Memory::Impl {
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             if (!unsafe) {
-                const u64 generation = TrackedGeneration();
                 HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
-                std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
-                NoteStoredWrite(GetInteger(current_vaddr), copy_amount, generation);
-            } else {
-                std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
             }
-            VideoCommon::WriteTrack::CloseIfArmed();
-            // EXP92: the after-store point (unsafe writes recorded nothing: noted here; also with
-            // the bank marks on, whose flag the write ring's Note sets, FRITCHII_BANK_FLAGGED).
-            Common::UniformKeepPages::AfterGuestStore();
-            if (unsafe && (Common::UniformKeepPages::AnyKept() ||
-                           Common::WriteRing::g_on.load(std::memory_order_relaxed) ||
-                           Common::BankMarks())) [[unlikely]] {
-                NoteUnrecordedStore(GetInteger(current_vaddr), copy_amount);
-            }
+            std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+            VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
         });
     }
 
@@ -423,12 +375,9 @@ struct Memory::Impl {
             std::memset(ptr, 0, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            const u64 generation = TrackedGeneration();
             HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
             std::memset(ptr, 0, copy_amount);
-            NoteStoredWrite(GetInteger(current_vaddr), copy_amount, generation);
-            VideoCommon::WriteTrack::CloseIfArmed();
-            Common::UniformKeepPages::AfterGuestStore(); // EXP92
+            VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
         });
     }
 
@@ -475,8 +424,6 @@ struct Memory::Impl {
             // dc cvac: Store to point of coherency
             // CPU flush -> GPU invalidate
             HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
-            VideoCommon::WriteTrack::CloseIfArmed();
-            Common::UniformKeepPages::AfterGuestStore(); // EXP92
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -486,8 +433,6 @@ struct Memory::Impl {
             // dc civac: Store to point of coherency, and invalidate from cache
             // CPU flush -> GPU invalidate
             HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
-            VideoCommon::WriteTrack::CloseIfArmed();
-            Common::UniformKeepPages::AfterGuestStore(); // EXP92
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -506,19 +451,11 @@ struct Memory::Impl {
         // Iterate over a contiguous CPU address space, marking/unmarking the region.
         // The region is at a granularity of CPU pages.
 
-        const u64 num_pages = ((vaddr + size - 1) >> YUZU_PAGEBITS) - (vaddr >> YUZU_PAGEBITS) + 1;
+        const u64 num_pages = ((vaddr + size - 1) >> LICHII_PAGEBITS) - (vaddr >> LICHII_PAGEBITS) + 1;
 
-        const bool lazy = Common::RamTableLazy(); // FRITCHII_RAM_PT_LAZY, as ProtectRegion
-        if (!lazy) {
-            current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr >> YUZU_PAGEBITS) + num_pages, "mark debug");
-        }
-        for (u64 i = 0; i < num_pages; ++i, vaddr += YUZU_PAGESIZE) {
-            if (lazy && !current_page_table->entries.IsCommittedAt(vaddr >> YUZU_PAGEBITS)) {
-                // Unmapped, as below
-                ASSERT(false && "Attempted to mark unmapped pages as debug or non-debug");
-                continue;
-            }
-            auto& entry = current_page_table->entries.GetUnchecked(vaddr >> YUZU_PAGEBITS);
+        current_page_table->entries.CommitRegion(vaddr >> LICHII_PAGEBITS, (vaddr >> LICHII_PAGEBITS) + num_pages);
+        for (u64 i = 0; i < num_pages; ++i, vaddr += LICHII_PAGESIZE) {
+            auto& entry = current_page_table->entries.GetUnchecked(vaddr >> LICHII_PAGEBITS);
             const auto [pointer, type, block] = entry.PointerTypeBlock(true);
             if (debug) {
                 // Switch page type to debug if now debug
@@ -557,57 +494,9 @@ struct Memory::Impl {
         }
     }
 
-    // EDEN_NX2_MME_DMA_STATS: how often pages are protected again after an upload and
-    // unprotected by a CPU write, and how many distinct pages that is.
-    struct ProtectStats {
-        std::mutex mutex;
-        std::array<u64, 2> calls{};
-        std::array<u64, 2> pages{};
-        std::unordered_map<u64, u32> protected_pages;
-        std::chrono::steady_clock::time_point last_log{std::chrono::steady_clock::now()};
-
-        static ProtectStats* Get() {
-            static const bool enabled = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
-            static ProtectStats stats;
-            return enabled ? &stats : nullptr;
-        }
-
-        void Note(u64 vaddr, u64 size, bool cached) {
-            std::scoped_lock lk{mutex};
-            const u64 first = vaddr >> YUZU_PAGEBITS;
-            const u64 last = (vaddr + size - 1) >> YUZU_PAGEBITS;
-            ++calls[cached];
-            pages[cached] += last - first + 1;
-            if (cached) {
-                for (u64 page = first; page <= last; ++page) {
-                    ++protected_pages[page];
-                }
-            }
-            const auto now = std::chrono::steady_clock::now();
-            if (now - last_log < std::chrono::seconds{5}) {
-                return;
-            }
-            last_log = now;
-            size_t hot = 0;
-            for (const auto& [page, count] : protected_pages) {
-                hot += count >= 100 ? 1 : 0;
-            }
-            LOG_INFO(HW_Memory,
-                     "Page protection (5 s): protect {} calls {} pages ({} distinct, {} protected "
-                     "100+ times), unprotect {} calls {} pages",
-                     calls[1], pages[1], protected_pages.size(), hot, calls[0], pages[0]);
-            calls = {};
-            pages = {};
-            protected_pages.clear();
-        }
-    };
-
     void RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached) {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
-        }
-        if (auto* stats = ProtectStats::Get()) {
-            stats->Note(vaddr, size, cached);
         }
 
         if (current_page_table->fastmem_arena) {
@@ -619,7 +508,7 @@ struct Memory::Impl {
                 return value != nullptr && value[0] == '1';
             }();
             const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
+                Settings::ReactiveFlushing() &&
                 !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
             if (!reactive_flushing || !cached) {
                 perm |= Common::MemoryPermission::Read;
@@ -638,16 +527,10 @@ struct Memory::Impl {
         // granularity of CPU pages, hence why we iterate on a CPU page basis (note: GPU page size
         // is different). This assumes the specified GPU address region is contiguous as well.
 
-        const u64 num_pages = ((vaddr + size - 1) >> YUZU_PAGEBITS) - (vaddr >> YUZU_PAGEBITS) + 1;
-        const bool lazy = Common::RamTableLazy(); // FRITCHII_RAM_PT_LAZY, as ProtectRegion
-        if (!lazy) {
-            current_page_table->entries.CommitRegion(vaddr >> YUZU_PAGEBITS, (vaddr >> YUZU_PAGEBITS) + num_pages, "mark cached");
-        }
-        for (u64 i = 0; i < num_pages; ++i, vaddr += YUZU_PAGESIZE) {
-            if (lazy && !current_page_table->entries.IsCommittedAt(vaddr >> YUZU_PAGEBITS)) {
-                continue; // Unmapped: left alone either way, as below
-            }
-            auto& entry = current_page_table->entries.GetUnchecked(vaddr >> YUZU_PAGEBITS);
+        const u64 num_pages = ((vaddr + size - 1) >> LICHII_PAGEBITS) - (vaddr >> LICHII_PAGEBITS) + 1;
+        current_page_table->entries.CommitRegion(vaddr >> LICHII_PAGEBITS, (vaddr >> LICHII_PAGEBITS) + num_pages);
+        for (u64 i = 0; i < num_pages; ++i, vaddr += LICHII_PAGESIZE) {
+            auto& entry = current_page_table->entries.GetUnchecked(vaddr >> LICHII_PAGEBITS);
             const Common::PageType page_type = entry.Type();
             if (cached) {
                 // Switch page type to cached if now cached
@@ -707,7 +590,7 @@ struct Memory::Impl {
             return value != nullptr && value[0] == '0';
         }();
         return !disabled && current_page_table->fastmem_arena &&
-               !Settings::values.use_reactive_flushing.GetValue() &&
+               !Settings::ReactiveFlushing() &&
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
 
@@ -718,7 +601,7 @@ struct Memory::Impl {
             !ReadTrapsEnabled()) {
             return;
         }
-        const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        const u64 page_end = ((vaddr + size - 1) >> LICHII_PAGEBITS) + 1;
         std::scoped_lock lk{read_trap_mutex};
         u64 run_begin = 0;
         u64 run_pages = 0;
@@ -726,12 +609,12 @@ struct Memory::Impl {
             if (run_pages > 0) {
                 // Reads that hit a cached read area must not skip the flush of a new trap.
                 read_trap_generation.fetch_add(1, std::memory_order_release);
-                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                host_buffer->Protect(run_begin << LICHII_PAGEBITS, run_pages << LICHII_PAGEBITS,
                                      Common::MemoryPermission{});
                 run_pages = 0;
             }
         };
-        for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
+        for (u64 page = vaddr >> LICHII_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
             armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
@@ -753,8 +636,8 @@ struct Memory::Impl {
             return false;
         }
         std::scoped_lock lk{read_trap_mutex};
-        const auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
+        const auto it = armed_read_traps.lower_bound(vaddr >> LICHII_PAGEBITS);
+        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> LICHII_PAGEBITS);
     }
 
     /// Takes read permission away again from armed pages that were just cached again.
@@ -763,10 +646,10 @@ struct Memory::Impl {
             return;
         }
         std::scoped_lock lk{read_trap_mutex};
-        const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
+        const u64 page_end = ((vaddr + size - 1) >> LICHII_PAGEBITS) + 1;
+        for (auto it = armed_read_traps.lower_bound(vaddr >> LICHII_PAGEBITS);
              it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            host_buffer->Protect(*it << LICHII_PAGEBITS, LICHII_PAGESIZE, Common::MemoryPermission{});
         }
     }
 
@@ -776,11 +659,11 @@ struct Memory::Impl {
             return;
         }
         std::scoped_lock lk{read_trap_mutex};
-        const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
+        const u64 page_end = ((vaddr + size - 1) >> LICHII_PAGEBITS) + 1;
+        auto it = armed_read_traps.lower_bound(vaddr >> LICHII_PAGEBITS);
         while (it != armed_read_traps.end() && *it < page_end) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+            host_buffer->Protect(*it << LICHII_PAGEBITS, LICHII_PAGESIZE,
                                  Common::MemoryPermission::Read);
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
@@ -801,21 +684,16 @@ struct Memory::Impl {
         auto base = GetInteger(base_address);
 
         LOG_DEBUG(HW_Memory, "Mapping {:016X} onto {:016X}-{:016X}", GetInteger(target),
-                  base * YUZU_PAGESIZE, (base + size) * YUZU_PAGESIZE);
+                  base * LICHII_PAGESIZE, (base + size) * LICHII_PAGESIZE);
 
         const auto end = base + size;
         ASSERT_MSG(end <= page_table.entries.size(), "out of range mapping at {:016X}", base + page_table.entries.size());
 
         if (!target) {
             ASSERT_MSG(type != Common::PageType::Memory,
-                       "Mapping memory page without a pointer @ {:016x}", base * YUZU_PAGESIZE);
+                       "Mapping memory page without a pointer @ {:016x}", base * LICHII_PAGESIZE);
 
             page_table.entries.ZeroRegion(base, end);
-            // FRITCHII_RAM_PT_TRIM: table pages left all zero leave RAM. Under the kernel page
-            // table lock (Operate), which every map into this table holds.
-            if (Common::RamTableTrim()) {
-                page_table.entries.DiscardZeroPages(base, end);
-            }
         } else {
             u64 mapping_id = block_count.load(std::memory_order_relaxed);
             constexpr u64 exhausted_count =
@@ -826,14 +704,10 @@ struct Memory::Impl {
             }
             const u16 current_block =
                 Common::PageTable::PageEntryData::BlockIdForMapping(mapping_id);
-            if (mapping_id == Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
-                LOG_WARNING(HW_Memory,
-                            "Page table block ids are exhausted; validating spans page by page");
-            }
 
-            page_table.entries.CommitRegion(base, end, "map");
+            page_table.entries.CommitRegion(base, end);
             while (base != end) {
-                auto host_ptr = reinterpret_cast<u64>(system.DeviceMemory().GetPointer<u8>(target)) - (base << YUZU_PAGEBITS);;
+                auto host_ptr = reinterpret_cast<u64>(system.DeviceMemory().GetPointer<u8>(target)) - (base << LICHII_PAGEBITS);;
                 auto& entry = page_table.entries.GetUnchecked(base);
 
                 entry.Store(false, type, current_block, host_ptr);
@@ -841,7 +715,7 @@ struct Memory::Impl {
                            "memory mapping base yield a nullptr within the table");
 
                 base += 1;
-                target += YUZU_PAGESIZE;
+                target += LICHII_PAGESIZE;
             }
         }
     }
@@ -852,7 +726,7 @@ struct Memory::Impl {
         vaddr &= 0xffffffffffffULL;
         if (AddressSpaceContains(*current_page_table, vaddr, 1)) [[likely]] {
             // Avoid adding any extra logic to this fast-path block
-            const auto raw = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Raw();
+            const auto raw = current_page_table->entries[vaddr >> LICHII_PAGEBITS].Raw();
             if (auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw); pointer) [[likely]] {
                 return reinterpret_cast<u8*>(pointer + vaddr);
             } else {
@@ -864,12 +738,7 @@ struct Memory::Impl {
                     return GetPointerFromDebugMemory(vaddr);
                 case Common::PageType::RasterizerCachedMemory: {
                     u8* const host_ptr{GetPointerFromRasterizerCachedMemory(vaddr)};
-                    // A store's handler takes the pointer instead of walking the table again.
-                    if constexpr (std::is_invocable_v<G, u8*>) {
-                        on_rasterizer(host_ptr);
-                    } else {
-                        on_rasterizer();
-                    }
+                    on_rasterizer();
                     return host_ptr;
                 }
                 case Common::PageType::Unmapped: [[unlikely]] {
@@ -899,24 +768,6 @@ struct Memory::Impl {
     [[nodiscard]] u8* GetPointerSilent(const Common::ProcessAddress vaddr) const {
         return GetPointerImpl(
             GetInteger(vaddr), []() {}, []() {});
-    }
-
-    [[nodiscard]] u8* GetContiguousSpan(VAddr addr, std::size_t size) const noexcept {
-        u8* const base = GetPointerSilent(addr);
-        if (base == nullptr) {
-            return nullptr;
-        }
-
-        const VAddr end = addr + size;
-        const VAddr first_page = ((addr >> YUZU_PAGEBITS) + 1) << YUZU_PAGEBITS;
-        const std::uintptr_t base_ptr = reinterpret_cast<std::uintptr_t>(base);
-        for (VAddr page = first_page; page < end; page += YUZU_PAGESIZE) {
-            const std::uintptr_t expected = base_ptr + (page - addr);
-            if (reinterpret_cast<std::uintptr_t>(GetPointerSilent(page)) != expected) {
-                return nullptr;
-            }
-        }
-        return base;
     }
 
     /// @brief Reads a particular data type out of memory at the given virtual address.
@@ -956,73 +807,47 @@ struct Memory::Impl {
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
         bool rasterizer_write = false;
-        u64 generation = 0;
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-        }, [&](u8* host_ptr) {
-            generation = TrackedGeneration();
-            HandleRasterizerWrite(addr, sizeof(T), host_ptr);
+        }, [&]() {
+            HandleRasterizerWrite(addr, sizeof(T));
             rasterizer_write = true;
         }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
             if (rasterizer_write) [[unlikely]] {
-                NoteStoredWrite(addr, sizeof(T), generation);
+                VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(T));
             }
-            VideoCommon::WriteTrack::CloseIfArmed();
-            Common::UniformKeepPages::AfterGuestStore(); // EXP92
         }
     }
 
     template <typename T>
     bool WriteExclusive(Common::ProcessAddress vaddr, const T data, const T expected) {
-        bool rasterizer_write = false;
-        u64 generation = 0;
         u8* const ptr = GetPointerImpl(
             GetInteger(vaddr),
             [vaddr, data]() {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
                           sizeof(T) * 8, GetInteger(vaddr), static_cast<u64>(data));
             },
-            [&](u8* host_ptr) {
-                generation = TrackedGeneration();
-                HandleRasterizerWrite(GetInteger(vaddr), sizeof(T), host_ptr);
-                rasterizer_write = true;
-            });
+            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
         if (ptr) {
-            const bool stored =
-                Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
-            if (stored && rasterizer_write) [[unlikely]] {
-                NoteStoredWrite(GetInteger(vaddr), sizeof(T), generation);
-            }
-            VideoCommon::WriteTrack::CloseIfArmed();
-            Common::UniformKeepPages::AfterGuestStore(); // EXP92
+            const bool stored = Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(T));
             return stored;
         }
         return true;
     }
 
     bool WriteExclusive128(Common::ProcessAddress vaddr, const u128 data, const u128 expected) {
-        bool rasterizer_write = false;
-        u64 generation = 0;
         u8* const ptr = GetPointerImpl(
             GetInteger(vaddr),
             [vaddr, data]() {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive128 @ {:#016x} = {:#016x}{:016X}",
                           GetInteger(vaddr), static_cast<u64>(data[1]), static_cast<u64>(data[0]));
             },
-            [&](u8* host_ptr) {
-                generation = TrackedGeneration();
-                HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128), host_ptr);
-                rasterizer_write = true;
-            });
+            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
         if (ptr) {
-            const bool stored =
-                Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
-            if (stored && rasterizer_write) [[unlikely]] {
-                NoteStoredWrite(GetInteger(vaddr), sizeof(u128), generation);
-            }
-            VideoCommon::WriteTrack::CloseIfArmed();
-            Common::UniformKeepPages::AfterGuestStore(); // EXP92
+            const bool stored = Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(u128));
             return stored;
         }
         return true;
@@ -1036,7 +861,7 @@ struct Memory::Impl {
             return;
         }
         const auto raw =
-            current_page_table->entries[(v_address & 0xffffffffffffULL) >> YUZU_PAGEBITS].Raw();
+            current_page_table->entries[(v_address & 0xffffffffffffULL) >> LICHII_PAGEBITS].Raw();
         LOG_ERROR(HW_Memory,
                   "Rasterizer access at {:#x}: host pointer {} is outside the emulated physical "
                   "memory at {} (page type {}, block {})",
@@ -1100,147 +925,21 @@ struct Memory::Impl {
         });
     }
 
-    /// FRITCHII_WRITE_REMARK: read before a write marks its pages (HandleRasterizerWrite), for
-    /// NoteStoredWrite.
-    [[nodiscard]] static u64 TrackedGeneration() noexcept {
-        // Acquire: stays before the mark whatever ordering the mark itself has (free on x86).
-        return Core::g_pages_tracked_generation.load(std::memory_order_acquire);
-    }
-
-    /// FRITCHII_WRITE_REMARK (live, default 1; port of zortos293/Lichii #1829): after a write that
-    /// marked its pages stored its bytes. The mark comes first, so a cache that took the mark in
-    /// between (a gather of the collected writes, an upload that tracks the pages again) could
-    /// read the old bytes and treat them as current: the stored ones then never reached it until
-    /// the page was written again (stale vertex, uniform or texture data). The window is wide when
-    /// the mark waits for a cache mutex the GPU threads hold. If such a take happened since the
-    /// mark began (the generation moved) and a page of the write is still tracked, the write
-    /// marks it again, so the next upload takes the stored bytes.
-    void NoteStoredWrite(VAddr v_address, size_t size, u64 generation) {
-        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_write_remark,
-                                             "FRITCHII_WRITE_REMARK", 1) == 0) {
-            return;
-        }
-        // Pairs with the take's fence: this store is in the cache's read, or the move is seen.
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (Core::g_pages_tracked_generation.load(std::memory_order_relaxed) == generation) {
-            return;
-        }
-        // The address the store went to: GetPointerImpl drops the upper 16 bits (AArch64 tags).
-        v_address &= 0xffffffffffffULL;
-        const size_t span = (std::max<size_t>)(size, 1);
-        if (!AddressSpaceContains(*current_page_table, v_address, span)) {
-            return;
-        }
-        const u64 first_page = v_address >> YUZU_PAGEBITS;
-        const u64 last_page = (v_address + span - 1) >> YUZU_PAGEBITS;
-        bool tracked = false;
-        for (u64 page = first_page; page <= last_page && !tracked; ++page) {
-            tracked = current_page_table->entries[page].Type() ==
-                      Common::PageType::RasterizerCachedMemory;
-        }
-        if (!tracked) {
-            // Untracked pages are CPU-modified to every cache: the next upload takes the store.
-            return;
-        }
-        static std::atomic<u64> marked_again{};
-        const u64 count = marked_again.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (std::has_single_bit(count) && count <= (u64{1} << 20)) {
-            LOG_INFO(HW_Memory,
-                     "CPU writes marked again after a cache took their marks before the store "
-                     "(FRITCHII_WRITE_REMARK): {}",
-                     count);
-        }
-        HandleRasterizerWrite(v_address, size);
-    }
-
-    /// `host_ptr`: the store's host pointer when the caller's walk already found it (null: walk).
-    void HandleRasterizerWrite(VAddr v_address, size_t size, const u8* host_ptr = nullptr) {
+    void HandleRasterizerWrite(VAddr v_address, size_t size) {
         if (!Kernel::Nx2ThreadStats::g_enabled) {
-            WriteToRasterizer(v_address, size, host_ptr);
+            WriteToRasterizer(v_address, size);
             return;
         }
         auto& timing = system.CoreTiming();
         const u64 start = timing.GetClockTicks();
-        WriteToRasterizer(v_address, size, host_ptr);
+        WriteToRasterizer(v_address, size);
         Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
                                             timing.GetClockTicks() - start, false);
     }
 
-    /// FRITCHII_STORE_MEMO: one per core (the last one also for the threads that are not cores,
-    /// under sys_core_guard as the rest of that core's state). `block`: device address >> 6 of the
-    /// last store whose full path ran with a memo kept, ~0 = none; `epoch`: g_store_memo_epoch
-    /// read before that path. Counters: written by the owner (load and store), read by the log.
-    struct alignas(64) StoreMemo {
-        u64 block{~u64{0}};
-        u64 epoch{};
-        std::atomic<u64> stores{};       ///< trapped stores looked at (each device address)
-        std::atomic<u64> hits{};         ///< of them the memo serves (=1: would serve)
-        std::atomic<u64> epoch_misses{}; ///< same block, but a mark may have been taken since
-    };
-
-    static void CountStoreMemo(std::atomic<u64>& counter) noexcept {
-        counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-    }
-
-    /// The dry counter's line, at most every 10 s, from whichever core gets there.
-    void LogStoreMemo(int mode) {
-        using Clock = std::chrono::steady_clock;
-        static std::atomic<s64> last_ns{0};
-        static std::mutex log_mutex;
-        static u64 last_stores{}, last_hits{}, last_epoch_misses{}, last_epoch{};
-        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            Clock::now().time_since_epoch())
-                            .count();
-        s64 last = last_ns.load(std::memory_order_relaxed);
-        if (last != 0 && now - last < 10'000'000'000LL) {
-            return;
-        }
-        std::unique_lock lock{log_mutex, std::try_to_lock};
-        if (!lock.owns_lock() || !last_ns.compare_exchange_strong(last, now)) {
-            return;
-        }
-        u64 stores = 0, hits = 0, epoch_misses = 0;
-        std::string per_core;
-        for (size_t i = 0; i < store_memos.size(); ++i) {
-            const u64 core_stores = store_memos[i].stores.load(std::memory_order_relaxed);
-            const u64 core_hits = store_memos[i].hits.load(std::memory_order_relaxed);
-            stores += core_stores;
-            hits += core_hits;
-            epoch_misses += store_memos[i].epoch_misses.load(std::memory_order_relaxed);
-            per_core += fmt::format("{}{}: {}/{}", i == 0 ? "" : ", ", i, core_hits, core_stores);
-        }
-        const u64 epoch = Common::g_store_memo_epoch.load(std::memory_order_relaxed);
-        if (last == 0) { // the first call only starts the window
-            last_stores = stores, last_hits = hits, last_epoch_misses = epoch_misses;
-            last_epoch = epoch;
-            return;
-        }
-        // Integer math only: this runs on a guest core with the guest's MXCSR, whose exception
-        // flags the guest reads back as FPSR (floating point here could set its inexact flag).
-        const u64 ms = (std::max)(u64(now - last) / 1'000'000, u64{1});
-        const auto per_second = [ms](u64 count) { return count * 1000 / ms; };
-        const u64 d_stores = stores - last_stores;
-        const u64 d_hits = hits - last_hits;
-        const u64 d_epoch_misses = epoch_misses - last_epoch_misses;
-        constexpr u64 field = (u64{1} << 24) - 1;
-        const u64 gathers = ((epoch >> 16) - (last_epoch >> 16)) & field;
-        const u64 takes = ((epoch >> 40) - (last_epoch >> 40)) & field;
-        LOG_INFO(HW_Memory,
-                 "Store memo (FRITCHII_STORE_MEMO={}) {} ms: trapped stores {}/s, {} {}/s ({}%), "
-                 "same block but a mark taken since {}/s; epoch moves: gathers {}/s, flag takes "
-                 "{}/s; since boot hits/stores by core {}",
-                 mode, ms, per_second(d_stores), mode == 2 ? "served" : "would serve",
-                 per_second(d_hits), d_stores == 0 ? 0 : d_hits * 100 / d_stores,
-                 per_second(d_epoch_misses), per_second(gathers), per_second(takes), per_core);
-        last_stores = stores, last_hits = hits, last_epoch_misses = epoch_misses;
-        last_epoch = epoch;
-    }
-
-    void WriteToRasterizer(VAddr v_address, size_t size, const u8* host_ptr) {
-        // The same walk the caller made, when it did not pass the pointer.
-        const auto* p = host_ptr != nullptr ? host_ptr
-                                            : GetPointerImpl(
-                                                  v_address, []() {}, []() {});
+    void WriteToRasterizer(VAddr v_address, size_t size) {
+        const auto* p = GetPointerImpl(
+            v_address, []() {}, []() {});
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
         const size_t core = (std::min)(system.GetCurrentHostThreadID(),
                                      sys_core); // any other calls threads go to syscore.
@@ -1260,138 +959,27 @@ struct Memory::Impl {
                 sys_core_guard.unlock();
             }
         };
-        // FRITCHII_STORE_MEMO (live, default 0; fable_a_gameceiling_answer 12.1): 1 = dry, counts
-        // the stores the memo would serve; 2 = serves them. A store inside the same 64-byte device
-        // block as this core's last full path, with g_store_memo_epoch unchanged since that path
-        // began (no clear began, ended or ran: common/fritchii_page_flags.h), with this core's
-        // write area still on its page and no run-ahead write tracking, finds every mark below
-        // already set: the watch and collected page flags (pages hold the block), the dirty
-        // manager's 64-byte bit (still collected: no gather since), last_address (no OnCPUWrite
-        // either way). The landing wait is not needed: that path saw no landing published, so
-        // every landing published since found its still-collected block and keeps those bytes.
-        // Only the uniform keeps' record runs (thread-local, a keep may be made at any time).
-        int memo_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_store_memo,
-                                                         "FRITCHII_STORE_MEMO");
-        // Without the epoch armed at boot no memo can be trusted: off for the session.
-        if (memo_mode != 0 && !Common::StoreMemoArmed()) [[unlikely]] {
-            if (static std::atomic_flag logged; !logged.test_and_set(std::memory_order_relaxed)) {
-                LOG_WARNING(HW_Memory,
-                            "FRITCHII_STORE_MEMO={} set after boot: the store memo stays off this "
-                            "session (it needs the switch on when the game starts)",
-                            memo_mode);
-            }
-            memo_mode = 0;
-        }
-        StoreMemo& memo = store_memos[core];
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
-            u64 memo_epoch = 0;
-            bool memo_keepable = false;
-            if (memo_mode != 0) [[unlikely]] {
-                memo_epoch = Common::g_store_memo_epoch.load(std::memory_order_seq_cst);
-                const u64 block = address >> 6;
-                const bool one_block =
-                    address != 0 && size != 0 && ((address + size - 1) >> 6) == block;
-                memo_keepable = one_block && (memo_epoch & Common::StoreMemoActiveMask) == 0;
-                CountStoreMemo(memo.stores);
-                if (one_block && memo.block == block) {
-                    if (memo.epoch == memo_epoch &&
-                        rasterizer_write_areas[core].last_address == (address >> YUZU_PAGEBITS) &&
-                        !VideoCommon::WriteTrack::g_armed.load(std::memory_order_relaxed)) {
-                        CountStoreMemo(memo.hits);
-                        if (memo_mode == 2) {
-                            Common::UniformKeepPages::RecordGuestStore(address, size);
-                            return;
-                        }
-                    } else {
-                        CountStoreMemo(memo.epoch_misses);
-                    }
-                }
-                if ((memo.stores.load(std::memory_order_relaxed) & 0xffff) == 0) [[unlikely]] {
-                    LogStoreMemo(memo_mode);
-                }
-            }
-            // EDEN_NX2_TEX_BANK_GEN: every trapped write, before the bytes land (the texture
-            // cache's watched pages look again at their next draw for that reason).
-            if (address != 0 && size != 0) {
-                g_watch_write_pages.Mark(address, size);
-            }
-            // EXP92 (uniform keeps): the device range this thread stores next; the caller's
-            // after-store point notes it (Common::UniformKeepPages::AfterGuestStore). Recorded
-            // always: a keep may be made between here and the store.
-            Common::UniformKeepPages::RecordGuestStore(address, size);
             auto& current_area = rasterizer_write_areas[core];
-            PAddr subaddress = address >> YUZU_PAGEBITS;
+            PAddr subaddress = address >> LICHII_PAGEBITS;
             // Performance note:
             // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
             // It is often the case the games like to access wildly different addresses. Hence why I propose
             // we should let the compiler just do it's thing...
             if (current_area.last_address != subaddress) {
-                // EDEN_NX2_EXP35: a page no GPU write ever marked (bits that never clear) is
-                // collected like a GPU-modified one instead of asking OnCPUWrite under both
-                // caches' mutexes, which the split's back holds through each draw (4% of the
-                // guest cores' busy time at Castle Town). The back applies collected writes to
-                // both caches at its next FlushCaching, before each draw, dispatch and clear.
-                // EXP35=2: every page, GPU-written ones too (their writes are collected anyway
-                // when OnCPUWrite finds them GPU-modified; the clean ones' WriteMemory becomes the
-                // same marks at the back's next FlushCaching). The cache mutexes are held in bursts
-                // through the back's draws: guest threads slept 5-6 ms on them (Fable answer 11).
-                const int collect_mode = VideoCore::Nx2Debug::Experiment(35);
-                const bool collect_unasked =
-                    address != 0 && size != 0 && collect_mode != 0 &&
-                    Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
-                    (collect_mode == 2 || !Tegra::Nx2MayBeGpuWritten(address, size));
-                if (collect_unasked) {
-                    Tegra::g_nx2_guest_writes_collected.fetch_add(1, std::memory_order_relaxed);
-                }
                 // Short circuit the need to check for address/size
-                auto const do_collection = collect_unasked || ((address != 0 && size != 0)
-                    && system.GPU().OnCPUWrite(address, size));
+                auto const do_collection = (address != 0 && size != 0)
+                    && system.GPU().OnCPUWrite(address, size);
                 if (do_collection) {
                     current_area.last_address = subaddress;
                 } else {
                     return;
                 }
             }
-            // EDEN_NX2_RUNAHEAD: the mark is collected before the caller stores the bytes; a
-            // run-ahead gather that copies bytes must know the store may still be on its way
-            // (nx2_write_track.h). The caller closes it after the store.
-            if (VideoCommon::WriteTrack::g_armed.load(std::memory_order_relaxed)) [[unlikely]] {
-                VideoCommon::WriteTrack::Open(address, size, static_cast<u32>(core));
-            }
             gpu_dirty_managers[core].Collect(address, size);
             // A download writing to guest memory here may have looked at the collected writes
             // before this one: its bytes would land over the ones stored after this returns.
-            const bool no_landing = VideoCore::DownloadLanding::AwaitIdle(address, size);
-            // last_address stays on the page after its GPU-written state is gone, so these
-            // writes can land on pages the buffer cache holds as clean until the next gather.
-            g_collected_write_pages.Mark(address, size);
-            if (memo_mode != 0) [[unlikely]] {
-                // Every mark of this block is set now, none taken since memo_epoch was read
-                // (a clear in between moves the epoch, and the next store misses).
-                memo.block = memo_keepable && no_landing ? address >> 6 : ~u64{0};
-                memo.epoch = memo_epoch;
-            }
-        });
-    }
-
-    /// EXP92: a store to a rasterizer-cached page that HandleRasterizerWrite did not see
-    /// (WriteBlockUnsafe, in-place span stores), after the bytes landed: noted for the uniform
-    /// keeps and the write ring (whose Note marks the native bank check's flag) by device
-    /// address. Its own scratch buffer: any thread may call it.
-    void NoteUnrecordedStore(VAddr v_address, size_t size) {
-        const auto* p = GetPointerImpl(
-            v_address, []() {}, []() {});
-        if (!gpu_device_memory) [[unlikely]] {
-            gpu_device_memory = &system.Host1x().MemoryManager();
-        }
-        if (p == nullptr || !gpu_device_memory->IsPhysicalPointer(p)) {
-            return;
-        }
-        thread_local Common::ScratchBuffer<u32> scratch;
-        gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
-            Common::UniformKeepPages::Note(address, size);
-            // The memory seam's read log: an emulator write, not a game store.
-            Common::WriteRing::Note(address, size, "Core::Memory unsafe write");
+            VideoCore::DownloadLanding::Await(address, size);
         });
     }
 
@@ -1432,7 +1020,6 @@ struct Memory::Impl {
     std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
-    std::array<StoreMemo, Core::Hardware::NUM_CPU_CORES> store_memos{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
 #ifdef __ANDROID__
@@ -1476,7 +1063,7 @@ void Memory::ProtectRegion(Common::PageTable& page_table, Common::ProcessAddress
 
 bool Memory::IsValidVirtualAddress(const Common::ProcessAddress vaddr) const {
     const auto& page_table = *impl->current_page_table;
-    const size_t page = vaddr >> YUZU_PAGEBITS;
+    const size_t page = vaddr >> LICHII_PAGEBITS;
     if (page >= page_table.entries.size()) {
         return false;
     }
@@ -1487,9 +1074,12 @@ bool Memory::IsValidVirtualAddress(const Common::ProcessAddress vaddr) const {
 
 bool Memory::IsValidVirtualAddressRange(Common::ProcessAddress base, u64 size) const {
     Common::ProcessAddress end = base + size;
-    Common::ProcessAddress page = Common::AlignDown(GetInteger(base), YUZU_PAGESIZE);
+    if (end < base) {
+        return false;
+    }
+    Common::ProcessAddress page = Common::AlignDown(GetInteger(base), LICHII_PAGESIZE);
 
-    for (; page < end; page += YUZU_PAGESIZE) {
+    for (; page < end; page += LICHII_PAGESIZE) {
         if (!IsValidVirtualAddress(page)) {
             return false;
         }
@@ -1596,21 +1186,6 @@ bool Memory::WriteBlock(const Common::ProcessAddress dest_addr, const void* src_
 bool Memory::WriteBlockUnsafe(const Common::ProcessAddress dest_addr, const void* src_buffer,
                               const std::size_t size) {
     return impl->WriteBlockImpl(dest_addr, src_buffer, size, true);
-}
-
-void Memory::NoteHostStoreSlow(u64 dest_addr, std::size_t size) {
-    // Page by page: each CPU page has its own backing. Only rasterizer-cached pages: the others
-    // are CPU-modified in the buffer cache's tracker or held by no buffer.
-    const u64 end = dest_addr + size;
-    for (u64 page = dest_addr; page < end;) {
-        const u64 next = (std::min<u64>)(end, (page & ~u64{YUZU_PAGEMASK}) + YUZU_PAGESIZE);
-        bool cached = false;
-        (void)impl->GetPointerImpl(page, [] {}, [&cached] { cached = true; });
-        if (cached) {
-            impl->NoteUnrecordedStore(page, next - page);
-        }
-        page = next;
-    }
 }
 
 bool Memory::CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr,

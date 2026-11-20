@@ -18,7 +18,7 @@ struct HostTranslateInfo;
 namespace Shader::Optimization {
 
 void CollectShaderInfoPass(Environment& env, IR::Program& program);
-void ConditionalBarrierPass(IR::Program& program);
+void ConditionalBarrierPass(IR::Program& program, u32 max_shared_memory_size);
 void ConstantPropagationPass(Environment& env, IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
 void GeometryCompactionPass(IR::Program& program, const HostTranslateInfo& host_info);
@@ -66,9 +66,6 @@ struct JoinedDescriptors {
 /// JoinStorageInfo), or at their own bindings when it gives none
 JoinedDescriptors JoinTextureInfo(Info& base, Info& source,
                                   std::span<const u32> storage_bindings = {});
-/// JoinTextureInfo as before the port (descriptors only, the handle
-/// programs of source not joined), for EDEN_NX2_LIGHT_TABLE_ARRAYS off
-void JoinTextureInfoLegacy(Info& base, Info& source);
 /// Adds the storage buffers of source to base, at most limit in all, returning the binding each
 /// has in base
 std::vector<u32> JoinStorageInfo(Info& base, Info& source, size_t limit = Info::MAX_SSBOS);

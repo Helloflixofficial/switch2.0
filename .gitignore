@@ -19,6 +19,7 @@ log.txt
 
 # Generated source files
 src/common/scm_rev.cpp
+dist/english_plurals/generated_en.ts
 
 # Project/editor files
 *.swp
@@ -63,10 +64,15 @@ artifacts
 /install*
 vulkansdk*.exe
 *.tar.zst
-*.zip
-*.7z
 *.exe
+*.zip
 *.pdb
+*.7z
+*.rar
+*.profdata
 
 # Build-time generated external sources
 externals/generated
+
+# Python bytecode
+__pycache__/

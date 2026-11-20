@@ -33,17 +33,6 @@ enum class StreamType {
     Sysmix,
 };
 
-/// Sample frames the host audio device took from the first audio renderer stream, played
-/// (rendered by the game) and starved (the last frame repeated: nothing was queued). Switch 2
-/// movies are shown by this clock (EDEN_NX2_VIDEO_PTS_SYNC, on unless 0) and the movie sync trace
-/// (EDEN_NX2_VIDEO_TRACE) compares it with video timestamps. Counted only when one of them is on.
-struct RenderOutputClock {
-    std::atomic<u64> played{};
-    std::atomic<u64> starved{};
-};
-RenderOutputClock& GetRenderOutputClock();
-bool RenderOutputClockEnabled();
-
 struct SinkBuffer {
     u64 frames;
     u64 frames_played;
@@ -99,6 +88,9 @@ public:
     }
 
     virtual bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples);
+
+    /// Bound queued sysmix blocks; discard sinks use one to preserve the timer cadence.
+    virtual u32 SysmixQueueLimit() const;
 
     /**
      * Check if the stream is paused.
@@ -284,7 +276,9 @@ protected:
 
 private:
     /// Ring buffer of the samples waiting to be played or consumed
-    Common::RingBuffer<s16, 0x10000> samples_buffer;
+    /// Samples the ring below holds, across all channels
+    static constexpr std::size_t SampleRingCapacity = 0x10000;
+    Common::RingBuffer<s16, SampleRingCapacity> samples_buffer;
     bool input_preview{};
     std::atomic<float> input_preview_gain{1.0f};
     std::atomic<u32> input_peak{};
@@ -297,8 +291,14 @@ private:
     /// EDEN_NX2_AUDIO_LEVEL meter state.
     s32 level_peak{};
     u64 level_frames{};
+    u64 level_rendered_frames{};
+    u64 level_callbacks{};
+    u64 level_underrun_callbacks{};
+    u64 level_max_missing_frames{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
+    /// Largest number of frames the host device has asked for in one callback (sysmix streams)
+    std::atomic<u64> largest_request_frames{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)
     u32 max_queue_size{};
     /// Locks access to sample count tracking info

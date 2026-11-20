@@ -7,42 +7,34 @@
 namespace Mode = VideoCommon::DlssMode;
 using Quality = Settings::NvidiaDlssQuality;
 
-TEST_CASE("The Auto DLSS preset is K unless a small card opts in to E", "[dlss_mode]") {
-    using Preset = Settings::DlssPreset;
-    constexpr u64 GiB = u64{1} << 30;
-    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, false, 6 * GiB) == Preset::K);
-    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, true, 6 * GiB) == Preset::E);
-    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, true, 7 * GiB - 1) == Preset::E);
-    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, true, 7 * GiB) == Preset::K);
-    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, true, 0) == Preset::K);
-    // A preset the player chose is never replaced.
-    STATIC_REQUIRE(Mode::ResolvePreset(Preset::K, true, 6 * GiB) == Preset::K);
-    STATIC_REQUIRE(Mode::ResolvePreset(Preset::M, true, 6 * GiB) == Preset::M);
-    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Default, true, 6 * GiB) == Preset::Default);
-}
-
-TEST_CASE("DLSS settings default to Auto and round-trip saved values", "[dlss_mode]") {
-    using Preset = Settings::DlssPreset;
-    REQUIRE(Settings::values.nvidia_dlss_preset.GetDefault() == Preset::Auto);
-    // The numbers saved configs hold.
-    STATIC_REQUIRE(static_cast<u32>(Preset::K) == 2);
-    STATIC_REQUIRE(static_cast<u32>(Preset::M) == 4);
+TEST_CASE("DLSS settings preserve old profiles and per-game overrides", "[dlss_mode]") {
+    REQUIRE(Settings::values.nvidia_dlss_preset.GetDefault() == Settings::NvidiaDlssPreset::M);
     REQUIRE(Settings::values.nvidia_dlss_quality.GetDefault() == Quality::Automatic);
     Settings::Linkage linkage;
-    Settings::Setting<Preset> preset{linkage, Preset::K, "preset", Settings::Category::Renderer};
+    Settings::SwitchableSetting<Settings::NvidiaDlssPreset> preset{
+        linkage, Settings::NvidiaDlssPreset::M, "preset", Settings::Category::Renderer};
     preset.LoadString("");
-    REQUIRE(preset.GetValue() == Preset::K);
+    REQUIRE(preset.GetValue() == Settings::NvidiaDlssPreset::M);
+    preset.LoadString("0");
+    REQUIRE(preset.GetValue() == Settings::NvidiaDlssPreset::M);
     preset.LoadString("invalid");
-    REQUIRE(preset.GetValue() == Preset::K);
-    for (const auto& [name, value] : Settings::EnumMetadata<Preset>::Canonicalizations()) {
+    REQUIRE(preset.GetValue() == Settings::NvidiaDlssPreset::M);
+    for (const auto& [name, value] :
+         Settings::EnumMetadata<Settings::NvidiaDlssPreset>::Canonicalizations()) {
         preset.SetValue(value);
         const auto saved = preset.ToString();
         preset.LoadString("");
         preset.LoadString(saved);
         REQUIRE(preset.GetValue() == value);
     }
-    Settings::Setting<Quality> quality{linkage, Quality::Automatic, "quality",
-                                       Settings::Category::Renderer};
+    preset.SetValue(Settings::NvidiaDlssPreset::K);
+    preset.SetGlobal(false);
+    preset.LoadString("0");
+    REQUIRE(preset.GetValue() == Settings::NvidiaDlssPreset::M);
+    preset.SetGlobal(true);
+    REQUIRE(preset.GetValue() == Settings::NvidiaDlssPreset::K);
+    Settings::SwitchableSetting<Quality> quality{linkage, Quality::Automatic, "quality",
+                                                 Settings::Category::Renderer};
     quality.LoadString("1");
     REQUIRE(quality.GetValue() == Quality::Native);
 }

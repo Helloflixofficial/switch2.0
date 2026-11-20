@@ -197,8 +197,8 @@ public:
     explicit EmulatedController(NpadIdType npad_id_type_);
     ~EmulatedController();
 
-    YUZU_NON_COPYABLE(EmulatedController);
-    YUZU_NON_MOVEABLE(EmulatedController);
+    LICHII_NON_COPYABLE(EmulatedController);
+    LICHII_NON_MOVEABLE(EmulatedController);
 
     /// Converts the controller type from settings to npad type
     static NpadStyleIndex MapSettingsTypeToNPad(Settings::ControllerType type);
@@ -359,9 +359,6 @@ public:
     /// Installs the debug server's injector, or removes it when empty. Never changes mappings.
     void SetInputInjector(InputInjector injector);
 
-    /// Whether the debug server's injector is installed.
-    bool HasInputInjector() const;
-
     /// Returns the latest status of motion input from the mouse
     MotionState GetMotions() const;
 
@@ -502,6 +499,10 @@ private:
 
     /// Set the params for virtual pad devices
     void LoadVirtualGamepadParams();
+
+    /// Sends a vibration to the output device for the given side of the controller
+    bool SetVibration(DeviceIndex device_index, const VibrationValue& vibration,
+                      Common::Input::VibrationSide side);
 
     /**
      * @param use_temporary_value If true tmp_npad_type will be used

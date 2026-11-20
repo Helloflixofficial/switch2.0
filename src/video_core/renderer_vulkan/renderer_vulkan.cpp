@@ -13,6 +13,7 @@
 
 #include <fmt/ranges.h>
 
+#include "common/display_hdr.h"
 #include "common/logging.h"
 #include <ranges>
 #include "common/scope_exit.h"
@@ -21,6 +22,7 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -34,6 +36,8 @@
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
+#include "video_core/vulkan_common/vulkan_address_map.h"
 #include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
@@ -41,10 +45,10 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/one_follower.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
+#include "video_core/vulkan_common/streamline_frame_gen.h"
 #endif
 #ifdef __ANDROID__
 #include <jni.h>
@@ -56,6 +60,23 @@ constexpr VkExtent2D CaptureImageSize{
     .width = VideoCore::Capture::LinearWidth,
     .height = VideoCore::Capture::LinearHeight,
 };
+
+#ifdef HAS_LSFG
+[[nodiscard]] VkExtent2D GuestExtent(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    if (framebuffers.empty()) {
+        return VkExtent2D{};
+    }
+
+    const auto& framebuffer = framebuffers.front();
+    if (framebuffer.crop_rect.IsEmpty()) {
+        return VkExtent2D{.width = framebuffer.width, .height = framebuffer.height};
+    }
+    return VkExtent2D{
+        .width = static_cast<u32>(framebuffer.crop_rect.GetWidth()),
+        .height = static_cast<u32>(framebuffer.crop_rect.GetHeight()),
+    };
+}
+#endif
 
 constexpr VkExtent3D CaptureImageExtent{
     .width = VideoCore::Capture::LinearWidth,
@@ -95,33 +116,41 @@ std::string BuildCommaSeparatedExtensions(
     return fmt::format("{}", fmt::join(available_extensions, ","));
 }
 
+// The swapchain format and colour space to present in: an HDR pair the surface lists while HDR
+// output is on (Off/On/Auto with the monitor's state), else SDR.
+VkSurfaceFormatKHR ChooseOutputFormat(const vk::PhysicalDevice& physical, VkSurfaceKHR surface,
+                                      void* window) {
+    auto& monitor = Common::DisplayHdrMonitor::Instance();
+    monitor.Watch(window);
+    const auto output = Common::ResolveHdrOutput(
+        monitor.Current(), Settings::values.hdr_mode.GetValue(),
+        Settings::values.hdr_peak_luminance.GetValue(),
+        Settings::values.hdr_reference_white.GetValue());
+    if (output.enabled) {
+        const auto formats = physical.GetSurfaceFormatsKHR(surface);
+        const auto hdr =
+            ChooseHdrSurfaceFormat(formats, Settings::values.hdr_swapchain.GetValue());
+        if (hdr) {
+            return *hdr;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "HDR output is on, but the surface lists no HDR10 or scRGB format");
+    }
+#ifdef __ANDROID__
+    return {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+#else
+    return {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+#endif
+}
+
 } // Anonymous namespace
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
     const std::vector<VkPhysicalDevice> devices = instance.EnumeratePhysicalDevices();
-    if (devices.empty()) {
-        LOG_ERROR(Render_Vulkan, "No Vulkan device found");
+    const u32 device_index = Settings::values.vulkan_device.GetValue();
+    if (device_index >= u32(devices.size())) {
+        LOG_ERROR(Render_Vulkan, "Invalid device index {}!", device_index);
         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
-    }
-    const u32 saved_index = Settings::values.vulkan_device.GetValue();
-    const std::string saved_name = Settings::values.vulkan_device_name.GetValue();
-    const auto summaries = SummarizePhysicalDevices(dld, devices);
-    const PhysicalDevicePick pick = PickPhysicalDevice(summaries, saved_index, saved_name);
-    const size_t device_index = pick.index;
-    {
-        std::string list;
-        for (size_t i = 0; i < summaries.size(); ++i) {
-            const char* type =
-                summaries[i].type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? "discrete"
-                : summaries[i].type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
-                                                                              : "other";
-            list += fmt::format("{}{}: {} ({}, {} MiB)", i == 0 ? "" : "; ", i, summaries[i].name,
-                                type, summaries[i].local_memory >> 20);
-        }
-        LOG_INFO(Render_Vulkan,
-                 "Graphics card: {} ({}), {}; saved index {}, saved name \"{}\"{}; devices: {}",
-                 summaries[device_index].name, device_index, pick.reason, saved_index, saved_name,
-                 Settings::values.vulkan_device.UsingGlobal() ? "" : " (game setting)", list);
     }
     const vk::PhysicalDevice physical_device(devices[device_index], dld);
     return Device(*instance, physical_device, surface, dld);
@@ -138,7 +167,7 @@ try
     , library(OpenLibrary(context.get()))
     , dld()
 #ifdef EGLANTINE_STREAMLINE
-    , streamline_started(Streamline::Start())
+    , streamline_started(Streamline::Start(render_window.GetWindowInfo().render_surface))
 #endif
     // Create raw Vulkan instance first
     , instance(CreateInstance(*library,
@@ -149,18 +178,21 @@ try
     // Create debug messenger if debug is enabled
     , debug_messenger(Settings::values.renderer_debug ? CreateDebugUtilsCallback(instance)
                                                     : vk::DebugUtilsMessenger{})
-    , va_report_messenger(VaReport::CreateMessenger(instance))
+    , address_messenger(AddressMap::Wanted() ? CreateAddressBindingCallback(instance, dld)
+                                             : vk::DebugUtilsMessenger{})
     // Create surface
     , surface(CreateSurface(instance, render_window.GetWindowInfo()))
     , device(CreateDevice(instance, dld, *surface))
     , memory_allocator(device)
     , state_tracker()
     , scheduler(device, state_tracker)
-    , swapchain(*surface,
+    , swapchain(PresentationSurface(),
                 device,
                 scheduler,
                render_window.GetFramebufferLayout().width,
-               render_window.GetFramebufferLayout().height)
+               render_window.GetFramebufferLayout().height,
+               ChooseOutputFormat(device.GetPhysical(), *surface,
+                                  render_window.GetWindowInfo().render_surface))
     , present_manager(instance,
                       render_window,
                       device,
@@ -187,33 +219,55 @@ try
                   scheduler,
                   PresentFiltersForAppletCapture)
     , rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker, scheduler)
+#ifdef HAS_LSFG
+    , frame_gen(memory_allocator, scheduler)
+#endif
 {
 
-    // Force maximum clocks (off by default): a second device keeps the GPU busy. Its device
-    // failing to start skips it instead of failing the whole renderer ("Vulkan initialization
-    // error" and no boot).
-    if (!Settings::values.renderer_force_max_clock.GetValue()) {
-        LOG_INFO(Render_Vulkan, "Force maximum clocks: off");
-    } else if (!device.ShouldBoostClocks()) {
-        LOG_INFO(Render_Vulkan, "Force maximum clocks: skipped (driver not on the list, Steam "
-                                "Deck, or a debugging tool attached)");
-    } else {
-        try {
-            turbo_mode.emplace(instance, dld);
-            scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
-            LOG_INFO(Render_Vulkan, "Force maximum clocks: running (costs power; not for laptops "
-                                    "on battery)");
-        } catch (const std::exception& exception) {
-            turbo_mode.reset();
-            LOG_WARNING(Render_Vulkan, "Force maximum clocks: skipped (its device failed: {})",
-                        exception.what());
-        }
+    if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
+        turbo_mode.emplace(instance, dld);
+        scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
     }
 
 #ifdef HAS_RESHADE
     VideoCore::FxChain::Instance().LoadFromSettings();
 #endif
 
+    device_info = {
+        .model = std::string{device.GetModelName()},
+        .driver = device.GetDriverVersion() != 0
+                      ? fmt::format("{} {}", device.GetVendorName(), GetDriverVersion(device))
+                      : std::string{},
+        .api = "Vulkan",
+        .api_version = GetReadableVersion(device.ApiVersion()),
+        .device_local_memory = device.GetDeviceLocalMemory(),
+        .extensions = {device.GetAvailableExtensions().begin(),
+                       device.GetAvailableExtensions().end()},
+        .features =
+            {
+                {"geometry_shader", device.IsGeometryShaderSupported()},
+                {"tessellation", device.IsTessellationSupported()},
+                {"mesh_shader", device.IsExtMeshShaderSupported()},
+                {"descriptor_buffer", device.IsExtDescriptorBufferSupported()},
+                {"buffer_device_address", device.IsBufferDeviceAddressSupported()},
+                {"push_descriptor", device.IsKhrPushDescriptorSupported()},
+                {"vertex_input_dynamic_state", device.IsExtVertexInputDynamicStateSupported()},
+                {"extended_dynamic_state", device.IsExtExtendedDynamicStateSupported()},
+                {"transform_feedback", device.IsExtTransformFeedbackSupported()},
+                {"conservative_rasterization", device.IsExtConservativeRasterizationSupported()},
+                {"line_rasterization", device.IsExtLineRasterizationSupported()},
+                {"depth_clip_control", device.IsExtDepthClipControlSupported()},
+                {"shader_float_controls", device.IsKhrShaderFloatControlsSupported()},
+                {"subgroup_size_control", device.IsExtSubgroupSizeControlSupported()},
+                {"vulkan_memory_model", device.IsVulkanMemoryModelSupported()},
+                {"cooperative_hmma", device.IsCooperativeHmmaSupported()},
+                {"sparse_binding", device.IsSparseBindingSupported()},
+                {"optimal_astc", device.IsOptimalAstcSupported()},
+                {"optimal_bcn", device.IsOptimalBcnSupported()},
+                {"formatless_image_load", device.IsFormatlessImageLoadSupported()},
+                {"pipeline_binary", device.IsKhrPipelineBinarySupported()},
+            },
+    };
     Report();
 } catch (const vk::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Vulkan initialization failed with error: {}", exception.what());
@@ -232,14 +286,13 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
     };
-
-    // One follower: the frame fence's syncpoint can run this on E while R still plays the frame.
-    // The scheduler is R's: wait for R before the first record (before 2026-11-18 a lend inside
-    // AccelerateDisplay did that by accident; FRITCHII_SLOW_GPU's present-pass records ran before
-    // it and raced R's DispatchWork, a null chunk on GPUBack; helper EC).
-    if (VideoCommon::OneFollower::OnEngineThread()) {
-        VideoCommon::OneFollower::Drain();
-    }
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS Frame Generation: this guest frame ends here, presented or not.
+    Streamline::FrameGenBeginFrame();
+    SCOPE_EXIT {
+        Streamline::FrameGenNextFrame();
+    };
+#endif
 
     RenderAppletCaptureLayer(framebuffers);
 
@@ -247,31 +300,82 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         return;
     }
 
+    if (VideoCommon::StutterTrace::Enabled()) {
+        VideoCommon::StutterTrace::OnPresent();
+    }
     RenderScreenshot(framebuffers);
     const auto acquiring = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-    Frame* frame = present_manager.GetRenderFrame();
+    Frame* frame = [this] {
+        const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::Present};
+        return present_manager.GetRenderFrame();
+    }();
     const auto acquired = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
 
+    const HdrPresent output = UpdateHdrPresent();
+    frame->color_space = output.color_space;
+
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
-                               render_window.GetFramebufferLayout(),
-                               present_manager.SwapchainImageCount(),
-                               swapchain.GetImageViewFormat());
+                              render_window.GetFramebufferLayout(),
+                              present_manager.SwapchainImageCount(), output_format.format, output);
 
-    if (trace) {
-        scheduler.MarkFrameEnd(++trace_frame);
+#ifdef HAS_LSFG
+    void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames(),
+                                     present_manager.FreeFrames(),
+                                     present_manager.TakeBlockedTime()));
+
+    frame_gen.Process(device, frame, frame->image_format, GuestExtent(framebuffers));
+
+    const size_t generated_frames = frame_gen.GeneratedFrameCount();
+    // Each generated frame keeps the screen for an equal share of the real frame interval. Sent
+    // back to back, a high refresh rate display shows it for one refresh only.
+    const auto spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<f32>(std::min(frame_gen.FrameInterval(), 0.1f) /
+                                   static_cast<f32>(generated_frames + 1)));
+    const u32 game_frame_presents = static_cast<u32>(generated_frames) + 1;
+    frame->game_frame_presents = game_frame_presents;
+    for (size_t generation = 0; generation < generated_frames; ++generation) {
+        Frame* generated = present_manager.GetRenderFrame();
+        generated->color_space = output.color_space;
+        generated->present_spacing = spacing;
+        generated->game_frame_presents = game_frame_presents;
+        blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
+        frame_gen.GenerateInto(device, generated, generation);
+        scheduler.Flush(*generated->render_ready);
+        present_manager.Present(generated);
     }
-    frame->render_tick = scheduler.Flush(*frame->render_ready);
+#endif
+
+    if (const auto mark = scheduler.NextFrameMark(); mark != Scheduler::FrameMark::None) {
+        scheduler.MarkFrameEnd(++trace_frame, mark);
+    }
+    scheduler.Flush(*frame->render_ready);
+#ifdef EGLANTINE_STREAMLINE
+    {
+        const Streamline::FrameGenFrame ended = Streamline::FrameGenEndFrame();
+        const Common::Rectangle<u32>& screen = render_window.GetFramebufferLayout().screen;
+        frame->frame_gen = Streamline::FrameGenSession();
+        frame->frame_gen_frame = ended;
+        frame->guest_rect = VkRect2D{
+            .offset = {static_cast<s32>(screen.left), static_cast<s32>(screen.top)},
+            .extent = {screen.GetWidth(), screen.GetHeight()},
+        };
+    }
+#endif
 
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
-    present_manager.Present(frame);
+    {
+        const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::Present};
+        present_manager.Present(frame);
+    }
     const auto presented = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-    // Hand the work recorded so far to the worker right after the present.
+#ifdef HAS_LSFG
     scheduler.DispatchWork();
+#endif
 
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();
@@ -298,12 +402,73 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 }
 
+HdrPresent RendererVulkan::UpdateHdrPresent() {
+    const auto& monitor = Common::DisplayHdrMonitor::Instance();
+    const u64 key = (monitor.Generation() << 8) |
+                    (u64{static_cast<u8>(Settings::values.hdr_mode.GetValue())} << 4) |
+                    static_cast<u8>(Settings::values.hdr_swapchain.GetValue());
+    const u32 luminance_key = (u32{Settings::values.hdr_peak_luminance.GetValue()} << 16) |
+                              Settings::values.hdr_reference_white.GetValue();
+    if (key == output_format_key && luminance_key == output_luminance_key) {
+        return {output_format.colorSpace, output_reference_white, output_peak};
+    }
+    output_format_key = key;
+    output_luminance_key = luminance_key;
+    const auto previous = output_format;
+    output_format = ChooseOutputFormat(device.GetPhysical(), *surface,
+                                       render_window.GetWindowInfo().render_surface);
+    const auto told = CaptureHdrPresent();
+    output_reference_white = told.reference_white;
+    output_peak = told.peak;
+    if (previous.format != output_format.format ||
+        previous.colorSpace != output_format.colorSpace) {
+        if (output_format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            LOG_INFO(Render_Vulkan,
+                     "HDR output: {} {}, reference white {} nits, peak {} nits. Anti-aliasing, "
+                     "post-processing and upscaling filters are off",
+                     string_VkFormat(output_format.format),
+                     string_VkColorSpaceKHR(output_format.colorSpace), output_reference_white,
+                     output_peak);
+        } else {
+            LOG_INFO(Render_Vulkan, "HDR output: SDR {}", string_VkFormat(output_format.format));
+        }
+    }
+    return {output_format.colorSpace, output_reference_white, output_peak};
+}
+
+HdrPresent RendererVulkan::CaptureHdrPresent() const {
+    // The luminances the game was told (nx2:vi2 QueryDisplayHdrStatus / PaperWhite).
+    const auto told = Common::ResolveHdrOutput(Common::DisplayHdrMonitor::Instance().Current(),
+                                               Settings::HdrMode::On,
+                                               Settings::values.hdr_peak_luminance.GetValue(),
+                                               Settings::values.hdr_reference_white.GetValue());
+    return {VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, static_cast<f32>(told.reference_white),
+            static_cast<f32>(told.peak_luminance)};
+}
+
+VkSurfaceKHR RendererVulkan::PresentationSurface() {
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS-G looks the window up by the swapchain's surface: replace the surface made before the
+    // device with one made through Streamline, for the same window. Present support stays valid,
+    // as it belongs to the window and the queue family.
+    const auto& window_info = render_window.GetWindowInfo();
+    if (Streamline::FrameGenSession()) {
+        const VkSurfaceKHR registered =
+            window_info.type == Core::Frontend::WindowSystemType::Windows
+                ? Streamline::CreateFrameGenSurface(*instance, window_info.render_surface)
+                : VK_NULL_HANDLE;
+        if (registered) {
+            surface = vk::SurfaceKHR(registered, *instance, instance.Dispatch());
+        } else {
+            Streamline::DisableFrameGen("Streamline could not make the window's surface");
+        }
+    }
+#endif
+    return *surface;
+}
+
 void RendererVulkan::Report() const {
     using namespace Common::Literals;
-    const std::string vendor_name{device.GetVendorName()};
-    const std::string model_name{device.GetModelName()};
-    const std::string driver_version = GetDriverVersion(device);
-    const std::string driver_name = fmt::format("{} {}", vendor_name, driver_version);
 
     const std::string api_version = GetReadableVersion(device.ApiVersion());
 
@@ -311,32 +476,10 @@ void RendererVulkan::Report() const {
 
     const auto available_vram = static_cast<f64>(device.GetDeviceLocalMemory()) / f64{1_GiB};
 
-    LOG_INFO(Render_Vulkan, "Driver: {}", driver_name);
-    LOG_INFO(Render_Vulkan, "Device: {}", model_name);
+    LOG_INFO(Render_Vulkan, "Driver: {} {}", device.GetVendorName(), GetDriverVersion(device));
+    LOG_INFO(Render_Vulkan, "Device: {}", device_info.model);
     LOG_INFO(Render_Vulkan, "Vulkan: {}", api_version);
-    // The caches' memory limit, not the card's size: with Conservative VRAM use it is capped at
-    // 6 GiB + 1 GiB per resolution scale step, so a 16 GB card reads 7.00 GiB at 1x.
-    std::string vram_limit;
-    if (device.IsIntegrated()) {
-        vram_limit = "integrated GPU: a share of system memory";
-    } else if (Settings::values.vram_usage_mode.GetValue() ==
-               Settings::VramUsageMode::Aggressive) {
-        vram_limit = "Aggressive: the driver's budget less up to 1 GiB";
-    } else {
-        vram_limit = fmt::format("Conservative cap: 6 GiB + 1 GiB x {}",
-                                 Settings::values.resolution_info.ScaleUp(1));
-    }
-    u64 main_usage = 0;
-    u64 main_budget = 0;
-    const std::string main_heap =
-        device.MainHeapUsage(main_usage, main_budget)
-            ? fmt::format("main heap {}: budget {:.2f} GiB, usage {:.2f} GiB",
-                          device.GetMainHeap(), static_cast<f64>(main_budget) / f64{1_GiB},
-                          static_cast<f64>(main_usage) / f64{1_GiB})
-            : fmt::format("main heap {}", device.GetMainHeap());
-    LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB (memory limit for the caches; {}; {})",
-             available_vram, vram_limit, main_heap);
-    device.LogMemoryHeaps();
+    LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB", available_vram);
     if (VideoCommon::RenderTrace::Enabled()) {
         LOG_INFO(Render_Vulkan, "Render trace enabled: interval=600 frames, log_filter={}",
                  Settings::values.log_filter.GetValue());
@@ -351,17 +494,10 @@ void RendererVulkan::Report() const {
 vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,
                                           const Layout::FramebufferLayout& layout, VkFormat format,
                                           VkDeviceSize buffer_size) {
-    auto frame = [&]() {
-        Frame f{};
-        f.image =
-            CreateWrappedImage(memory_allocator, VkExtent2D{layout.width, layout.height}, format);
-        f.image_view = CreateWrappedImageView(device, f.image, format);
-        f.framebuffer = blit_capture.CreateFramebuffer(device, layout, *f.image_view, format);
-        return f;
-    }();
-
+    auto& frame = screenshot_frame;
     auto dst_buffer = CreateWrappedBuffer(memory_allocator, buffer_size, MemoryUsage::Download);
-    blit_capture.DrawToFrame(device, rasterizer, &frame, framebuffers, layout, 1, format);
+    blit_capture.DrawToFrame(device, rasterizer, &frame, framebuffers, layout, 1, format,
+                             CaptureHdrPresent());
 
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([&](vk::CommandBuffer cmdbuf) {
@@ -397,11 +533,6 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 
 std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
     using namespace VideoCore::Capture;
-
-    // Same as Composite: the scheduler is R's (this Finish ran on E too).
-    if (VideoCommon::OneFollower::OnEngineThread()) {
-        VideoCommon::OneFollower::Drain();
-    }
 
     std::vector<u8> out(VideoCore::Capture::TiledSize);
 
@@ -445,7 +576,7 @@ void RendererVulkan::RenderAppletCaptureLayer(
 
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_applet.DrawToFrame(device, rasterizer, &applet_frame, capture_layers, VideoCore::Capture::Layout, 1,
-                            CaptureFormat);
+                            CaptureFormat, CaptureHdrPresent());
 }
 
 #ifdef EGLANTINE_STREAMLINE

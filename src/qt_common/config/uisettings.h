@@ -61,17 +61,12 @@ enum class Theme {
     DarkColorful,
     MidnightBlue,
     MidnightBlueColorful,
+    LichiiDark,
 };
 
-static constexpr Theme default_theme{
-#ifdef _WIN32
-    Theme::DarkColorful
-#else
-    Theme::DefaultColorful
-#endif
-};
+static constexpr Theme default_theme{Theme::LichiiDark};
 
-using Themes = std::array<std::pair<const char*, const char*>, 6>;
+using Themes = std::array<std::pair<const char*, const char*>, 7>;
 extern const Themes themes;
 
 struct GameDir {
@@ -110,9 +105,10 @@ struct Values {
                                                            true};
 
     Setting<bool> first_start{linkage, true, "firstStart", Category::Ui};
-    // The shader warm-up told the player once to raise the NVIDIA shader cache size.
-    Setting<bool> shader_warm_cache_tip_shown{linkage, false, "shaderWarmCacheTipShown",
-                                              Category::Ui};
+    // The last What's new release shown, and whether to show the next one on launch
+    Setting<u32> whats_new_version{linkage, 0, "whats_new_version", Category::Ui};
+    Setting<bool> show_whats_new{linkage, true, "show_whats_new", Category::Ui};
+    Setting<bool> show_low_ram_warning{linkage, true, "show_low_ram_warning", Category::Ui};
     Setting<bool> pause_when_in_background{linkage,
                                            false,
                                            "pauseWhenInBackground",
@@ -145,23 +141,6 @@ struct Values {
     // Release tag the user chose to skip, and the epoch second before which updates stay quiet.
     Setting<std::string> skipped_update_tag{linkage, {}, "skipped_update_tag", Category::Ui};
     Setting<unsigned long long> update_remind_at{linkage, 0, "update_remind_at", Category::Ui};
-    // The Fritchii version whose "What's new" window was shown (yuzu/fritchii/whats_new.cpp).
-    Setting<std::string> fritchii_whats_new_seen{linkage, {}, "fritchii_whats_new_seen",
-                                                 Category::Ui};
-    // The major version ("v6") that asked to clear the old shader caches (yuzu/fritchii/
-    // cache_cleanup.cpp), whatever the answer.
-    Setting<std::string> fritchii_cache_cleanup_asked{linkage, {}, "fritchii_cache_cleanup_asked",
-                                                      Category::Ui};
-    // The major version that turned OoT's Max Resolution add-on off once, and the one that asked
-    // whether to turn it on (yuzu/fritchii/max_resolution.cpp), whatever the answer.
-    Setting<std::string> fritchii_maxres_off{linkage, {}, "fritchii_maxres_off", Category::Ui};
-    Setting<std::string> fritchii_maxres_asked{linkage, {}, "fritchii_maxres_asked", Category::Ui};
-    // The major version ("v6") that showed "Good to know" (yuzu/fritchii/known_issues.cpp).
-    Setting<std::string> fritchii_known_issues_shown{linkage, {}, "fritchii_known_issues_shown",
-                                                     Category::Ui};
-    // The one-time offer of "OoT occlusion speed-up: Full" (yuzu/fritchii/occlusion_offer.cpp):
-    // empty, "pending" (a game could use it), or the answer. Never asked again once answered.
-    Setting<std::string> fritchii_occl_offer{linkage, {}, "fritchii_occl_offer", Category::Ui};
 
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,
@@ -231,7 +210,9 @@ struct Values {
 
     // Game List
     Setting<bool> show_add_ons{linkage, true, "show_add_ons", Category::UiGameList};
-    Setting<u32, true> game_icon_size{linkage, 64, 0, 512, "game_icon_size", Category::UiGameList};
+    Setting<u32, true> game_icon_size{linkage, 44, 0, 512, "game_icon_size", Category::UiGameList};
+    Setting<u32, true> game_cover_size{
+        linkage, 160, 0, 512, "game_cover_size", Category::UiGameList};
     Setting<u32, true> folder_icon_size{linkage, 48, 8, 512, "folder_icon_size", Category::UiGameList};
     Setting<u8> row_1_text_id{linkage, 3, "row_1_text_id", Category::UiGameList};
     Setting<u8> row_2_text_id{linkage, 2, "row_2_text_id", Category::UiGameList};
@@ -246,13 +227,6 @@ struct Values {
 
     // perf overlay
     Setting<bool> show_perf_overlay{linkage, false, "show_perf_overlay", Category::UiGameList};
-    // View > Frame Times: the overlay's GPU, CPU and thread time rows (common/frame_budget.h).
-    Setting<bool> perf_overlay_times{linkage, true, "perf_overlay_times", Category::UiGameList};
-
-    // Profiling mode (Help > Profiling Mode): the profiling switches from the next start on and a
-    // banner on the game. main.cpp reads it straight from qt-config.ini ([UI] profiling_mode)
-    // before the settings load: keep the name and the category.
-    Setting<bool> profiling_mode{linkage, false, "profiling_mode", Category::Ui};
 
     // Size & File Types Column
     Setting<bool> show_size{linkage, true, "show_size", Category::UiGameList};
@@ -271,13 +245,16 @@ struct Values {
 
 extern Values values;
 
+// The list rows and the grid/carousel covers keep separate sizes.
+Setting<u32, true>& CurrentGameIconSize();
+
 u32 CalculateWidth(u32 height, Settings::AspectRatio ratio);
 
 void SaveWindowState();
 void RestoreWindowState(std::unique_ptr<QtConfig>& qtConfig);
 
 // sync with uisettings.cpp
-extern const std::array<Shortcut, 32> default_hotkeys;
+extern const std::array<Shortcut, 34> default_hotkeys;
 
 } // namespace UISettings
 

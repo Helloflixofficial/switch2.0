@@ -13,7 +13,6 @@
 #include <cstdio>
 #include <fstream>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include <windows.h>
@@ -21,6 +20,8 @@
 #include <softpub.h>
 #include <wincrypt.h>
 #include <wintrust.h>
+#elif defined(__linux__) && !defined(__ANDROID__)
+#include <dlfcn.h>
 #endif
 
 namespace Vulkan::FfxRuntime {
@@ -41,19 +42,6 @@ bool FilesPresent() {
 }
 
 #ifdef _WIN32
-
-/// AMD signs with more than one name: its other signed files on a Ryzen PC read "Advanced Micro
-/// Devices Inc." (2026-11-09), and an exact "Advanced Micro Devices" would silently drop FSR 4 to
-/// FSR 3.1. The files are SHA-256 pinned as well, so the name only has to be AMD's.
-static bool IsAmdSignerName(std::wstring_view name) {
-    constexpr std::wstring_view Amd = L"Advanced Micro Devices";
-    if (!name.starts_with(Amd)) {
-        return false;
-    }
-    const std::wstring_view rest = name.substr(Amd.size());
-    return rest.empty() || rest == L" Inc." || rest == L", Inc." || rest == L" Inc" ||
-           rest == L", Inc" || rest == L" Incorporated";
-}
 
 bool IsSignedByAmd(const std::filesystem::path& path) {
     const std::wstring file_path = std::filesystem::absolute(path).wstring();
@@ -79,7 +67,7 @@ bool IsSignedByAmd(const std::filesystem::path& path) {
         valid = cert &&
                 CertGetNameStringW(cert->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name,
                                    static_cast<DWORD>(std::size(name))) > 1 &&
-                IsAmdSignerName(name);
+                std::wstring_view{name} == L"Advanced Micro Devices";
     }
     data.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(nullptr, &action, &data);
@@ -199,21 +187,8 @@ std::shared_ptr<const Api> Acquire() {
         return nullptr;
     }
     LOG_INFO(Render_Vulkan, "AMD FSR 4: FidelityFX SDK {} runtime loaded", SDK_VERSION);
-    // The upscaler the loader brought in goes with it, so the next game loads both afresh with
-    // its own device (CheezyEmu found a kept AMD DLL holding the stopped game's device). Holders
-    // destroy their contexts first. The deleter takes the lock: release happens outside it.
     std::shared_ptr<const Loaded> shared{loaded.release(), [](const Loaded* l) {
-                                             std::scoped_lock unload_lock{mutex};
                                              FreeLibrary(l->module);
-                                             for (int i = 0; i < 8; ++i) {
-                                                 const HMODULE upscaler = GetModuleHandleW(
-                                                     L"amd_fidelityfx_upscaler_vk.dll");
-                                                 if (!upscaler || !FreeLibrary(upscaler)) {
-                                                     break;
-                                                 }
-                                             }
-                                             LOG_INFO(Render_Vulkan,
-                                                      "AMD FSR 4: FidelityFX runtime unloaded");
                                              delete l;
                                          }};
     current = shared;
@@ -230,9 +205,82 @@ bool HasSha256(const std::filesystem::path&, std::string_view) {
     return false;
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+
+std::filesystem::path PortLibrary() {
+    std::error_code ec;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        const std::filesystem::path bundled =
+            exe.parent_path().parent_path() / "lib" / PORT_LIBRARY;
+        if (std::filesystem::is_regular_file(bundled, ec)) {
+            return bundled;
+        }
+    }
+    const std::filesystem::path user = Folder() / PORT_LIBRARY;
+    return std::filesystem::is_regular_file(user, ec) ? user : std::filesystem::path{};
+}
+
+namespace {
+
+struct Loaded : Api {
+    void* module{};
+};
+
+std::mutex mutex;
+std::weak_ptr<const Loaded> current;
+
+} // Anonymous namespace
+
+std::shared_ptr<const Api> Acquire() {
+    std::scoped_lock lock{mutex};
+    if (auto existing = current.lock()) {
+        return existing;
+    }
+    const std::filesystem::path path = PortLibrary();
+    if (path.empty()) {
+        LOG_INFO(Render_Vulkan, "FSR 4: {} is not in this build or in {}; using FSR 3.1",
+                 PORT_LIBRARY, Common::FS::PathToUTF8String(Folder()));
+        return nullptr;
+    }
+    void* const module = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!module) {
+        LOG_WARNING(Render_Vulkan, "FSR 4: {} doesn't load ({}); using FSR 3.1",
+                    Common::FS::PathToUTF8String(path), dlerror());
+        return nullptr;
+    }
+    auto loaded = std::make_unique<Loaded>();
+    loaded->module = module;
+    loaded->create_context =
+        reinterpret_cast<PfnFfxCreateContext>(dlsym(module, "ffxCreateContext"));
+    loaded->destroy_context =
+        reinterpret_cast<PfnFfxDestroyContext>(dlsym(module, "ffxDestroyContext"));
+    loaded->query = reinterpret_cast<PfnFfxQuery>(dlsym(module, "ffxQuery"));
+    loaded->dispatch = reinterpret_cast<PfnFfxDispatch>(dlsym(module, "ffxDispatch"));
+    if (!loaded->create_context || !loaded->destroy_context || !loaded->query ||
+        !loaded->dispatch) {
+        LOG_WARNING(Render_Vulkan, "FSR 4: {} lacks the FFX API exports; using FSR 3.1",
+                    Common::FS::PathToUTF8String(path));
+        dlclose(module);
+        return nullptr;
+    }
+    LOG_INFO(Render_Vulkan, "FSR 4: loaded the fsr4-vk community Vulkan port from {}",
+             Common::FS::PathToUTF8String(path));
+    std::shared_ptr<const Loaded> shared{loaded.release(), [](const Loaded* l) {
+                                             dlclose(l->module);
+                                             delete l;
+                                         }};
+    current = shared;
+    return shared;
+}
+
+#else
+
 std::shared_ptr<const Api> Acquire() {
     return nullptr;
 }
+
+#endif
 
 #endif
 

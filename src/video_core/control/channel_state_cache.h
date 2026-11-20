@@ -7,6 +7,7 @@
 
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include "common/container/unordered_map.h"
@@ -59,23 +60,6 @@ public:
     /// Erase channel's state.
     void EraseChannel(s32 id);
 
-    /// One follower (vk_one_follower_draw.cpp): the 3D engine this cache reads, swapped for R's
-    /// view engine while R plays an unlent draw and back after (BindToChannel sets it as before).
-    /// Returns the one it had.
-    Tegra::Engines::Maxwell3D* ExchangeMaxwell3D(Tegra::Engines::Maxwell3D* engine) noexcept {
-        Tegra::Engines::Maxwell3D* const previous = maxwell3d;
-        maxwell3d = engine;
-        return previous;
-    }
-    /// One follower (FRITCHII_ONEF_OP_DISPATCH): the compute engine, swapped for R's view of it
-    /// while R plays a posted dispatch and back after. Returns the one it had.
-    Tegra::Engines::KeplerCompute* ExchangeKeplerCompute(
-        Tegra::Engines::KeplerCompute* engine) noexcept {
-        Tegra::Engines::KeplerCompute* const previous = kepler_compute;
-        kepler_compute = engine;
-        return previous;
-    }
-
     Tegra::MemoryManager* GetFromID(size_t id) const {
         std::unique_lock<std::mutex> lk(config_mutex);
         const auto ref = address_spaces.find(id);
@@ -110,6 +94,8 @@ protected:
         size_t ref_count;
         size_t storage_id;
         Tegra::MemoryManager* gpu_memory;
+        /// nvdrv owns the memory manager and destroys it when the address space is closed.
+        std::weak_ptr<Tegra::MemoryManager> owner;
     };
     ::Common::unordered_map<size_t, AddressSpaceRef> address_spaces;
     mutable std::mutex config_mutex;

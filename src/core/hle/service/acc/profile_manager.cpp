@@ -16,6 +16,7 @@
 #include "common/fs/fs_types.h"
 #include "common/fs/path_util.h"
 #include "common/fs/symlink.h"
+#include "common/nextendo.h"
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "core/file_sys/savedata_factory.h"
@@ -51,10 +52,13 @@ constexpr char ACC_SAVE_AVATORS_BASE_PATH[] = "system/save/8000000000000010/su/a
 
 ProfileManager::ProfileManager() {
     ParseUserSaveFile();
+    OpenCurrentUser();
+}
 
+void ProfileManager::OpenCurrentUser() {
     // Create an user if none are present
     if (user_count == 0) {
-        CreateNewUser(UUID::MakeRandom(), "Fritchii");
+        CreateNewUser(UUID::MakeRandom(), "Eden");
         WriteUserSaveFile();
     }
 
@@ -88,6 +92,7 @@ bool ProfileManager::RemoveProfileAtIndex(std::size_t index) {
         return false;
     }
 
+    Common::Nextendo::ClearAccount(profiles[index].user_uuid);
     profiles[index] = ProfileInfo{};
     std::stable_partition(profiles.begin(), profiles.end(),
                           [](const ProfileInfo& profile) { return profile.user_uuid.IsValid(); });
@@ -395,19 +400,20 @@ bool ProfileManager::SetProfileBaseAndData(Common::UUID uuid, const ProfileBase&
 void ProfileManager::ParseUserSaveFile() {
     const auto save_path(FS::GetEdenPath(FS::EdenPath::NANDDir) / ACC_SAVE_AVATORS_BASE_PATH /
                          "profiles.dat");
+    user_save_file_read = false;
 
     const FS::IOFile save(save_path, FS::FileAccessMode::Read, FS::FileType::BinaryFile);
 
     if (!save.IsOpen()) {
         LOG_WARNING(Service_ACC, "Failed to load profile data from save data... Generating new "
-                                 "user 'Fritchii' with random UUID.");
+                                 "user 'Eden' with random UUID.");
         return;
     }
 
     ProfileDataRaw data;
     if (!save.ReadObject(data)) {
         LOG_WARNING(Service_ACC, "profiles.dat is smaller than expected... Generating new user "
-                                 "'Fritchii' with random UUID.");
+                                 "'Eden' with random UUID.");
         return;
     }
 
@@ -427,6 +433,7 @@ void ProfileManager::ParseUserSaveFile() {
 
     std::stable_partition(profiles.begin(), profiles.end(),
                           [](const ProfileInfo& profile) { return profile.user_uuid.IsValid(); });
+    user_save_file_read = user_count > 0;
 }
 
 void ProfileManager::WriteUserSaveFile() {
@@ -484,6 +491,9 @@ void ProfileManager::ResetUserSaveFile()
 {
     RemoveAllProfiles();
     ParseUserSaveFile();
+    // ParseUserSaveFile adds every user closed: open the current one as the constructor does, or
+    // the eden-cli, which resets once the config names the NAND, left games no open user.
+    OpenCurrentUser();
 }
 
 std::vector<UUID> ProfileManager::FindExistingProfileUUIDs()

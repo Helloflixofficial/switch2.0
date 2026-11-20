@@ -13,7 +13,6 @@
 #include <string>
 #include <vector>
 
-#include "common/fritchii_page_flags.h"
 #include "common/scratch_buffer.h"
 #include "common/typed_address.h"
 #include "core/guest_memory.h"
@@ -46,9 +45,9 @@ u32& UnmappedReadFlag();
  * Page size used by the ARM architecture. This is the smallest granularity with which memory can
  * be mapped.
  */
-constexpr std::size_t YUZU_PAGEBITS = 12;
-constexpr u64 YUZU_PAGESIZE = 1ULL << YUZU_PAGEBITS;
-constexpr u64 YUZU_PAGEMASK = YUZU_PAGESIZE - 1;
+constexpr std::size_t LICHII_PAGEBITS = 12;
+constexpr u64 LICHII_PAGESIZE = 1ULL << LICHII_PAGEBITS;
+constexpr u64 LICHII_PAGEMASK = LICHII_PAGESIZE - 1;
 
 /// Virtual user-space memory regions
 enum : u64 {
@@ -419,16 +418,6 @@ public:
      */
     bool WriteBlockUnsafe(Common::ProcessAddress dest_addr, const void* src_buffer,
                           std::size_t size);
-
-    /// Bytes stored in place through a span (GuestMemoryScoped), after they landed: with the bank
-    /// marks on (FRITCHII_BANK_FLAGGED, FRITCHII_BANK_CENSUS) noted as an unsafe write's are (the
-    /// uniform keeps, the write ring and the native bank check's flag). Off, one load.
-    void NoteHostStore(u64 dest_addr, std::size_t size) {
-        if (Common::BankMarks()) [[unlikely]] {
-            NoteHostStoreSlow(dest_addr, size);
-        }
-    }
-    void NoteHostStoreSlow(u64 dest_addr, std::size_t size);
 
     /**
      * Copies data within a process' address space to another location within the

@@ -4,26 +4,31 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <cstdlib>
 #include <thread>
 
-#include "common/logging.h"
-#include "common/nx2_hitch.h"
-#include "common/nx2_timeline.h"
+#include "common/display_hdr.h"
+#include "common/dkb_frame_trace.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#ifdef _WIN32
+#include "common/windows/timer_resolution.h"
+#endif
 #include "core/frontend/emu_window.h"
-#include "video_core/nx2_debug_control.h"
-#include "video_core/nx2_perf.h"
+#include "video_core/host_vsync.h"
+#include "video_core/nx2_profile.h"
+#ifdef HAS_LSFG
+#include "video_core/renderer_vulkan/present/lsfg_common.h"
+#endif
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
-#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 
 namespace Vulkan {
 
@@ -32,24 +37,47 @@ namespace {
 
 constexpr size_t MAX_FRAMES_IN_FLIGHT = 7;
 constexpr u32 MAX_PRESENT_ATTEMPTS = 3;
+#ifdef HAS_LSFG
+static_assert(MAX_FRAMES_IN_FLIGHT <= LSFG_MAX_TARGETS);
+#endif
+
+// Sleeps until the deadline, without spinning: it may pass by up to a timer tick (about 0.5 ms
+// on Windows), well within a refresh, and the next deadline counts from this one.
+void SleepUntil(std::chrono::steady_clock::time_point deadline) {
+    while (true) {
+        const auto left = deadline - std::chrono::steady_clock::now();
+        if (left <= std::chrono::steady_clock::duration::zero()) {
+            return;
+        }
+#ifdef _WIN32
+        Common::Windows::SleepForOneTick();
+#else
+        std::this_thread::sleep_for(left);
+#endif
+    }
+}
+
+// Sleeps short of the deadline and yields through the last millisecond: for the start of the
+// game's frame (HostVsync), where a timer tick of overshoot would show as uneven frame times.
+void WaitUntil(std::chrono::steady_clock::time_point deadline) {
+    SleepUntil(deadline - std::chrono::milliseconds{1});
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+}
+
+bool CanStoreToFrame(const vk::PhysicalDevice& physical_device, VkFormat format) {
+#ifdef HAS_LSFG
+    const VkFormatProperties props{physical_device.GetFormatProperties(format)};
+    return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+#else
+    return false;
+#endif
+}
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, VkFormat format) {
     const VkFormatProperties props{physical_device.GetFormatProperties(format)};
     return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
-}
-
-/// The host pacer's hold: sleeps until a millisecond before `target`, then yields until it.
-void HoldUntil(std::chrono::steady_clock::time_point target, const std::stop_token* token) {
-    using Clock = std::chrono::steady_clock;
-    for (auto now = Clock::now(); now < target && !(token != nullptr && token->stop_requested());
-         now = Clock::now()) {
-        const auto left = target - now;
-        if (left > std::chrono::microseconds{1500}) {
-            std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
-        } else {
-            std::this_thread::yield();
-        }
-    }
 }
 
 [[nodiscard]] VkImageSubresourceLayers MakeImageSubresourceLayers() {
@@ -137,9 +165,15 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , scheduler{scheduler_}
     , swapchain{swapchain_}
     , surface{surface_}
-    , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
-    , use_present_thread{Settings::values.async_presentation.GetValue()}
+    , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
+    // Frame generation needs the present thread to space generated frames without stalling the
+    // emulator.
+    , use_present_thread{Settings::values.async_presentation.GetValue() ||
+                         Settings::values.frame_gen.GetValue()}
+    , present_wait{device.IsPresentWaitEnabled() && VideoCore::HostVsync::Enabled()}
 {
+    // No frame starter of an earlier boot is left for this presenter.
+    VideoCore::HostVsync::Reset();
     SetImageCount();
 
     auto& dld = device.GetLogical();
@@ -150,19 +184,9 @@ PresentManager::PresentManager(const vk::Instance& instance_,
             VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = device.GetGraphicsFamily(),
     });
-    // EDEN_NX2_PRESENT_EXTRA_FRAMES (boot, default 2; fable52_answer_acquire 4): render frames
-    // beyond the swapchain's images, so the renderer has a free one while the present thread
-    // holds every queued frame (pacing, or a display stall of 125-190 ms at the night market).
-    size_t extra_frames = use_present_thread ? 2 : 0;
-    if (const char* extra = std::getenv("EDEN_NX2_PRESENT_EXTRA_FRAMES")) {
-        extra_frames = static_cast<size_t>(std::max(0, std::atoi(extra)));
-    }
-    const size_t frame_count = (std::min)(image_count + extra_frames, MAX_FRAMES_IN_FLIGHT);
-    LOG_INFO(Render_Vulkan, "Present frames: {} ({} swapchain images)", frame_count,
-             image_count.load());
-    auto cmdbuffers = cmdpool.Allocate(frame_count);
+    auto cmdbuffers = cmdpool.Allocate(image_count);
 
-    frames.resize(frame_count);
+    frames.resize(image_count);
     for (u32 i = 0; i < frames.size(); i++) {
         Frame& frame = frames[i];
         frame.index = i;
@@ -177,135 +201,154 @@ PresentManager::PresentManager(const vk::Instance& instance_,
             .pNext = nullptr,
             .flags = VK_FENCE_CREATE_SIGNALED_BIT,
         });
+        frame.storage_capable = storage_supported;
         free_queue.push_back(&frame);
     }
 
-    present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
-    LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
-             present_wait_enabled ? "supported" : "unavailable, frames are not paced");
-    // What the driver offers for a pacer later (probe only, nothing uses them): AMD's Windows
-    // driver has no present wait; a present_wait2 there would let the host pacer run.
-    {
-        const auto& extensions = device.GetAvailableExtensions();
-        const auto has = [&extensions](std::string_view name) {
-            return extensions.contains(name) ? "yes" : "no";
-        };
-        LOG_INFO(Render_Vulkan,
-                 "Host pacing: driver offers VK_KHR_present_wait {}, VK_KHR_present_wait2 {}, "
-                 "VK_KHR_present_id2 {}, VK_AMD_anti_lag {}",
-                 has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME), has("VK_KHR_present_wait2"),
-                 has("VK_KHR_present_id2"), has("VK_AMD_anti_lag"));
+    if (use_present_thread) {
+        StartPresentThread();
     }
-    if (present_wait_enabled) {
+    if (present_wait) {
         present_wait_thread =
             std::jthread([this](std::stop_token token) { PresentWaitThread(token); });
     }
-    if (use_present_thread) {
-        present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+}
+
+void PresentManager::StartPresentThread() {
+    use_present_thread = true;
+    present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+}
+
+void PresentManager::LogPacing(const Frame* frame, std::chrono::steady_clock::duration took,
+                               std::chrono::steady_clock::time_point now) {
+    if (!Settings::values.frame_gen.GetValue()) {
+        return;
+    }
+    const bool generated = frame->present_spacing.count() != 0;
+    ++(generated ? pacing_log.generated : pacing_log.real);
+    pacing_log.spacing += frame->present_spacing;
+    pacing_log.present_time += took;
+    if (pacing_log.since == std::chrono::steady_clock::time_point{}) {
+        pacing_log.since = now;
+    } else if (now - pacing_log.since >= std::chrono::seconds(10)) {
+        const auto ms = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        const u64 total = pacing_log.real + pacing_log.generated;
+        LOG_INFO(Render_Vulkan,
+                 "Frame gen pacing (10 s): {} real and {} generated presents, spacing {:.2f} ms "
+                 "after each generated frame, {:.2f} ms average wait and present",
+                 pacing_log.real, pacing_log.generated,
+                 pacing_log.generated ? ms(pacing_log.spacing) / pacing_log.generated : 0.0,
+                 total ? ms(pacing_log.present_time) / total : 0.0);
+        pacing_log = {.since = now};
     }
 }
 
 PresentManager::~PresentManager() {
-    // The present thread uses the pacer and the wait queue: stop it first.
+    // FrameGenSuspend uses state only the present thread touches: stop that thread first.
     if (present_thread.joinable()) {
         present_thread.request_stop();
         present_thread.join();
     }
-    if (present_wait_thread.joinable()) {
-        present_wait_thread.request_stop();
-        present_wait_thread.join();
-    }
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenSuspend();
+#endif
 }
 
 Frame* PresentManager::GetRenderFrame() {
 
-    // The renderer waits for the present thread (tools/nx2/critical_path.py's table).
-    Common::Nx2Timeline::Span timeline_span{"present: wait for free frame"};
+    VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
     // Wait for free presentation frames
+    const auto waiting = std::chrono::steady_clock::now();
     std::unique_lock lock{free_mutex};
-    Frame* frame = nullptr;
-    // EDEN_NX2_EXP70 (live, ms, 0 = off; fable52_answer_acquire 4): after this long without a
-    // free frame, the renderer takes back the oldest queued frame that is not at the front (the
-    // present thread may be pacing or presenting that one) and drops it: a display that stops
-    // taking frames (vkAcquireNextImageKHR blocked 76-140 ms) no longer stalls emulation.
-    if (const int steal_ms = VideoCore::Nx2Debug::Experiment(70); steal_ms > 0 && use_present_thread) {
-        while (!free_cv.wait_for(lock, std::chrono::milliseconds{steal_ms},
-                                 [this] { return !free_queue.empty(); })) {
-            lock.unlock();
-            Frame* stolen = nullptr;
-            {
-                std::scoped_lock ql{queue_mutex};
-                if (present_queue.size() >= 2) {
-                    stolen = present_queue[1];
-                    present_queue.erase(present_queue.begin() + 1);
-                }
-            }
-            if (stolen != nullptr) {
-                DiscardFrame(stolen);
-                static std::atomic<u32> logged{};
-                const u32 count = logged.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (count <= 20 || (count & (count - 1)) == 0) {
-                    LOG_INFO(Render_Vulkan,
-                             "Present (EXP70): no free frame for {} ms, dropped a queued frame "
-                             "({} so far)",
-                             steal_ms, count);
-                }
-                frame = stolen;
-                break;
-            }
-            lock.lock();
-        }
-    } else {
-        free_cv.wait(lock, [this] { return !free_queue.empty(); });
-    }
-    if (frame == nullptr) {
-        // Take the frame from the queue
-        frame = free_queue.front();
-        free_queue.pop_front();
-    }
+    free_cv.wait(lock, [this] { return !free_queue.empty(); });
+
+    // Take the frame from the queue
+    Frame* frame = free_queue.front();
+    free_queue.pop_front();
 
     // Wait for the presentation to be finished so all frame resources are free
-    if (frame->present_done.Wait() == VK_ERROR_DEVICE_LOST) {
-        device.ReportLoss();
-    }
+    frame->present_done.Wait();
+    blocked_time.fetch_add((std::chrono::steady_clock::now() - waiting).count(),
+                           std::memory_order_relaxed);
     frame->present_done.Reset();
+    frame->color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    frame->present_spacing = {};
+    frame->game_frame_presents = 1;
+#ifdef EGLANTINE_STREAMLINE
+    frame->frame_gen = false;
+#endif
 
     return frame;
 }
 
 void PresentManager::Present(Frame* frame) {
+    if (!use_present_thread && Settings::values.frame_gen.GetValue()) {
+        // Frame generation was turned on from the status bar while a game runs. Earlier frames
+        // were presented here, so none are in flight.
+        StartPresentThread();
+    }
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
-            frame->queued_at = std::chrono::steady_clock::now();
-            // What ends the present thread's "present: wait for frame" (on the Vulkan worker).
-            if (Common::Nx2Timeline::Active()) {
-                Common::Nx2Timeline::Instant("present: frame queued", {"frame", frame->index});
-            }
             std::unique_lock lock{queue_mutex};
             present_queue.push_back(frame);
             frame_cv.notify_one();
         });
     } else {
-        scheduler.WaitWorker();
-        NoteDisplayRefresh();
+        {
+            VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
+            scheduler.WaitWorker();
+        }
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }
 }
 
+size_t PresentManager::MaxExtraFrames() const {
+    return image_count - 1;
+}
+
+size_t PresentManager::FreeFrames() {
+    std::scoped_lock lock{free_mutex};
+    return free_queue.size();
+}
+
+bool PresentManager::NeedsStorage(const Frame* frame, bool required) const {
+    return required && frame->storage_capable && !frame->storage_view;
+}
+
+VkFormat PresentManager::GetFrameImageFormat(VkFormat image_view_format) const {
+    if (image_view_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+        image_view_format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+        return image_view_format;
+    }
+    // Render SDR through a UNORM view, but preserve the surface's transfer encoding for blits.
+    return swapchain.GetSdrImageFormat();
+}
+
 void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
-                                   VkRenderPass rd) {
+                                   VkRenderPass rd, bool storage) {
     auto& dld = device.GetLogical();
 
     frame->width = width;
     frame->height = height;
+    frame->format = image_view_format;
+    frame->image_format = GetFrameImageFormat(image_view_format);
+    frame->storage_capable = CanStoreToFrame(device.GetPhysical(), frame->image_format);
+
+    const bool with_storage = storage && frame->storage_capable;
+    VkImageUsageFlags storage_usage = 0;
+    if (with_storage) {
+        storage_usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    }
 
     frame->image = memory_allocator.CreateImage({
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
         .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = swapchain.GetImageFormat(),
+        .format = frame->image_format,
         .extent =
             {
                 .width = width,
@@ -317,7 +360,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | storage_usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -347,6 +390,33 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
                 .layerCount = 1,
             },
     });
+
+    frame->storage_view = vk::ImageView{};
+    if (with_storage) {
+        frame->storage_view = dld.CreateImageView({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = *frame->image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = frame->image_format,
+            .components =
+                {
+                    .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                    .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+                },
+            .subresourceRange =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+        });
+    }
 
     const VkImageView image_view{*frame->image_view};
     frame->framebuffer = dld.CreateFramebuffer({
@@ -383,30 +453,11 @@ void PresentManager::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("VulkanPresent");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     Common::SetCurrentThreadToPerformanceCores();
-    int siblings_free_applied = 0; ///< FRITCHII_GPU_SIBLINGS_FREE as this thread applied it
     while (!token.stop_requested()) {
-        // FRITCHII_GPU_SIBLINGS_FREE (live): off the GPU threads' cores before the wait.
-        Common::KeepOffGpuCores(siblings_free_applied);
         std::unique_lock lock{queue_mutex};
         // Wait for presentation frames
-        {
-            Common::Nx2Timeline::Span timeline_span{"present: wait for frame"};
-            frame_cv.wait(lock, token, [this] { return !present_queue.empty(); });
-        }
+        frame_cv.wait(lock, token, [this] { return !present_queue.empty(); });
         if (!token.stop_requested()) {
-            // FRITCHII_SIBLING_CENSUS (dry): where this thread woke up to present.
-            Common::NoteCensusCpu(Common::CensusThread::Present);
-            bool held = false;
-            if (present_wait_enabled) {
-                // Only this thread pops the queue: the frame stays at its front, and WaitPresent
-                // keeps waiting while it is held.
-                Frame* const next = present_queue.front();
-                lock.unlock();
-                held = PaceFrame(next, token);
-                lock.lock();
-            } else {
-                NoteDisplayRefresh();
-            }
             // Take the frame and notify anyone waiting
             Frame* frame = present_queue.front();
             present_queue.pop_front();
@@ -416,42 +467,19 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
-            last_present_id = 0;
-            // EDEN_NX2_EXP71 (live, ms, test only): a display stall of this length every 10 s,
-            // as the 125-190 ms ones at the night market, to check EXP70 on demand.
-            if (const int stall_ms = VideoCore::Nx2Debug::Experiment(71); stall_ms > 0) [[unlikely]] {
-                static auto last_stall = std::chrono::steady_clock::now();
-                const auto now = std::chrono::steady_clock::now();
-                if (now - last_stall > std::chrono::seconds{10}) {
-                    last_stall = now;
-                    LOG_INFO(Render_Vulkan, "Present (EXP71): simulated display stall of {} ms",
-                             stall_ms);
-                    std::this_thread::sleep_for(std::chrono::milliseconds{stall_ms});
-                }
-            }
+            const auto ready = std::chrono::steady_clock::now();
+            // The spacing counts from when this present was due, not from when it returned. A
+            // present that waits for vblank has already spent part of the spacing; counting it
+            // again cost each generated frame an extra refresh, which lengthened the measured
+            // frame interval and with it the spacing, until the game ran at a fraction of its
+            // speed (#1772).
+            const auto start = (std::max)(next_present, ready);
+            SleepUntil(start);
             CopyToSwapchain(frame);
-            if (Common::Nx2Timeline::Active()) {
-                Common::Nx2Timeline::Instant("vkQueuePresentKHR", {"id", last_present_id});
-            }
-            {
-                static std::chrono::steady_clock::time_point previous{};
-                const auto now = std::chrono::steady_clock::now();
-                if (previous != std::chrono::steady_clock::time_point{}) {
-                    VideoCommon::Nx2Perf::NoteFrameTime(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count());
-                }
-                previous = now;
-            }
-            if (present_wait_enabled) {
-                const auto submitted = std::chrono::steady_clock::now();
-                pacer.NoteSubmitted(last_present_id, submitted, held);
-                if (last_present_id != 0) {
-                    {
-                        std::scoped_lock ql{wait_queue_mutex};
-                        wait_queue.push_back({last_present_id, swapchain.Handle(), submitted});
-                    }
-                    wait_queue_cv.notify_one();
-                }
+            next_present = start + frame->present_spacing;
+            if (Common::DkbFrameTrace::Enabled()) {
+                const auto presented = std::chrono::steady_clock::now();
+                LogPacing(frame, presented - ready, presented);
             }
 
             // Free the frame for reuse
@@ -462,193 +490,68 @@ void PresentManager::PresentThread(std::stop_token token) {
     }
 }
 
-bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
-    using Clock = std::chrono::steady_clock;
-    deferred_hold.reset();
-    pacer.NoteQueued(frame->queued_at);
-    const VkPresentModeKHR mode = swapchain.PresentMode();
-    // Mailbox with a game faster than the display (Ocarina of Time's high refresh rate above the
-    // monitor's rate, or with no cap): hold nothing, Mailbox shows the newest frame at each
-    // refresh. Holding one frame per refresh capped the game at the display rate.
-    const long long guest_ns =
-        VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed);
-    const long long display_ns =
-        VideoCommon::Nx2Perf::g_display_refresh_ns.load(std::memory_order_relaxed);
-    const bool faster_than_display =
-        mode == VK_PRESENT_MODE_MAILBOX_KHR &&
-        (VideoCommon::Nx2Perf::g_guest_unpaced.load(std::memory_order_relaxed) ||
-         (guest_ns > 0 && display_ns > 0 && guest_ns * 100 < display_ns * 98));
-    const bool allowed =
-        (mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_MAILBOX_KHR ||
-         mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) &&
-        !faster_than_display && Settings::SpeedLimitEnabled() &&
-        Settings::values.current_speed_mode.GetValue() != Settings::SpeedMode::Turbo;
-    // The refresh rate of the display the window is on (the HWND on Windows).
-    const auto& window_info = render_window.GetWindowInfo();
-    pacer.Refresh(Clock::now(), allowed,
-                  window_info.type == Core::Frontend::WindowSystemType::Windows
-                      ? window_info.render_surface
-                      : nullptr);
-    if (const u64 want = pacer.Outstanding(); pacer.Pacing() && want != 0) {
-        // The next target counts from the refresh the previous frame was shown at.
-        Common::Nx2Timeline::Span span{"present: wait until shown"};
-        // At most a refresh and a half: a driver whose present wait never signals would hold
-        // every frame for the whole wait (the pacer turns itself off after a few of these).
-        const auto limit = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            pacer.RefreshPeriod() * 3 / 2 + std::chrono::milliseconds{2});
-        std::unique_lock sl{shown_mutex};
-        const bool shown = shown_cv.wait_for(sl, limit, [&] {
-            return token.stop_requested() ||
-                   std::any_of(shown_reports.begin(), shown_reports.end(),
-                               [want](const ShownReport& r) { return r.id >= want; });
-        });
-        sl.unlock();
-        pacer.NoteShownWait(shown);
-    }
-    DrainShown();
-    if (!pacer.Pacing()) {
-        VideoCommon::Nx2Perf::g_host_phase_ns.store(-1, std::memory_order_relaxed);
-        return false;
-    }
-    if (frame->render_tick != 0) {
-        // Hold from when the frame is rendered: a frame the GPU finishes late is presented at
-        // once rather than counted against the lead.
-        Common::Nx2Timeline::Span span{"present: wait for frame render"};
-        scheduler.GetMasterSemaphore().Wait(frame->render_tick);
-    }
-    const auto start = Clock::now();
-    // 30 FPS and below: no hold. Holding a frame for its refresh kept the GPU thread from
-    // getting a frame for the next one, so every frame arrived right after the last was shown
-    // and waited a whole frame (~30 ms of input lag). The game's pacing lines its frames up with
-    // the refreshes instead (g_host_phase_ns).
-    if (VideoCommon::Nx2Perf::g_guest_frame_interval_ns.load(std::memory_order_relaxed) >=
-        25'000'000) {
-        VideoCommon::Nx2Perf::g_host_phase_ns.store(pacer.NsToNextRefresh(start),
-                                                    std::memory_order_relaxed);
-        // Only a short hold, for a frame that would be shown a refresh early (after a late
-        // one): longer ones are what backed the frames up.
-        const auto target = pacer.Target(start);
-        if (target <= start || target - start >= pacer.RefreshPeriod()) {
-            return false;
-        }
-        Common::Nx2Timeline::Span span{"present: host pacing hold"};
-        HoldUntil(target, &token);
-        pacer.NoteHold(start, Clock::now());
-        return true;
-    }
-    VideoCommon::Nx2Perf::g_host_phase_ns.store(-1, std::memory_order_relaxed);
-    const auto target = pacer.Target(start);
-    if (target <= start) {
-        return false;
-    }
-    if ((pacer.Fix() & 2) != 0) {
-        // FRITCHII_PACE_FIX 2: CopyToSwapchainImpl copies and submits first and holds only the
-        // present, so the copy's GPU time and the submit lock are not taken from the lead.
-        deferred_hold = DeferredHold{start, target};
-        return true;
-    }
-    Common::Nx2Timeline::Span span{"present: host pacing hold"};
-    HoldUntil(target, &token);
-    pacer.NoteHold(start, Clock::now());
-    return true;
+void PresentManager::UpdateHdrMetadata() {
+    // The values the guest was told it renders for (nx2:vi2 QueryDisplayHdrStatus).
+    auto& monitor = Common::DisplayHdrMonitor::Instance();
+    monitor.Watch(render_window.GetWindowInfo().render_surface);
+    hdr_metadata_generation = monitor.Generation();
+    const auto output = Common::ResolveHdrOutput(monitor.Current(), Settings::HdrMode::On,
+                                                 Settings::values.hdr_peak_luminance.GetValue(),
+                                                 Settings::values.hdr_reference_white.GetValue());
+    swapchain.SetHdrMetadata(output.peak_luminance, output.reference_white);
 }
 
-void PresentManager::NoteDisplayRefresh() {
-    // Refresh queries the display at most every 2 s; with `allowed` false it never paces.
-    const auto& window_info = render_window.GetWindowInfo();
-    pacer.Refresh(std::chrono::steady_clock::now(), false,
-                  window_info.type == Core::Frontend::WindowSystemType::Windows
-                      ? window_info.render_surface
-                      : nullptr);
+// Returns false after discarding a deferred or incompatible frame; creation exceptions propagate.
+bool PresentManager::RecreateSwapchain(Frame* frame) {
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::FrameGenSuspend();
+#endif
+    if (swapchain.Create(*surface, frame->width, frame->height, frame->format,
+                         frame->color_space)) {
+        SetImageCount();
+        if (frame->color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+            UpdateHdrMetadata();
+        }
+        ConfigureTransfer(frame);
+        if (transfer_mode != TransferMode::Unsupported) {
+            return true;
+        }
+    }
+    DiscardFrame(frame);
+    return false;
 }
 
-void PresentManager::PresentWaitThread(std::stop_token token) {
-    Common::SetCurrentThreadName("VulkanPresentWait");
-    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
-    while (!token.stop_requested()) {
-        {
-            std::unique_lock ql{wait_queue_mutex};
-            Common::Nx2Timeline::Span timeline_span{"present-wait: wait for work"};
-            wait_queue_cv.wait(ql, token, [this] { return !wait_queue.empty(); });
-            if (token.stop_requested()) {
-                return;
-            }
-        }
-        // Short waits, so a swapchain recreation (which takes present_wait_mutex) never waits
-        // long; the swapchain of a queued id stays alive while the mutex is held.
-        std::unique_lock wl{present_wait_mutex};
-        PendingWait item;
-        {
-            std::scoped_lock ql{wait_queue_mutex};
-            if (wait_queue.empty()) {
-                continue;
-            }
-            item = wait_queue.front();
-        }
-        const VkResult result = [&] {
-            Common::Nx2Timeline::ArgSpan timeline_span{"present-wait: vkWaitForPresentKHR",
-                                                       {"id", item.id}};
-            return device.GetLogical().WaitForPresentKHR(item.swapchain, item.id, 4'000'000);
-        }();
-        const auto now = std::chrono::steady_clock::now();
-        wl.unlock();
-        if (result == VK_TIMEOUT && now - item.submitted < std::chrono::milliseconds{500}) {
-            continue;
-        }
-        {
-            std::scoped_lock ql{wait_queue_mutex};
-            if (wait_queue.empty() || wait_queue.front().id != item.id) {
-                continue;
-            }
-            wait_queue.pop_front();
-        }
-        ReportShown(item.id, now, result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR);
-    }
-}
-
-void PresentManager::ReportShown(u64 id, std::chrono::steady_clock::time_point shown, bool lost) {
-    {
-        std::scoped_lock sl{shown_mutex};
-        shown_reports.push_back({id, shown, lost});
-    }
-    shown_cv.notify_all();
-}
-
-void PresentManager::DrainShown() {
-    std::vector<ShownReport> reports;
-    {
-        std::scoped_lock sl{shown_mutex};
-        reports.swap(shown_reports);
-    }
-    for (const ShownReport& report : reports) {
-        pacer.NoteShown(report.id, report.shown, report.lost);
-    }
-}
-
-void PresentManager::RecreateSwapchain(Frame* frame) {
-    // Nothing may wait on the old swapchain while it is replaced: its queued ids count as lost.
-    std::unique_lock wl{present_wait_mutex, std::defer_lock};
-    if (present_wait_enabled) {
-        wl.lock();
-        std::deque<PendingWait> dropped;
-        {
-            std::scoped_lock ql{wait_queue_mutex};
-            dropped.swap(wait_queue);
-        }
-        for (const PendingWait& item : dropped) {
-            ReportShown(item.id, std::chrono::steady_clock::now(), true);
+void PresentManager::ConfigureTransfer(const Frame* frame) {
+    transfer_source_format = frame->image_format;
+    transfer_mode = TransferMode::Unsupported;
+    if (frame->image_format == GetFrameImageFormat(frame->format)) {
+        if (CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageFormat()) &&
+            (device.GetPhysical().GetFormatProperties(frame->image_format).optimalTilingFeatures &
+             VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0) {
+            transfer_mode = TransferMode::Blit;
+        } else if (frame->image_format == swapchain.GetImageFormat()) {
+            transfer_mode = TransferMode::Copy;
         }
     }
-    swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
-    SetImageCount();
 }
 
 void PresentManager::SetImageCount() {
     // We cannot have more than 7 images in flight at any given time.
     // FRAMES_IN_FLIGHT is 8, and the cache TICKS_TO_DESTROY is 8.
     // Mali drivers will give us 6.
+#ifdef HAS_LSFG
+    const size_t generations = Settings::FrameGenMaxGenerations();
+    const size_t queued_composites = Settings::values.frame_gen_queue_target.GetValue() + 1;
+    // One frame more than the presents of the queued composites, for the next game frame
+    // (GenerationsWithoutWaiting).
+    image_count =
+        std::clamp<size_t>((generations + 1) * queued_composites + 1, swapchain.GetImageCount(),
+                           MAX_FRAMES_IN_FLIGHT);
+#else
     image_count = std::min<size_t>(swapchain.GetImageCount(), MAX_FRAMES_IN_FLIGHT);
+#endif
     swapchain_image_count = swapchain.GetImageCount();
+    swapchain_image_format = swapchain.GetImageFormat();
 }
 
 void PresentManager::DiscardFrame(Frame* frame) {
@@ -667,23 +570,17 @@ void PresentManager::DiscardFrame(Frame* frame) {
     };
 
     std::scoped_lock submit_lock{scheduler.submit_mutex};
-    const VkResult result = device.GetGraphicsQueue().Submit(submit_info, *frame->present_done);
-    if (result == VK_SUCCESS) {
-        return;
-    }
-    if (result == VK_ERROR_DEVICE_LOST) {
-        device.ReportLoss();
-    }
-    // Nothing will signal the fence now, and the next use of this frame waits on it for good.
-    LOG_ERROR(Render_Vulkan, "Discarding a frame failed ({})", string_VkResult(result));
-    frame->present_done = device.GetLogical().CreateFence({
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-    });
+    void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
 }
 
 void PresentManager::CopyToSwapchain(Frame* frame) {
+#ifdef EGLANTINE_STREAMLINE
+    SCOPE_EXIT {
+        if (frame->frame_gen) {
+            Streamline::FrameGenClosePresent(frame->frame_gen_frame.index);
+        }
+    };
+#endif
     bool requires_recreation = false;
 
     for (u32 attempt = 0; attempt < MAX_PRESENT_ATTEMPTS; ++attempt) {
@@ -693,7 +590,9 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
 #ifdef __ANDROID__
                 surface = CreateSurface(instance, render_window.GetWindowInfo());
 #endif
-                RecreateSwapchain(frame);
+                if (!RecreateSwapchain(frame)) {
+                    return;
+                }
             }
 
             // Draw to swapchain.
@@ -713,22 +612,49 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
 }
 
 void PresentManager::CopyToSwapchainImpl(Frame* frame) {
+    // The host's display starts the game's frames only while a session asks for it (a game whose
+    // frame rate is unlocked), and not with frame generation, which spaces its own presents. The
+    // swapchain is made with present ids the first time that happens, not before.
+    const bool host_vsync = present_wait && !Settings::values.frame_gen.GetValue() &&
+                            VideoCore::HostVsync::Active();
+    swapchain.RequestPresentIds(host_vsync);
 
-    // If the size of the incoming frames has changed, recreate the swapchain
-    // to account for that.
+    // Recreate for size changes, SDR/HDR10/scRGB transitions, or a suboptimal swapchain.
     const bool is_suboptimal = swapchain.NeedsRecreation() || swapchain.IsOutDated();
     const bool size_changed =
         swapchain.GetWidth() != frame->width || swapchain.GetHeight() != frame->height;
-    if (is_suboptimal || size_changed) {
-        RecreateSwapchain(frame);
+    const bool format_changed = swapchain.GetRequestedFormat() != frame->format;
+    const bool color_space_changed = swapchain.GetRequestedColorSpace() != frame->color_space;
+    if (is_suboptimal || size_changed || format_changed || color_space_changed) {
+        if (!RecreateSwapchain(frame)) {
+            return;
+        }
+    } else if (frame->color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+               Common::DisplayHdrMonitor::Instance().Generation() != hdr_metadata_generation) {
+        // A new calibration or peak while HDR stays on: the game tone maps to the new peak.
+        UpdateHdrMetadata();
+    }
+
+    // Queued SDR frames can retain an older underlying format after surface recreation.
+    if (transfer_source_format != frame->image_format) {
+        ConfigureTransfer(frame);
+    }
+    if (transfer_mode == TransferMode::Unsupported) {
+        DiscardFrame(frame);
+        return;
     }
     if (!swapchain.IsCreated()) {
         DiscardFrame(frame);
         return;
     }
 
-    while (swapchain.AcquireNextImage(!use_present_thread)) {
-        RecreateSwapchain(frame);
+    if (host_vsync) {
+        WaitForDisplay();
+    }
+    while (swapchain.AcquireNextImage(!use_present_thread, frame->game_frame_presents)) {
+        if (!RecreateSwapchain(frame)) {
+            return;
+        }
     }
 
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};
@@ -821,7 +747,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT, {},
                            {}, {}, pre_barriers);
 
-    if (blit_supported) {
+    if (transfer_mode == TransferMode::Blit) {
         cmdbuf.BlitImage(*frame->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
@@ -860,37 +786,134 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Submit the image copy/blit to the swapchain
     {
-        const auto lock_stall =
-            Common::Nx2Hitch::StallEnter("present: wait for the submit lock (copy)");
         std::scoped_lock submit_lock{scheduler.submit_mutex};
-        Common::Nx2Hitch::StallLeave(lock_stall);
-        const Common::Nx2Hitch::StallScope submit_stall{"present: submit the copy"};
         switch (const VkResult result =
                     device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
         case VK_SUCCESS:
             break;
         case VK_ERROR_DEVICE_LOST:
             device.ReportLoss();
-            [[fallthrough]];
         default:
             vk::Check(result);
             break;
         }
     }
 
-    // FRITCHII_PACE_FIX 2: the host pacer's hold, now that the copy is on the GPU.
-    if (deferred_hold) {
-        const DeferredHold hold = *deferred_hold;
-        deferred_hold.reset();
-        {
-            Common::Nx2Timeline::Span span{"present: host pacing hold"};
-            HoldUntil(hold.target, nullptr);
-        }
-        pacer.NoteHold(hold.start, std::chrono::steady_clock::now());
-    }
-
     // Present
-    last_present_id = swapchain.Present(render_semaphore);
+#ifdef EGLANTINE_STREAMLINE
+    if (frame->frame_gen) {
+        Streamline::FrameGenBeforePresent({
+            .frame = frame->frame_gen_frame,
+            .guest_rect = frame->guest_rect,
+            .frame_extent = {frame->width, frame->height},
+            .swapchain_extent = extent,
+            .swapchain_format = swapchain.GetImageFormat(),
+            .swapchain_images = static_cast<u32>(swapchain.GetImageCount()),
+        });
+    }
+#endif
+    PresentRecord record{
+        .generation = swapchain.Generation(),
+        .id = host_vsync && swapchain.WaitsForDisplay() ? ++last_present_id : 0,
+    };
+    record.accepted = swapchain.Present(render_semaphore, record.id);
+#ifdef EGLANTINE_STREAMLINE
+    if (frame->frame_gen) {
+        Streamline::FrameGenAfterPresent(frame->frame_gen_frame.index);
+    }
+#endif
+    if (record.id == 0) {
+        return;
+    }
+    {
+        std::scoped_lock lock{wait_mutex};
+        wait_queue.push_back(record);
+    }
+    wait_cv.notify_one();
+}
+
+void PresentManager::WaitForDisplay() {
+    if (last_present_id < 2 || !swapchain.WaitsForDisplay() ||
+        display_silent.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Long enough for any refresh rate, short enough that a window that shows nothing does not
+    // stall presentation.
+    constexpr std::chrono::milliseconds Timeout{100};
+    const u64 target = last_present_id - 1;
+    {
+        std::unique_lock lock{shown_mutex};
+        if (!shown_cv.wait_for(lock, Timeout, [this, target] {
+                return completed_present_id.load(std::memory_order_acquire) >= target;
+            })) {
+            display_silent.store(true, std::memory_order_release);
+            return;
+        }
+    }
+    if (shown_present_id.load(std::memory_order_acquire) < target) {
+        return;
+    }
+    // The present before the last is on screen: the game may start its next frame, once the FPS
+    // limit allows it. This thread holds its next present until then on purpose: the game has
+    // nothing new to show before that start, and the frame after it is acquired right behind it.
+    const auto start = VideoCore::HostVsync::NextStart(std::chrono::steady_clock::now());
+    if (!start) {
+        return;
+    }
+    WaitUntil(*start);
+    VideoCore::HostVsync::StartFrame();
+}
+
+void PresentManager::PresentWaitThread(std::stop_token token) {
+    Common::SetCurrentThreadName("VulkanPresentWait");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    // Vulkan allows no acquire or present on a swapchain during a present wait, so the swapchain
+    // locks them out for each wait: short waits, which an acquire or a present gets in between
+    // (it waits 1 ms at most), until the present is shown or counts as not shown.
+    constexpr u64 WaitSliceNs = 1'000'000;
+    constexpr std::chrono::milliseconds WaitLimit{100};
+    while (!token.stop_requested()) {
+        PresentRecord record{};
+        {
+            std::unique_lock lock{wait_mutex};
+            if (!wait_cv.wait(lock, token, [this] { return !wait_queue.empty(); })) {
+                break;
+            }
+            record = wait_queue.front();
+            wait_queue.pop_front();
+            // While the display shows nothing, only the newest present is worth waiting for.
+            if (display_silent.load(std::memory_order_acquire) && !wait_queue.empty()) {
+                continue;
+            }
+        }
+        // Only the id of an accepted present can be waited for. One the driver refused (an
+        // out of date swapchain) went through the queue in order and counts as gone.
+        const auto began = std::chrono::steady_clock::now();
+        VkResult result = record.accepted ? VK_TIMEOUT : VK_ERROR_OUT_OF_DATE_KHR;
+        while (result == VK_TIMEOUT && !token.stop_requested() &&
+               std::chrono::steady_clock::now() - began < WaitLimit) {
+            result = swapchain.WaitForPresent(record.generation, record.id, WaitSliceNs);
+        }
+        // A present to a swapchain that is gone (VK_ERROR_OUT_OF_DATE_KHR), or that the driver
+        // refused, holds nothing back: the game's next frame starts as after a shown one, without
+        // a pause at each recreation.
+        const bool shown = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
+        const bool gone = result == VK_ERROR_OUT_OF_DATE_KHR;
+        {
+            std::scoped_lock lock{shown_mutex};
+            completed_present_id.store(record.id, std::memory_order_release);
+            if (shown || gone) {
+                shown_present_id.store(record.id, std::memory_order_release);
+            }
+            if (shown) {
+                display_silent.store(false, std::memory_order_release);
+            } else if (!gone) {
+                // Not shown in time, or no present waits (a driver that ignored the timeout).
+                display_silent.store(true, std::memory_order_release);
+            }
+        }
+        shown_cv.notify_all();
+    }
 }
 
 } // namespace Vulkan

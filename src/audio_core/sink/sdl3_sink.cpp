@@ -26,7 +26,7 @@ namespace {
         // caused them be identified as different applications by the OS."
         //
         // Keep in sync with cubeb_sink.cpp name.
-        SDL_SetHint("SDL_AUDIO_DEVICE_APP_NAME", "Fritchii Latency Getter");
+        SDL_SetHint("SDL_AUDIO_DEVICE_APP_NAME", "Lichii Latency Getter");
 #ifdef __ANDROID__
         SDL_SetHintWithPriority(SDL_HINT_AUDIO_DRIVER, "openslES", SDL_HINT_OVERRIDE);
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
@@ -82,10 +82,8 @@ public:
      * @param event            - Event used only for audio renderer, signalled on buffer consume.
      */
     SDLSinkStream(u32 device_channels_, u32 system_channels_, const std::string& output_device,
-                  const std::string& input_device, StreamType type_, Core::System& system_,
-                  const std::string& name_)
+                  const std::string& input_device, StreamType type_, Core::System& system_)
         : SinkStream{system_, type_} {
-        name = name_;
         system_channels = system_channels_;
         device_channels = device_channels_;
 
@@ -256,10 +254,10 @@ SDLSink::SDLSink(std::string_view target_device_name) {
 SDLSink::~SDLSink() = default;
 
 SinkStream* SDLSink::AcquireSinkStream(Core::System& system, u32 system_channels_,
-                                       const std::string& name, StreamType type) {
+                                       const std::string&, StreamType type) {
     system_channels = system_channels_;
     SinkStreamPtr& stream = sink_streams.emplace_back(std::make_unique<SDLSinkStream>(
-        device_channels, system_channels, output_device, input_device, type, system, name));
+        device_channels, system_channels, output_device, input_device, type, system));
     stream->SetDeviceVolume(device_volume);
     return stream.get();
 }

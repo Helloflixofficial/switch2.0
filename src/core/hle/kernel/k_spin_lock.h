@@ -15,18 +15,12 @@ class KSpinLock {
 public:
     explicit KSpinLock() = default;
 
-    YUZU_NON_COPYABLE(KSpinLock);
-    YUZU_NON_MOVEABLE(KSpinLock);
+    LICHII_NON_COPYABLE(KSpinLock);
+    LICHII_NON_MOVEABLE(KSpinLock);
 
     void Lock();
     void Unlock();
     bool TryLock();
-
-    // EXP98: true when no one holds the lock. The acquire pairs with Unlock's release, so every
-    // write of a completed critical section is visible after it reads true.
-    bool IsFree() const {
-        return m_state.load(std::memory_order_acquire) == 0;
-    }
 
 private:
     // 0 free, 1 held, 2 held with (possible) sleepers. The scheduler lock is taken by every

@@ -27,6 +27,15 @@ struct Profile {
     bool support_separate_denorm_behavior{};
     bool support_separate_rounding_mode{};
     bool support_fp16_denorm_preserve{};
+    /// The device converts to fp16 with round-to-nearest-even when asked (RoundingModeRTE 16).
+    bool support_fp16_rounding_rte{};
+    /// fp16 and fp64 float controls must be set identically (independence 32_BIT_ONLY), and the
+    /// device supports the fp64 counterparts of the fp16 modes above.
+    bool fp16_float_controls_shared_with_fp64{};
+    /// fp16 float controls can differ from fp32 ones (neither independence is NONE).
+    bool fp16_float_controls_independent_of_fp32{};
+    bool support_fp64_rounding_rte{};
+    bool support_fp64_denorm_preserve{};
     bool support_fp32_denorm_preserve{};
     bool support_fp16_denorm_flush{};
     bool support_fp32_denorm_flush{};
@@ -47,9 +56,6 @@ struct Profile {
     bool support_demote_to_helper_invocation{};
     bool support_int64_atomics{};
     bool support_shared_int64_atomics{};
-    /// Storage buffer float32 atomic add in hardware (VK_EXT_shader_atomic_float), not a
-    /// compare-exchange loop.
-    bool support_float32_atomic_add{};
     bool support_derivative_control{};
     bool support_geometry_shader_passthrough{};
     bool support_native_ndc{};
@@ -67,11 +73,13 @@ struct Profile {
     bool support_storage_image_array_nonuniform_indexing{};
     bool support_uniform_texel_buffer_array_nonuniform_indexing{};
     bool support_storage_texel_buffer_array_nonuniform_indexing{};
+    /// Routed global memory accesses pick their storage buffer with OpSelect on a NonUniform
+    /// variable pointer instead of one branch per candidate buffer. NVIDIA's driver hangs on the
+    /// branch chain (#619). AMD lowers the NonUniform access to a waterfall loop, which spills in
+    /// vertex and mesh shaders that already use every register, so it keeps the chain.
+    bool select_global_memory_buffer{};
 
     bool warp_size_potentially_larger_than_guest{};
-    /// Some stages may run in subgroups narrower than the guest's 32 lanes (Intel's SIMD8/16
-    /// fragment and vertex shaders): shuffles from lanes past the subgroup are kept in bounds.
-    bool warp_size_potentially_smaller_than_guest{};
 
     bool lower_left_origin_mode{};
     /// Fragment outputs have to be declared even if they are not written to avoid undefined values.
@@ -116,14 +124,16 @@ struct Profile {
     bool support_cooperative_hmma{};
     /// Without the above, HMMA runs on 16x16x16 cooperative matrices through shared memory
     bool support_cooperative_hmma_16x16x16{};
-    /// Without either, HMMA runs through shared memory as two 8x16x16 cooperative matrix products
-    bool support_cooperative_hmma_8x16x16{};
     u32 max_subgroup_size{};
 
     u32 gl_max_compute_smem_size{};
 
     /// Maxwell and earlier nVidia architectures have broken robust support
     bool has_broken_robust{};
+    /// RADV before Mesa 26.2.5 keeps stale vertex user SGPR state when a mesh shader without the
+    /// grid size or draw index is bound, and the next mesh draw hangs the GPU (Mesa MR 45092).
+    /// Native mesh shaders read the grid size there so that RADV gives them that SGPR.
+    bool has_broken_mesh_user_sgprs{};
 
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};

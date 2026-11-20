@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <queue>
@@ -24,16 +26,11 @@
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
 #include "common/polyfill_thread.h"
-#include "common/nx2_timeline.h"
 #include "common/settings.h"
-#include "video_core/fritchii_price.h"
 #include "video_core/gpu_split.h"
-#include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
+#include "video_core/renderer_vulkan/frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
-#include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
-#include "video_core/renderer_vulkan/vk_sim_gpu_slow.h"
-#include "video_core/renderer_vulkan/vk_submit_times.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -74,10 +71,6 @@ public:
     bool DeferFlush();
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
-    /// The split's back (EDEN_NX2_EXP27 & 8, the original's DISPATCH_BATCH): the work so
-    /// far goes with the next submission, when the back goes idle or when another thread waits
-    /// for it (WaitSubmitted), with no time window. False on other threads (the caller submits).
-    bool DeferFlushUntilWanted();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
@@ -91,7 +84,22 @@ public:
     /// safe to touch worker resources.
     void WaitWorker();
 
-    void MarkFrameEnd(u64 frame);
+    /// Keeps the worker from executing chunks while the lock is held. Take it before submit_mutex.
+    [[nodiscard]] std::unique_lock<std::mutex> PauseWorker() {
+        return std::unique_lock{execution_mutex};
+    }
+
+    enum class FrameMark : u8 { None, Start, End, Both };
+    /// GPU thread, once per present: the frame-end mark this present gets. EDEN_DKB_FRAME_TRACE
+    /// marks every present; otherwise only the two presents after RequestGpuBusySample.
+    [[nodiscard]] FrameMark NextFrameMark();
+    void MarkFrameEnd(u64 frame, FrameMark mark);
+    /// Any thread: asks for one host GPU timestamp sample of the frame after the next present.
+    void RequestGpuBusySample() {
+        gpu_busy_marks.store(2, std::memory_order_relaxed);
+    }
+    /// Host GPU busy time of the last sampled frame, nullopt when none was taken in 3 s.
+    [[nodiscard]] std::optional<double> GpuBusyMs() const;
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
@@ -157,13 +165,13 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
-    /// Render passes begun (delta draws: a draw in another render pass is resolved in full).
-    [[nodiscard]] u64 RenderPassSerial() const noexcept {
+    /// Changes whenever a render pass begins or ends.
+    u64 RenderPassSerial() const {
         return render_pass_serial;
     }
 
-    /// The graphics pipeline UpdateGraphicsPipeline bound last in this command buffer.
-    [[nodiscard]] const GraphicsPipeline* BoundGraphicsPipeline() const noexcept {
+    /// The graphics pipeline bound in the current command buffer, if the scheduler knows it.
+    const GraphicsPipeline* BoundGraphicsPipeline() const {
         return state.graphics_pipeline;
     }
 
@@ -205,27 +213,8 @@ public:
     /// Send work to a separate thread.
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
-    void RecordWithUploadBuffer(T&& command) {
-        SeamHook::Watch(SeamHook::Use::Record);
-        RecordCommand(std::forward<T>(command));
-    }
-
-    template <typename T>
-        requires std::is_invocable_v<T, vk::CommandBuffer>
-    void Record(T&& c) {
-        SeamHook::Watch(SeamHook::Use::Record);
-        RecordCommand([command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-            command(cmdbuf);
-        });
-    }
-
-    template <typename T>
-        requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
-    void RecordCommand(T&& command) {
-        // fable_stage_levelpoints 19.4 (GPU profile on, the back): this call's time (the lambda's
-        // capture, the chunk append, a full chunk's hand-off), sampled ("Price Vulkan worker").
-        // Off: the profile's test and a branch.
-        const VideoCommon::FritchiiPrice::RecordScope price_scope;
+    void RecordWithUploadBuffer(T&& command,
+                                std::source_location location = std::source_location::current()) {
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
@@ -234,6 +223,9 @@ public:
             FlushUploads();
         }
         ++record_serial;
+        if (Common::DkbFrameTrace::Enabled()) {
+            RecordSiteMarker(location);
+        }
         if (chunk->Record(command)) {
             return;
         }
@@ -241,13 +233,25 @@ public:
         (void)chunk->Record(command);
     }
 
-    /// Whether a command was recorded since the last Flush or Finish (EXP61: a flush with nothing
-    /// to submit is skipped).
-    [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
-        // Pending batched uploads are recorded work too: EXP61 must not
-        // skip a flush that would send them.
-        return uploads_pending || record_serial != submitted_serial;
+    /// Send work to a separate thread; `location` labels it in EDEN_DKB_FRAME_TRACE's gpu_site log.
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void Record(T&& c, std::source_location location = std::source_location::current()) {
+        this->RecordWithUploadBuffer(
+            [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+                command(cmdbuf);
+            },
+            location);
     }
+
+    /// Whether anything was recorded since the last Flush or Finish, or waits to be: batched
+    /// uploads and a deferred clear reach the command buffer only at the next record or submit.
+    [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
+        return record_serial != submitted_serial || uploads_pending ||
+               deferred_clear.framebuffer != nullptr;
+    }
+    /// Counts a flush skipped because nothing was recorded (GPU profile).
+    static void CountSkippedFlush();
 
     /// Whether the recording thread submitted `tick` within 20 ms.
     [[nodiscard]] bool WaitForSubmission(u64 tick) const {
@@ -282,7 +286,10 @@ public:
     /// into the current chunk while that thread does (corrupt command buffers, crashes). They
     /// wait for the recording thread to submit the tick instead, and give up after 20 ms (it may
     /// be waiting for them).
-    void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true) {
+    /// target_fps paces presents in game frames; game_frame_presents is how many presents show the
+    /// current one (see FramePacer).
+    void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true,
+              u32 game_frame_presents = 1) {
         const bool trace = Common::DkbFrameTrace::Enabled() && target_fps > 0.0;
         const auto trace_start = trace ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
@@ -290,8 +297,6 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
-            VideoCommon::BackWaitScope wait_scope{"Scheduler::Wait (host GPU execution)"};
-            Common::Nx2Timeline::ArgSpan timeline_span{"wait for host GPU", {"tick", tick}};
             master_semaphore->Wait(tick);
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()
@@ -299,18 +304,10 @@ public:
         double trace_requested_ms{};
         double trace_sleep_ms{};
         double trace_slept_ms{};
-        if (Settings::SpeedLimitEnabled() && target_fps > 0.0) {
+        if (Settings::values.use_speed_limit.GetValue() && target_fps > 0.0) {
             auto now = std::chrono::steady_clock::now();
-            if (last_target_fps != target_fps) {
-                frame_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(1.0 / target_fps));
-                max_frame_count = static_cast<int>(0.1 * target_fps);
-                last_target_fps = target_fps;
-                frame_counter = 0;
-                start_time = now;
-            }
-            frame_counter++;
-            auto target_time = start_time + frame_interval * frame_counter;
-            if (target_time >= now) {
+            if (const auto paced = frame_pacer.Next(now, target_fps, game_frame_presents)) {
+                const auto target_time = *paced;
                 constexpr auto spin_tail = std::chrono::milliseconds(1);
                 auto sleep_time = target_time - now;
                 if (trace) {
@@ -333,9 +330,6 @@ public:
                 while (std::chrono::steady_clock::now() < target_time) {
                     std::this_thread::yield();
                 }
-            } else if (frame_counter > max_frame_count) {
-                frame_counter = 0;
-                start_time = now;
             }
         }
         if (trace) {
@@ -347,7 +341,7 @@ public:
                          "cpu_wait_wall_ms={:.3f} pace_requested_ms={:.3f} "
                          "sleep_requested_ms={:.3f} sleep_actual_wall_ms={:.3f} "
                          "pace_actual_wall_ms={:.3f}",
-                         target_fps, Settings::SpeedLimitEnabled(), may_flush,
+                         target_fps, Settings::values.use_speed_limit.GetValue(), may_flush,
                          std::chrono::duration<double, std::milli>(trace_waited - trace_start).count(),
                          trace_requested_ms, trace_sleep_ms, trace_slept_ms,
                          std::chrono::duration<double, std::milli>(end - trace_waited).count());
@@ -360,17 +354,12 @@ public:
         return *master_semaphore;
     }
 
-    /// FRITCHII_SUBMIT_TIMES: per-submission GPU timestamps (Measure is safe on any thread).
-    [[nodiscard]] const SubmitTimes& GetSubmitTimes() const noexcept {
-        return submit_times;
-    }
-
     std::mutex submit_mutex;
 
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
-    u64 record_serial{};    ///< Commands recorded (RecordWithUploadBuffer)
+    u64 record_serial{};    ///< Commands recorded
     u64 submitted_serial{}; ///< record_serial at the last Flush or Finish
 
     class Command {
@@ -459,9 +448,6 @@ private:
         VkRenderPass renderpass{};
         VkFramebuffer framebuffer{};
         VkExtent2D render_area = {0, 0};
-        /// The pass is a deferred clear's variant of the framebuffer's render pass that differs
-        /// from it only in load ops, so later draws on that framebuffer can stay in it.
-        bool clear_variant = false;
         GraphicsPipeline* graphics_pipeline = nullptr;
         bool is_rescaling = false;
         bool rescaling_defined = false;
@@ -492,7 +478,26 @@ private:
 
     void TraceGpuSubmission();
     void ReportWorkTimes();
+    /// EDEN_DKB_FRAME_TRACE: before each recorded command, a marker that timestamps it in
+    /// sampled submissions, so the frame's GPU time can be split by the code that recorded it.
+    void RecordSiteMarker(std::source_location location);
+    /// Worker thread, run by a marker: writes its timestamp while a sampled submission records.
+    void TraceSite(vk::CommandBuffer cmdbuf, const char* file, u32 line);
+    /// Logs the sampled frame's GPU time by recording site (the 25 most expensive), given each
+    /// submission's begin and end timestamps.
+    void ReportSiteTimes(const std::vector<u64>& submission_begin,
+                         const std::vector<u64>& submission_end);
     void TraceShader(u64 hash, u32 stage);
+    void TracePassShaders(u64 hash, u32 stage, u64 fragment_hash);
+    /// Worker thread, just before a render pass of a sampled submission ends: timestamps it and
+    /// keeps what was recorded since the previous pass ended.
+    void TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent);
+    /// Logs the sampled frame's GPU time by render pass (the 16 most expensive). Each pass is
+    /// timed from the end of the one before it, so compute and copies between them count with it.
+    /// MoltenVK samples timestamps only at Metal encoder boundaries, so this is the finest split
+    /// it gives.
+    void ReportPassTimes(const std::vector<u64>& submission_begin,
+                         const std::vector<u64>& submission_end);
 
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
 
@@ -512,6 +517,7 @@ private:
     bool render_pass_has_stores{};
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
+    u64 render_pass_serial{};
     std::unique_ptr<CommandPool> command_pool;
 
     std::unique_ptr<UploadBatch> upload_batch;
@@ -545,6 +551,38 @@ private:
     vk::QueryPool trace_work_pool;
     std::vector<WorkTrace> trace_work_items;
     u32 trace_work_count{};
+    static constexpr u32 TraceMaxSites = 32768;
+    struct SiteTrace {
+        const char* file{};
+        u32 line{};
+        u32 submission{};
+    };
+    vk::QueryPool trace_site_pool;
+    std::vector<SiteTrace> trace_site_items;
+    u32 trace_site_count{};
+    /// A Metal counter sample buffer holds at most 4096 timestamps; MoltenVK emulates larger
+    /// pools with timestamps that do not measure the GPU.
+    static constexpr u32 TraceMaxPasses = 4096;
+    struct PassTrace {
+        struct Shaders {
+            u64 hash{};
+            u64 fragment_hash{};
+            u32 stage{};
+        };
+        u32 submission{};
+        u32 draws{};
+        u32 dispatches{};
+        VkExtent2D extent{};
+        u32 num_shaders{};
+        u32 untracked_uses{};
+        std::array<Shaders, 4> shaders{};
+    };
+    vk::QueryPool trace_pass_pool;
+    std::vector<PassTrace> trace_pass_items;
+    /// What each sampled submission recorded after its last render pass ended.
+    std::vector<PassTrace> trace_pass_tails;
+    PassTrace trace_pass;
+    u32 trace_pass_count{};
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
     u64 trace_gpu_tick{};
     u64 trace_frame_end{};
@@ -557,35 +595,17 @@ private:
     bool trace_gpu_sampling{};
     bool trace_gpu_pending{};
     bool trace_gpu_failed{};
+    FrameMark trace_frame_mark{};
+    /// The pending sample covers exactly one frame, so its busy time can be shown.
+    bool trace_gpu_publish{};
 
-    /// The performance overlay's GPU time (common/frame_budget.h), while it shows its time rows:
-    /// one timestamp pair per submission in a ring, read back once the tick is done, never waited
-    /// for. Worker thread only.
-    void BudgetGpuSubmission();
-    void ReadBudgetResults();
-    /// FRITCHII_SUBMIT_TIMES: the worker's per-submission GPU timestamps (GetSubmitTimes).
-    SubmitTimes submit_times;
-    /// FRITCHII_SLOW_GPU: slow submission lines and the hang breadcrumbs (worker side).
-    SlowGpu slow_gpu;
-    /// FRITCHII_SIM_GPU_SLOW: the low-end PC simulation's added GPU load (worker side).
-    SimGpuSlow sim_gpu_slow;
-    /// The Flush or Finish that calls SubmitExecution (recording thread), for SlowGpu::Origin.
-    std::source_location submit_site{};
-    bool submit_is_finish{};
-    /// Common::Nx2Hitch::LogGpuBreadcrumbs's hook (any thread).
-    static void LogGpuBreadcrumbs(const void* self, const char* prefix);
-    static constexpr u32 BudgetSlots = 256;
-    vk::QueryPool budget_pool;
-    std::array<u64, BudgetSlots> budget_ticks{}; ///< each pending slot's tick
-    u32 budget_next_slot{};    ///< slot of the next submission (counts up, modulo BudgetSlots)
-    u32 budget_pending{};      ///< submitted, not read back: the slots before budget_next_slot
-    u64 budget_last_end{};     ///< end of the latest read submission, GPU clock
-    u64 budget_last_tick{};    ///< latest tick that wrote to budget_pool
-    u32 budget_timestamp_bits{};
-    float budget_timestamp_period{};
-    bool budget_recording{};   ///< the current command buffers carry a start stamp
-    bool budget_has_end{};
-    bool budget_failed{};
+    std::atomic<u32> gpu_busy_marks{};
+    struct GpuBusySample {
+        double ms;
+        std::chrono::steady_clock::time_point taken;
+    };
+    mutable std::mutex gpu_busy_mutex;
+    std::optional<GpuBusySample> gpu_busy;
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
@@ -599,7 +619,6 @@ private:
 
     State state;
     u64 recording_epoch = 0;
-    u64 render_pass_serial = 0; ///< BeginRenderPassImpl calls (delta draws)
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};
@@ -612,35 +631,9 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
-    /// FRITCHII_WORKER_SPIN: the worker is spinning for work outside the lock and looks at the
-    /// queue under the lock before it sleeps (guarded by queue_mutex).
-    bool worker_spinning{};
-    /// FRITCHII_WORKER_SPIN: chunks queued since start, raised under queue_mutex with each push;
-    /// the spinning worker watches it without the lock.
-    std::atomic<u64> dispatch_serial{};
-    /// Spins the worker for up to `spin_us` microseconds (without a lock) until dispatch_serial
-    /// moves from `seen`. Returns whether it moved.
-    bool SpinForWork(u64 seen, int spin_us, const std::stop_token& stop_token);
-    /// FRITCHII_WORKER_SPIN's counts: dispatches by the recording thread, the worker's spins.
-    struct WakeStats {
-        u64 dispatches{};
-        u64 notified{};
-        u64 skipped_busy{};
-        u64 skipped_spinning{};
-        std::chrono::steady_clock::time_point since{};
-    };
-    WakeStats wake_stats;
-    std::atomic<u64> worker_spins{};
-    std::atomic<u64> worker_spin_hits{};
-    std::atomic<u64> worker_spin_ns{};
-    void NoteDispatchWake(bool notified, bool spinning);
     std::jthread worker_thread;
 
-    std::chrono::steady_clock::duration frame_interval{};
-    std::chrono::steady_clock::time_point start_time{};
-    double last_target_fps{};
-    u64 max_frame_count{};
-    u64 frame_counter{};
+    FramePacer frame_pacer;
 };
 
 } // namespace Vulkan

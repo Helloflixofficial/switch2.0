@@ -12,6 +12,9 @@
 #include "common/dynamic_library.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_base.h"
+#ifdef HAS_LSFG
+#include "video_core/renderer_vulkan/present/frame_gen.h"
+#endif
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -22,6 +25,9 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#if defined(EGLANTINE_STREAMLINE) && !defined(HAS_LSFG)
+#include "video_core/vulkan_common/streamline.h"
+#endif
 
 namespace Core::Memory {
 class Memory;
@@ -55,9 +61,30 @@ public:
         return device.GetDriverName();
     }
 
+    [[nodiscard]] VideoCore::FrameGenStatus GetFrameGenStatus() const override {
+#ifdef HAS_LSFG
+        return frame_gen.CurrentStatus();
+#else
+#ifdef EGLANTINE_STREAMLINE
+        if (Streamline::FrameGenActive()) {
+            return {.state = VideoCore::FrameGenState::NvidiaFrameGen};
+        }
+#endif
+        return {.state = VideoCore::FrameGenState::UnsupportedBuild};
+#endif
+    }
+
 #ifdef EGLANTINE_STREAMLINE
     [[nodiscard]] VideoCore::DlssStatus GetDlssStatus() const override;
 #endif
+
+    void RequestGpuBusySample() override {
+        scheduler.RequestGpuBusySample();
+    }
+
+    [[nodiscard]] std::optional<double> GetGpuBusyMs() const override {
+        return scheduler.GpuBusyMs();
+    }
 
     // Enhanced platform-specific initialization
     void InitializePlatformSpecific();
@@ -67,9 +94,19 @@ private:
     std::chrono::steady_clock::time_point trace_last_frame{};
     u64 trace_frame{};
 
+    void InterpolateFrames(Frame* prev_frame, Frame* curr_frame);
+    Frame* previous_frame = nullptr;  // Store the previous frame for interpolation
     VkCommandBuffer BeginSingleTimeCommands();
     void EndSingleTimeCommands(VkCommandBuffer command_buffer);
     void Report() const;
+    /// The surface the swapchain is made for, once the device exists.
+    VkSurfaceKHR PresentationSurface();
+
+    /// The encoding and luminances this frame is presented with; picks the swapchain format
+    /// again when the HDR settings or the monitor's state changed.
+    HdrPresent UpdateHdrPresent();
+    /// SDR, with the luminances the game was told: screenshots and captures tone map HDR layers.
+    HdrPresent CaptureHdrPresent() const;
 
     vk::Buffer RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,
                               const Layout::FramebufferLayout& layout, VkFormat format,
@@ -93,8 +130,7 @@ private:
     vk::Instance instance;
 
     vk::DebugUtilsMessenger debug_messenger;
-    /// FRITCHII_VA_REPORT=1: the driver's GPU address binds and unbinds (device loss reports).
-    vk::DebugUtilsMessenger va_report_messenger;
+    vk::DebugUtilsMessenger address_messenger;
 
     vk::SurfaceKHR surface;
 
@@ -108,9 +144,21 @@ private:
     BlitScreen blit_capture;
     BlitScreen blit_applet;
     RasterizerVulkan rasterizer;
+#ifdef HAS_LSFG
+    FrameGen frame_gen;
+#endif
     std::optional<TurboMode> turbo_mode;
 
     Frame applet_frame;
+
+    u64 output_format_key{~u64{}};
+    u32 output_luminance_key{};
+    VkSurfaceFormatKHR output_format{};
+    f32 output_reference_white{};
+    f32 output_peak{};
+
+    // DrawToFrame recreates the image when the layout size or format changes.
+    Frame screenshot_frame{};
 };
 
 } // namespace Vulkan

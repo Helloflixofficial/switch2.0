@@ -11,7 +11,6 @@
 #include <deque>
 #include <mutex>
 #include <regex>
-#include <string_view>
 #include <thread>
 
 #if defined(__ANDROID__)
@@ -33,7 +32,6 @@
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/polyfill_thread.h"
-#include "common/scm_rev.h"
 #include "common/thread.h"
 
 #include "common/logging.h"
@@ -159,9 +157,6 @@ struct Backend {
     virtual void Flush() noexcept = 0;
 };
 
-/// @brief Formatting specifier (to use with printf) of the equivalent fmt::format() expression
-#define CCB_PRINTF_FMT "[%4d.%06d] %s <%s> %s:%u:%s: %s"
-
 /// @brief Instead of using fmt::format() just use the system's formatting capabilities directly
 struct DirectFormatArgs {
     const char *class_name;
@@ -203,7 +198,13 @@ struct ColorConsoleBackend final : public Backend {
             }());
             SetConsoleTextAttribute(console_handle, color);
             auto const df = GetDirectFormatArgs(entry);
-            std::fprintf(stdout, CCB_PRINTF_FMT "\n", df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function, entry.message);
+            // One write per line: MinGW's fprintf emits each character separately, and stdout is
+            // unbuffered here, so every character became a WriteFile on the thread that logs.
+            fmt::memory_buffer line;
+            fmt::format_to(fmt::appender(line), "[{:4d}.{:06d}] {} <{}> {}:{}:{}: ", df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function);
+            line.append(entry.message, entry.message + entry.message_len);
+            line.push_back('\n');
+            std::fwrite(line.data(), 1, line.size(), stdout);
         }
     }
     void Flush() noexcept override {}
@@ -246,30 +247,37 @@ struct ColorConsoleBackend final : public Backend {
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
-        auto old_filename = filename;
-        old_filename += ".old.txt";
-        // Existence checks are done within the functions themselves.
-        // We don't particularly care if these succeed or not.
-        void(FS::RemoveFile(old_filename));
-        void(FS::RenameFile(filename, old_filename));
-        file.emplace(filename, FS::FileAccessMode::Write, FS::FileType::TextFile);
-        path = filename;
-        if (!file->IsOpen()) {
-            // Another Fritchii still holds the log (one that never finished closing, e.g. after
-            // an update's restart): without this the session logged nothing and Export Log sent
-            // that process's old log (a v5.3 log in a v5.5 export, 2026-11-09).
-            auto busy = filename;
-            busy.replace_extension();
-            busy += ".busy.txt";
-            file.emplace(busy, FS::FileAccessMode::Write, FS::FileType::TextFile);
-            path = busy;
-            primary_locked = true;
+        // Move a log over its ".old.txt" copy. The rename replaces the copy atomically, and fails
+        // if the log is still open elsewhere (e.g. in a Lichii process that hasn't exited yet).
+        // A log that can't even be checked counts as a failure, so it is never truncated.
+        const auto rotate = [](const std::filesystem::path& path) {
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec))
+                return !ec;
+            auto old_path = path;
+            old_path += ".old.txt";
+            std::filesystem::rename(path, old_path, ec);
+            return !ec;
+        };
+        // If the log can't be moved, write this session to a second log (eden_log_2.txt) so that
+        // the previous session is kept and this one still gets the full size limit. If that one
+        // can't be moved either, append to it.
+        auto path = filename;
+        auto mode = FS::FileAccessMode::Write;
+        if (!rotate(path)) {
+            path = filename.parent_path() / filename.stem();
+            path += "_2";
+            path += filename.extension();
+            if (!rotate(path))
+                mode = FS::FileAccessMode::Append;
         }
+        file.emplace(path, mode, FS::FileType::TextFile);
+        file_path = path;
+        // Count what is already there so the size limit still applies when appending.
+        if (mode == FS::FileAccessMode::Append)
+            bytes_written = file->GetSize();
     }
     ~FileBackend() noexcept override = default;
-
-    std::filesystem::path path;
-    bool primary_locked = false;
 
     void Write(const Entry& entry) noexcept override {
         if (!enabled)
@@ -289,25 +297,15 @@ struct FileBackend final : public Backend {
                         return std::string{s};
                 return std::string{};
             }();
-            if (!username.empty()) {
-                // The build version can contain the username ("Frizti v2" for user "Frizt").
-                const std::string_view version{Common::g_build_version};
-                const bool keep_version =
-                    !version.empty() && version.find(username) != std::string_view::npos &&
-                    message.find(version) != std::string::npos;
-                if (keep_version)
-                    boost::replace_all(message, version, "\x01");
+            if (!username.empty())
                 boost::replace_all(message, username, "user");
-                if (keep_version)
-                    boost::replace_all(message, "\x01", version);
-            }
         }
 #endif
         bytes_written += file->WriteSpan(std::span<const char>{message.begin(), message.end()});
 
         // Option to log each line rather than 4k buffers
         if (Settings::values.log_flush_line.GetValue())
-            file->Flush();
+            Flush();
 
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
@@ -318,13 +316,22 @@ struct FileBackend final : public Backend {
             // Don't close the file so we can print a stacktrace if necessary
             if (write_limit_exceeded)
                 enabled = false;
-            file->Flush();
+            Flush();
         }
     }
 
     void Flush() noexcept override {
+        // A failed flush logs an Error, whose own flush would fail and log again without end.
+        static thread_local bool flushing = false;
+        if (flushing)
+            return;
+        flushing = true;
         file->Flush();
+        flushing = false;
     }
+
+    std::filesystem::path file_path;
+
 private:
     std::optional<FS::IOFile> file;
     std::size_t bytes_written = 0;
@@ -387,7 +394,7 @@ struct LogcatBackend : public Backend {
             }
         }();
         auto const df = GetDirectFormatArgs(entry);
-        __android_log_print(android_log_priority, "YuzuNative", "%s %s:%u:%s: %s", df.class_name, entry.filename, entry.line_num, entry.function, entry.message);
+        __android_log_print(android_log_priority, "LichiiNative", "%s %s:%u:%s: %s", df.class_name, entry.filename, entry.line_num, entry.function, entry.message);
     }
     void Flush() noexcept override {}
 };
@@ -427,6 +434,10 @@ struct Impl {
     LogcatBackend lc_backend{};
 #endif
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
+#ifndef __OPENORBIS__
+    // Last, so it stops before the file backend it flushes is destroyed.
+    std::jthread file_flush_thread;
+#endif
 };
 } // Anonymous namespace
 
@@ -466,24 +477,32 @@ void Initialize() {
 }
 
 void Start() {
+#ifndef __OPENORBIS__
+    // Lines below Error wait in the file's buffer until it fills. Flushing it every second keeps a
+    // hang or a kill from losing more than the last second of the log.
+    if (!logging_instance || !logging_instance->file_backend || logging_instance->file_flush_thread.joinable())
+        return;
+    logging_instance->file_flush_thread = std::jthread([&backend = *logging_instance->file_backend](std::stop_token token) {
+        Common::SetCurrentThreadName("LogFlush");
+        while (Common::StoppableTimedWait(token, std::chrono::seconds{1}))
+            backend.Flush();
+    });
+#endif
 }
 
 void Stop() {
+    Flush();
+}
+
+void Flush() {
     if (logging_instance)
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
 }
 
-std::filesystem::path FilePath(bool* primary_locked) {
-    if (primary_locked) {
-        *primary_locked = false;
-    }
+std::filesystem::path FilePath() {
 #ifndef __OPENORBIS__
-    if (logging_instance && logging_instance->file_backend) {
-        if (primary_locked) {
-            *primary_locked = logging_instance->file_backend->primary_locked;
-        }
-        return logging_instance->file_backend->path;
-    }
+    if (logging_instance && logging_instance->file_backend)
+        return logging_instance->file_backend->file_path;
 #endif
     return {};
 }

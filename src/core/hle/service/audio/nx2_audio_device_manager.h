@@ -88,7 +88,7 @@ struct Nx2SysmixStreams {
 };
 
 // Switch 2 virtual output devices (nn::audio::ListVirtualOutputDevices and friends), reached through
-// the object auddmg:u command 0 returns. The emulator plays everything through one stereo 48 kHz output, so
+// the object auddmg:u command 0 returns. Eden plays everything through one stereo 48 kHz output, so
 // there is one virtual device. The nx2: name keeps the other commands auto-stubbed and logged.
 // - 0(u32): u32 count, the device names in the out buffer (0x100 bytes each).
 // - 100(u32): the default device's name in the out buffer.
@@ -204,7 +204,11 @@ private:
         };
         put32(0x100, 3);
         put32(0x104, 2);
-        put32(0x108, 2);     // stereo
+        // Match the output channel count audren reports. Orbitals rejects a stereo device after
+        // GetActiveChannelCount said six and retries forever.
+        const bool surround =
+            !input && system.AudioCore().GetOutputSink().GetSystemChannels() == 6;
+        put32(0x108, surround ? 6 : 2);
         put32(0x10c, 48000); // Hz
         CopyName(block.data() + 0x110, input ? PhysicalInputDeviceName : PhysicalDeviceName);
         const u64 latency_ns = 10'000'000;

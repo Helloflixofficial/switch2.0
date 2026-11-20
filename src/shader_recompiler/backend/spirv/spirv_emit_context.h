@@ -8,6 +8,8 @@
 #include <array>
 #include <bit>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_map.h"
@@ -168,16 +170,32 @@ struct CooperativeHmmaTypes {
     Id matrix_a{};
     Id matrix_b{};
     Id matrix_c{};
-    u32 rows{16}; ///< Rows of A and the accumulator
 };
 
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info,
-                         IR::Program& program, Bindings& binding);
+                         IR::Program& program, Bindings& binding, bool vulkan_memory_model);
     ~EmitContext();
 
     [[nodiscard]] Id Def(const IR::Value& value);
+
+    /// Workgroup memory loads and stores. GLSL450 keeps workgroup memory coherent within the
+    /// workgroup. Under the Vulkan memory model a plain access is private, so each one is
+    /// non-private and makes itself visible or available to the workgroup, as glslang does for
+    /// GLSL's shared variables.
+    [[nodiscard]] Id LoadShared(Id result_type, Id pointer);
+    void StoreShared(Id pointer, Id object);
+    /// The memory operands LoadShared and StoreShared use under the Vulkan memory model.
+    [[nodiscard]] std::array<Sirit::MemoryAccessLiteral, 2> SharedMemoryAccess(
+        spv::MemoryAccessMask availability);
+    /// Barrier semantics. Under the Vulkan memory model a barrier also makes the writes before it
+    /// available and the writes it orders visible.
+    [[nodiscard]] Id BarrierSemantics(spv::MemorySemanticsMask semantics);
+    /// Workgroup memory semantics of a guest barrier.
+    [[nodiscard]] Id GuestBarrierSemantics();
+    /// The shared word ConditionalBarrierPass counts branch conditions in.
+    [[nodiscard]] Id BarrierVoteWord(Id offset);
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
@@ -231,6 +249,8 @@ public:
     const RuntimeInfo& runtime_info;
     const bool requires_coherent_global_memory;
     const bool requires_coherent_image_memory;
+    /// Set when HMMA lowers to cooperative matrices, which need the Vulkan memory model.
+    const bool vulkan_memory_model;
     Stage stage{};
 
     Id void_id{};
@@ -287,9 +307,6 @@ public:
     Id sample_id{};
     Id is_helper_invocation{};
     Id subgroup_local_invocation_id{};
-    /// SubgroupSize, when the host subgroup may be narrower than the guest warp and the program
-    /// shuffles (Profile::warp_size_potentially_smaller_than_guest).
-    Id subgroup_size{};
     Id subgroup_mask_eq{};
     Id subgroup_mask_lt{};
     Id subgroup_mask_le{};
@@ -326,38 +343,9 @@ public:
     u32 rescaling_downfactor_member_index{};
     u32 texture_rescaling_index{};
     u32 image_rescaling_index{};
-    u32 descriptor_set{}; ///< Set of every resource of the stage (Bindings::descriptor_set)
 
     Id render_area_push_constant{};
     u32 render_are_member_index{};
-
-    Id mesh_draw_base_push_constant{};
-    u32 mesh_draw_base_member_index{};
-
-    /// FRITCHII_OCCL_FLAG (RuntimeInfo::occl_flag_store): the push constant block holding the
-    /// flag slot address (a u64 at offset 40; the rescaling or render area block when the
-    /// program declares one: one push constant block per entry point), the member's index, and
-    /// the store's types. The address is a u64 member, never a struct the slot pointer could
-    /// share: Sirit merges identical type declarations, decorations and all.
-    Id occl_flag_push_constant{};
-    u32 occl_flag_member_index{};
-    Id occl_flag_u64{};
-    Id occl_flag_slot_pointer{};
-    /// The store, a function of its own: its branch must not split main's first block (the
-    /// deferred phis name their predecessors by the IR blocks' labels).
-    Id occl_flag_store_function{};
-
-    /// FRITCHII_OCCL_FLAG: this module stores the occlusion flag (fragment, Vulkan).
-    [[nodiscard]] bool UsesOcclFlagStore() const {
-        return stage == Stage::Fragment &&
-               (runtime_info.occl_flag_store || runtime_info.occl_flag_store_at_end) &&
-               profile.unified_descriptor_binding;
-    }
-
-    /// FRITCHII_OCCL_FLAG pre-pass: the store is at the end of main, not at its start.
-    [[nodiscard]] bool OcclFlagStoreAtEnd() const {
-        return UsesOcclFlagStore() && runtime_info.occl_flag_store_at_end;
-    }
 
     Id local_memory{};
 
@@ -374,6 +362,8 @@ public:
     Id shared_store_u8_func{};
     Id shared_store_u16_func{};
     Id increment_cas_shared{};
+    Id barrier_vote_func{};
+    Id voted_barrier_func{};
     Id increment_cas_ssbo{};
     Id decrement_cas_shared{};
     Id decrement_cas_ssbo{};
@@ -387,15 +377,26 @@ public:
 
     Id write_storage_cas_loop_func{};
 
-    Id load_global_func_u32{};
-    Id load_global_func_u32x2{};
-    Id load_global_func_u32x4{};
-    Id write_global_func_u32{};
-    Id write_global_func_u32x2{};
-    Id write_global_func_u32x4{};
-    Id atomic_add_global_func_u32{};
-    Id atomic_umax_global_func_u32{};
-    Id atomic_cas_global_func_u32{};
+    // 32-bit global atomics on untracked addresses, routed to the storage buffer holding them.
+    enum class GlobalAtomic : size_t {
+        IAdd, SMin, UMin, SMax, UMax, Inc, Dec, And, Or, Xor, Exchange, AddF32, Count,
+    };
+    /// The functions that route global memory accesses among some of the bound storage buffers
+    struct GlobalMemoryFunctions {
+        Id load_u32{};
+        Id load_u32x2{};
+        Id load_u32x4{};
+        Id write_u32{};
+        Id write_u32x2{};
+        Id write_u32x4{};
+        std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> atomics{};
+        Id compare_exchange_u32{};
+    };
+    /// The first routes among every bound storage buffer, the others among
+    /// IR::Program::global_memory_routes
+    std::vector<GlobalMemoryFunctions> global_memory_functions;
+    std::unordered_map<const IR::Inst*, u32> global_memory_route;
+    [[nodiscard]] const GlobalMemoryFunctions& GlobalMemoryFunctionsOf(const IR::Inst& inst) const;
 
     bool need_input_position_indirect{};
     Id input_position{};
@@ -421,10 +422,11 @@ public:
     /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
     std::optional<u32> tensor_scratch_word;
     Id tensor_subgroup_id{};
+    /// The software matrix functions round to fp16 with a native conversion, which needs the
+    /// entry point's fp16 round-to-nearest-even and denorm preserve modes.
+    bool native_half_rounding{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
-    /// Storage float32 atomic adds use OpAtomicFAddEXT (Profile::support_float32_atomic_add).
-    bool native_f32_atomic_add{};
 
     // Task and mesh programs. Their stage buffer: the task's output region is the task payload
     // (the mesh stage's input region); the mesh output regions live in workgroup memory until
@@ -462,6 +464,8 @@ public:
     Id mesh_task_offsets_buffer{};
     Id mesh_task_args_buffer{};
     Id mesh_group_index{};
+    /// NumWorkgroups of a native mesh program (Profile::has_broken_mesh_user_sgprs only).
+    Id mesh_num_workgroups{};
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
@@ -500,6 +504,7 @@ private:
     void DefineLocalMemory(const IR::Program& program);
     void DefineSharedMemory(const IR::Program& program);
     void DefineSharedMemoryFunctions(const IR::Program& program);
+    void DefineBarrierVoteFunctions(const IR::Program& program);
     void DefineConstantBuffers(const Info& info, u32& binding);
     void DefineConstantBufferIndirectFunctions(const Info& info);
     void DefineStorageBuffers(const Info& info, u32& binding);
@@ -514,10 +519,6 @@ private:
     void DefineRescalingInputPushConstant();
     void DefineRescalingInputUniformConstant();
     void DefineRenderArea(const Info& info);
-    void DefineMeshDrawBase();
-    [[nodiscard]] bool UsesMeshDrawBase() const;
-    void DefineOcclFlag();
-    [[nodiscard]] u32 MeshDrawBaseOffset() const;
 
     void DefineInputs(const IR::Program& program);
     void DefineOutputs(const IR::Program& program);

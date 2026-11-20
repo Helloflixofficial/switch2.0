@@ -53,44 +53,32 @@ constexpr std::array PreferredGpuDecoders = {
 };
 
 AVPixelFormat GetGpuFormat(AVCodecContext* codec_context, const AVPixelFormat* pix_fmts) {
-    // The hardware format of the device the context was given, when the decoder offers it for
-    // this stream.
-    if (codec_context->hw_device_ctx) {
-        const auto* hw_ctx =
-            reinterpret_cast<const AVHWDeviceContext*>(codec_context->hw_device_ctx->data);
+    const auto desc = av_pix_fmt_desc_get(codec_context->pix_fmt);
+    if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
         for (int i = 0;; i++) {
             const AVCodecHWConfig* config = avcodec_get_hw_config(codec_context->codec, i);
             if (!config) {
                 break;
             }
-            if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
-                config->device_type == hw_ctx->type) {
-                for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
-                    if (*p == config->pix_fmt) {
-                        return *p;
-                    }
+
+            for (const auto type : PreferredGpuDecoders) {
+                if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == type) {
+                    codec_context->pix_fmt = config->pix_fmt;
                 }
             }
         }
     }
 
+    for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+        if (*p == codec_context->pix_fmt) {
+            return codec_context->pix_fmt;
+        }
+    }
+
     LOG_INFO(HW_GPU, "Could not find supported GPU pixel format, falling back to CPU decoder");
     av_buffer_unref(&codec_context->hw_device_ctx);
-    // A software format from the offered list: one outside it fails the decode of the whole
-    // stream (a 10-bit stream offers YUV420P10, not YUV420P). FFmpeg lists them after the
-    // hardware formats.
-    AVPixelFormat software = AV_PIX_FMT_NONE;
-    for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
-        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
-        if (desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
-            continue;
-        }
-        if (*p == PreferredCpuFormat) {
-            return *p;
-        }
-        software = *p;
-    }
-    return software != AV_PIX_FMT_NONE ? software : pix_fmts[0];
+    codec_context->pix_fmt = PreferredCpuFormat;
+    return codec_context->pix_fmt;
 }
 
 std::string AVError(int errnum) {
@@ -197,6 +185,10 @@ Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
         }
     }
 #endif
+    if (!m_codec && av_codec == AV_CODEC_ID_AV1) {
+        // FFmpeg's own av1 decoder only decodes through a GPU hwaccel.
+        m_codec = avcodec_find_decoder_by_name("libdav1d");
+    }
     if (!m_codec) {
         m_codec = avcodec_find_decoder(av_codec);
     }
@@ -211,7 +203,6 @@ bool Decoder::SupportsDecodingOnDevice(AVPixelFormat* out_pix_fmt, AVHWDeviceTyp
         }
 
         if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == type) {
-            LOG_INFO(HW_GPU, "Using {} GPU decoder", av_hwdevice_get_type_name(type));
             *out_pix_fmt = config->pix_fmt;
             return true;
         }
@@ -248,21 +239,18 @@ bool HardwareContext::InitializeForDecoder(DecoderContext& decoder_context, cons
             continue;
         }
 
-        // Ask the codec first: creating a device it can't use costs time at the start of every
-        // movie (CUDA, D3D11, DXVA2 and D3D12 one after another for libdav1d, which has none).
+        // Creating a device is slow (CUDA, Vulkan): only create the ones the decoder can use.
         if (!decoder.SupportsDecodingOnDevice(&hw_pix_fmt, type)) {
             continue;
         }
 
-        if (!this->InitializeWithType(type)) {
-            continue;
+        if (this->InitializeWithType(type)) {
+            LOG_INFO(HW_GPU, "Using {} GPU decoder", av_hwdevice_get_type_name(type));
+            decoder_context.InitializeHardwareDecoder(*this, hw_pix_fmt);
+            return true;
         }
-
-        decoder_context.InitializeHardwareDecoder(*this, hw_pix_fmt);
-        return true;
     }
 
-    av_buffer_unref(&m_gpu_decoder);
     return false;
 }
 
@@ -343,7 +331,6 @@ bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> ext
 bool DecoderContext::SendPacket(const Packet& packet) {
     if (const int ret = avcodec_send_packet(m_codec_context, packet.GetPacket()); ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
         LOG_ERROR(HW_GPU, "avcodec_send_packet error: {}", AVError(ret));
-        ++m_errors;
         return false;
     }
 
@@ -351,40 +338,31 @@ bool DecoderContext::SendPacket(const Packet& packet) {
 }
 
 std::shared_ptr<Frame> DecoderContext::ReceiveFrame() {
-    while (true) {
-        auto frame = std::make_shared<Frame>();
-        if (const int ret = avcodec_receive_frame(m_codec_context, frame->GetFrame()); ret < 0) {
-            if (ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
-                LOG_ERROR(HW_GPU, "avcodec_receive_frame error: {}", AVError(ret));
-                ++m_errors;
-            }
+    auto ReceiveImpl = [&](AVFrame* frame) -> int {
+        const int ret = avcodec_receive_frame(m_codec_context, frame);
+        if (ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
+            LOG_ERROR(HW_GPU, "avcodec_receive_frame error: {}", AVError(ret));
+        }
+        return ret;
+    };
+
+    std::shared_ptr<Frame> intermediate_frame = std::make_shared<Frame>();
+    if (ReceiveImpl(intermediate_frame->GetFrame()) < 0) {
+        return {};
+    }
+
+    m_final_frame = std::make_shared<Frame>();
+    if (m_codec_context->hw_device_ctx) {
+        m_final_frame->SetFormat(PreferredGpuFormat);
+        if (const int ret = av_hwframe_transfer_data(m_final_frame->GetFrame(), intermediate_frame->GetFrame(), 0); ret < 0) {
+            LOG_ERROR(HW_GPU, "av_hwframe_transfer_data error: {}", AVError(ret));
             return {};
         }
-        // Decide per frame, not by the context: get_format drops the device when a stream
-        // changes to one the GPU can't decode, and a GPU surface handed on as a picture would be
-        // read as memory.
-        if (!frame->IsHardwareDecoded()) {
-            return frame;
-        }
-        auto copy = std::make_shared<Frame>();
-        copy->SetFormat(PreferredGpuFormat);
-        int ret = av_hwframe_transfer_data(copy->GetFrame(), frame->GetFrame(), 0);
-        if (ret < 0) {
-            // Not NV12 on the GPU (10-bit P010, 4:4:4): copy it in the format FFmpeg picks.
-            copy = std::make_shared<Frame>();
-            ret = av_hwframe_transfer_data(copy->GetFrame(), frame->GetFrame(), 0);
-        }
-        if (ret < 0) {
-            // Skip this frame, keep the ones after it.
-            LOG_ERROR(HW_GPU, "av_hwframe_transfer_data error: {}", AVError(ret));
-            ++m_errors;
-            continue;
-        }
-        // The copy has no timestamps of its own: without them a frame takes another's and the
-        // video service shows it at the wrong time.
-        av_frame_copy_props(copy->GetFrame(), frame->GetFrame());
-        return copy;
+    } else {
+        m_final_frame = std::move(intermediate_frame);
     }
+
+    return std::move(m_final_frame);
 }
 
 void DecodeApi::Reset() {

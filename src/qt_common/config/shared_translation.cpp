@@ -20,6 +20,12 @@
 
 namespace ConfigurationShared {
 
+/**
+ * Builds the label and tooltip every settings widget shows, keyed by setting id.
+ *
+ * @param parent Object used for translation lookups.
+ * @return The translation map.
+ */
 std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     std::unique_ptr<TranslationMap> translations = std::make_unique<TranslationMap>();
     const auto& tr = [](const char* text) -> QString { return QCoreApplication::translate("ConfigurationShared", text); };
@@ -63,9 +69,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("This option increases CPU emulation thread use from 1 to the maximum of 4.\n"
               "This is mainly a debug option and shouldn't be disabled."));
     INSERT(Settings, memory_layout_mode, tr("Memory Layout"),
-           tr("Switch 2 games always use 12 GB while they run, whatever this says: it only "
-              "applies to Switch 1 games.\nIncreases the amount of emulated RAM. Doesn't affect "
-              "performance/stability but may allow HD texture mods to load."));
+           tr("Increases the amount of emulated RAM.\nDoesn't affect performance/stability but may "
+              "allow HD texture "
+              "mods to load."));
     INSERT(Settings, use_speed_limit, QString(), QString());
     INSERT(Settings, current_speed_mode, QString(), QString());
     INSERT(Settings, speed_limit, tr("Limit Speed Percent"),
@@ -90,8 +96,6 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, cpu_accuracy, tr("Accuracy:"),
            tr("Change the accuracy of the emulated CPU (for debugging only)."));
     INSERT(Settings, cpu_backend, tr("Backend:"), QString());
-    INSERT(Settings, hybrid_cpu_placement, tr("Intel P-cores:"),
-           tr("Automatic lets Windows place the GPU threads.\nApplies at the next game start."));
 
     INSERT(Settings, cpu_clock, tr("CPU Clocks"),
            tr("Raises the clock the emulated CPU reports, which removes some FPS limiters.\n"
@@ -137,72 +141,122 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            "other race conditions."));
 
     // Renderer
+    INSERT(Settings, hdr_mode, tr("HDR output:"),
+           tr("HDR output for games with an HDR mode. Requires Vulkan.\n"
+              "Off (default): always SDR.\n"
+              "Auto: HDR while Windows HDR (\"Use HDR\") is on for the monitor that shows the "
+              "game, SDR otherwise and on hosts that cannot tell.\n"
+              "On: HDR whenever the display driver offers an HDR format.\n"
+              "The game is told the display is HDR only while Lichii really presents HDR. SDR "
+              "games and menus are shown at the reference white.\n"
+              "While HDR is active, anti-aliasing, post-processing and FSR/SGSR upscaling are off "
+              "and the window is scaled bilinearly. Frame generation keeps working.\n"
+              "Screenshots are tone mapped to SDR."));
+    INSERT(Settings, hdr_swapchain, tr("HDR format:"),
+           tr("HDR10: 10-bit PQ, what HDR displays take.\n"
+              "scRGB: 16-bit float. Try it if HDR shows banding, which some NVIDIA drivers do "
+              "with 10-bit in fullscreen."));
+    INSERT(Settings, hdr_reference_white, tr("HDR Reference White"),
+           tr("Reference white in nits reported to the game, the brightness of its HUD and "
+              "menus. 0 (default): Windows' SDR content brightness for the monitor, so the game "
+              "matches the desktop; elsewhere the Switch 2 calibration, HDR Peak Luminance "
+              "divided by 1.5, rounded up and clamped to 50-300 nits.\n"
+              "SDR games and menus are shown at this brightness while HDR is active, and HDR "
+              "screenshots map it to SDR white."));
+    INSERT(Settings, hdr_peak_luminance, tr("HDR Peak Luminance"),
+           tr("Peak luminance in nits reported to the game, which tone maps to it. 0 (default): "
+              "the monitor's peak from its EDID as Windows reports it; elsewhere 300 nits, the "
+              "Switch 2 HDR calibration's starting value.\n"
+              "Also the HDR10 metadata peak, and what an HDR image rolls off to on an SDR "
+              "screen."));
     INSERT(Settings, renderer_backend, tr("API:"),
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
            tr("This setting selects the GPU to use (Vulkan only)."));
-    INSERT(Settings, vulkan_device_name, QString(), QString());
     INSERT(Settings, resolution_setup, tr("Resolution:"),
            tr("Forces to render at a different resolution.\n"
               "Higher resolutions require more VRAM and bandwidth.\n"
               "Options lower than 1X can cause artifacts."));
-    INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"), QString());
+    INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"),
+           tr("Bilinear while HDR output is active."));
     INSERT(Settings, game_dlss_network, tr("Use the game's own DLSS"),
            tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
               "instead of AMD FSR 3.1 in its place.\nAMD FSR 3.1 still draws while the network is "
               "checked, when it can't run on this GPU, with resolution scaling, and for the rest "
-              "of the session if its output fails Fritchii's checks.\nWith NVIDIA DLSS turned on "
-              "and available, NVIDIA DLSS is used instead.\nTakes effect when a game starts."));
+              "of the session if its output fails Lichii's checks.\nTakes effect when a game "
+              "starts."));
+    INSERT(Settings, frame_rate_limit, tr("Frame rate limit (Switch 2):"),
+           tr("Rate of the Switch 2 VSync event that games start their frames on (default 60 Hz)."
+              "\nAbove 60 Hz most games run too fast; use it with a game patch that follows real "
+              "time, such as \"FPS Unlock (built-in)\" for Ocarina of Time.\nTakes effect when a "
+              "game starts."));
     INSERT(Settings, fsr_sharpening_slider, tr("RCAS Sharpness:"),
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
               "of the AMD FSR 1 and SGSR window adapting filters."));
-    INSERT(Settings, nvidia_dlss_preset, tr("DLSS preset:"),
-           tr("The DLSS model. Automatic picks one for your card; K is the tested one, L and M "
-              "are NVIDIA's newer models, J the older one. Default lets NVIDIA choose per quality "
-              "mode. The status bar shows the model in use."));
+    INSERT(Settings, ocarina_fsr, tr("Use AMD FSR 3.1 upscaling in Ocarina of Time"),
+           tr("Replaces Ocarina of Time's native upscaler using scene depth and camera motion. "
+              "Works on any supported Vulkan GPU. NVIDIA DLSS takes precedence when enabled and "
+              "available. RCAS Sharpness controls sharpening. Takes effect when a game starts."));
+#if defined(__linux__) && !defined(__ANDROID__)
+    INSERT(Settings, amd_fsr4, tr("Use FSR 4 (fsr4-vk community Vulkan port) in place of FSR 3.1"),
+           tr("Uses fsr4-vk, a community Vulkan port of AMD's ML-based FSR 4.1.1 that Lichii's "
+              "x86-64 Linux packages include, where FSR replaces a game's upscaler (Ocarina of Time with "
+              "the setting above). It is not AMD's official FSR 4 and is not affiliated with or "
+              "endorsed by AMD. Radeon RX 6000 or newer, or an RDNA 3 Ryzen GPU, on Mesa's RADV "
+              "driver; RDNA 4 runs the FP8 network, older GPUs the INT8 one.\nIf FSR 4 can't run, "
+              "FSR 3.1 is used and the log says why. Takes effect when a game starts."));
+#else
+    INSERT(Settings, amd_fsr4, tr("Use AMD FSR 4 in place of FSR 3.1"),
+           tr("Uses AMD's ML-based FSR 4 where FSR replaces a game's upscaler (Ocarina of Time "
+              "with the setting above). Radeon RX 6000 or newer, or a Ryzen AI processor, with a "
+              "current AMD driver.\nNeeds AMD's FidelityFX runtime, which Lichii downloads from "
+              "AMD when you ask. The files are AMD's, under AMD's licence. Without them, or if FSR 4 "
+              "can't run, FSR 3.1 is used. Takes effect when a game starts."));
+#endif
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
-              "the NVIDIA app has downloaded it; Fritchii does not ship NVIDIA's files. Use the "
-              "download button below.\nFire Emblem: Fortune's Weave also needs "
-              "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
-              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
-    INSERT(Settings, nvidia_dlss_quality, tr("DLSS quality:"),
-           tr("Automatic picks the mode from the game's own resolution. Native (DLAA) keeps the "
-              "game's resolution and only smooths it. Other modes apply when they fit the game's "
-              "resolution, otherwise Automatic is used. Changes apply while playing."));
-    INSERT(Settings, oot_dlss_jitter, tr("DLSS jitter"),
-           tr("Tiny camera shifts each frame that DLSS uses for smoother edges. On by "
-              "default.\nTakes effect when the game starts."));
-    INSERT(Settings, oot_texture_sharpness, tr("Texture sharpness:"),
-           tr("Auto matches OoT's render and output sizes. Sharper goes half a step further. "
-              "Custom uses the LOD bias you set.\nTakes effect when the game starts."));
-    // Set by the picture menu's "Resolution" row (ConfigureGraphics::UpdatePictureMenu).
-    INSERT(Settings, oot_upscale_output, QString(), QString());
-    // Set by the picture menu's "Resolution" row while an upscaler is on.
-    INSERT(Settings, oot_render_height, QString(), QString());
-    INSERT(Settings, oot_lod_bias_custom, tr("LOD bias:"),
-           tr("Lower is sharper. Too low makes textures shimmer.\nTakes effect when the game "
+              "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
+              "download button below.\nIn Fire Emblem: Fortune's Weave it replaces the game's "
+              "DLSS while \"Use the game's own DLSS\" is off.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
+              "upscaler at 1x resolution scale.\nThe window adapting filter (the FSR 1, Bilinear "
+              "and similar button in the status bar) is separate and runs after DLSS. While DLSS "
+              "runs, the status bar shows DLSS, its mode and its preset. If DLSS fails, it stays "
+              "off until the game restarts and the log says why.\nTakes effect when a game "
               "starts."));
+    INSERT(Settings, nvidia_dlss_quality, tr("NVIDIA DLSS quality:"),
+           tr("Applies only when a game uses its own DLSS.\nAutomatic selects a mode for the "
+              "game's render/output sizes. Native (DLAA) "
+              "applies anti-aliasing at the game's render resolution, then scales to its output; "
+              "Ocarina's 1440p mode stays at 1440p instead of reconstructing to 4K.\n"
+              "In The Legend of Zelda: Ocarina of Time (docked, with the Max Resolution add-on), "
+              "Balanced, Performance and Ultra Performance lower the game's render resolution "
+              "from 2560x1440 to 2276x1280, 1920x1080 and 1280x720 before DLSS reconstructs 4K. "
+              "That resolution changes when the game starts.\n"
+              "In other games, explicit modes only apply when the game's render size is within "
+              "NVIDIA's supported range; otherwise Automatic is used and the fallback is logged. "
+              "There they don't change the game's render resolution. Apply/OK updates the mode "
+              "while playing."));
+    INSERT(
+        Settings, nvidia_dlss_preset, tr("NVIDIA DLSS model preset:"),
+        tr("Applies only when a game uses its own DLSS.\nM (DLSS 4.5) is Lichii's default for "
+           "every quality mode. NVIDIA recommends K for "
+           "DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.\n"
+           "L/M cost more on RTX 20/30 GPUs; consider K. J may reduce ghosting but flicker more. "
+           "E/F are deprecated CNN models. NVIDIA default lets the runtime choose.\n"
+           "L/M require DLSS 310.5 or newer; the download button provides 310.9.16. "
+           "If Fire Emblem shows horizontal lines with L/M at 2x, try K. "
+           "NVIDIA app overrides may supersede this choice. Apply/OK updates it while playing."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
-              "can produce a more stable picture in lower resolutions."));
-    INSERT(Settings, oot_movie_upscale, tr("Ocarina of Time movies:"),
-           tr("How the title screen and cutscene videos are scaled up.\nGame's own upscaler: the "
-              "game's video upscaler, which removes banding and sharpens. Fast on NVIDIA RTX, slow "
-              "on GPUs that emulate its math.\nBilinear: a plain, fast stretch.\nAutomatic: the "
-              "game's upscaler where the GPU runs it natively, bilinear elsewhere."));
+              "can produce a more stable picture in lower resolutions.\nOff while HDR output "
+              "is active."));
     INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
            tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
               "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
-              "without the network (faster; pairs well with a higher resolution).\nAMD FSR 3.1: "
-              "AMD's upscaler in place of the game's, on any GPU. RCAS Sharpness sets its "
-              "sharpening.\nAMD FSR 4: AMD's newer upscaler on Radeon RX 6000 or newer and Ryzen "
-              "AI GPUs, with AMD's files (download below). Without them, FSR 3.1 runs.\nWith Game "
-              "or No sharpening, NVIDIA DLSS replaces the game's upscaler while its setting is "
-              "on.\nTakes effect when the game starts."));
+              "without the network (faster; pairs well with a higher resolution). Has no effect while "
+              "NVIDIA DLSS is on.\nTakes effect when the game starts."));
     INSERT(Settings, post_shader_chain, QString(), QString());
     INSERT(Settings, post_shader_preset, QString(), QString());
     INSERT(Settings, post_shader_enabled, tr("Enable post-processing effects"),
@@ -247,6 +301,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, skip_cpu_inner_invalidation, tr("Skip CPU Inner Invalidation"),
            tr("Skips certain cache invalidations during memory updates, reducing CPU usage and "
               "improving latency. This may cause soft-crashes."));
+    INSERT(Settings, fps_limit, tr("FPS Limit"),
+           tr("Caps how often the game presents, so the game itself runs at this rate. 0 leaves "
+              "the frame rate to the game and the display."));
     INSERT(Settings, vsync_mode, tr("VSync Mode:"),
            tr("FIFO (VSync) does not drop frames or exhibit tearing but is limited by the screen "
               "refresh rate.\nFIFO Relaxed allows tearing as it recovers from a slow down.\n"
@@ -256,6 +313,26 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_red, QString(), QString());
     INSERT(Settings, bg_green, QString(), QString());
     INSERT(Settings, bg_blue, QString(), QString());
+
+    INSERT(Settings, frame_gen, tr("Enable Frame Generation"),
+           tr("Generates intermediate frames for smoother motion. Requires Vulkan.\n"
+              "Optical Flow Interpolation is built in. LSFG requires Lossless.dll in the "
+              "user directory's lossless folder."));
+    INSERT(Settings, frame_gen_type, tr("Frame Generation Type"),
+           tr("Optical Flow Interpolation is built in and runs on any GPU.\nNVIDIA DLSS Frame "
+              "Generation (Windows only) needs a GeForce RTX 40 series or newer GPU (3x and 4x need "
+              "an RTX 50 series), Hardware-accelerated GPU scheduling on in Windows' graphics "
+              "settings, \"Use NVIDIA DLSS\" on and NVIDIA's files from the NVIDIA DLSS panel. "
+              "It takes the game's depth and motion vectors from the DLSS evaluation, so it runs "
+              "in The Legend of Zelda: Ocarina of Time only, docked, with DLSS as its upscaler. "
+              "Other games, and scRGB HDR output, use Optical Flow Interpolation instead.\nVSync "
+              "is off while it runs. Choosing it takes effect when a game starts."));
+    INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
+    INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());
+    INSERT(Settings, frame_gen_flow_scale_auto, tr("Auto Flow Scale"), QString());
+    INSERT(Settings, frame_gen_flow_scale, tr("Flow Scale"), QString());
+    INSERT(Settings, frame_gen_queue_target, tr("Queue Target"), QString());
+    INSERT(Settings, frame_gen_dump_flow, tr("Dump Optical Flow"), QString());
 
     // Renderer (Advanced Graphics)
     INSERT(Settings, use_asynchronous_gpu_emulation, QString(), QString());
@@ -285,10 +362,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "the GPU after each dispatch.\nAuto marks what the shader's stores can reach and "
               "falls back to Full when that cannot be proven.\nFull marks the whole binding (up to "
               "8 MiB), the original behaviour: it can delay the game's own writes to nearby memory "
-              "(flickering effects) and copy far more data back from the GPU.\n64 KiB cap marks at "
-              "most 64 KiB, which can miss data a large dispatch really wrote."));
-    INSERT(Settings, use_asynchronous_shaders, tr("Enable asynchronous shader compilation"),
-           tr("May reduce shader stutter."));
+              "(flickering effects) and copy far more data back from the GPU."));
+    INSERT(Settings, use_asynchronous_shaders,
+           tr("Don't wait for shaders that are still compiling"),
+           tr("On (default): a draw or compute pass whose shader is still compiling is skipped "
+              "for a few frames, so a new shader costs a brief pop-in instead of a freeze.\nOff "
+              "(accurate): the game waits for every shader, so nothing is ever missing, but each "
+              "new shader can freeze the game for up to a few seconds."));
     INSERT(Settings, gpu_clock, tr("GPU Clocks"),
            tr("Makes the game believe GPU work finishes faster than it does, so it stops lowering "
               "resolution and render distance to fit the Switch's clocks."));
@@ -308,22 +388,43 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Determines the number of depth slices processed in a single dispatch.\n"
               "Increasing this can improve throughput on high-end GPUs but may cause TDR or driver "
               "timeouts on weaker hardware."));
+    INSERT(Settings, pin_gpu_threads, tr("Pin GPU threads to their own cores"),
+           tr("Pins the emulator's GPU threads to dedicated physical CPU cores and keeps the "
+              "emulated CPU cores off them.\n"
+              "Can hurt performance on CPUs with few cores. Skipped on CPUs with fewer than 6 "
+              "physical performance cores.\n"
+              "Windows and Linux only. Takes effect when a game starts."));
 
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
-    INSERT(Settings, use_graphics_pipeline_library,
-           tr("Shader libraries (faster first-time shader builds)"),
-           tr("Builds each shader stage once and links them into pipelines, so new shaders "
-              "cause shorter stutters.\nUsed on NVIDIA and AMD GPUs. The graphics half of the "
-              "shader warm-up (Prepare shaders in the game list) needs it.\nTakes effect after "
-              "restarting the game."));
-    INSERT(Settings, shader_warm_threads, tr("Shader warm-up threads:"),
-           tr("CPU threads the shader warm-up uses (low priority). More threads finish the "
-              "warm-up sooner. It builds only while the game is paused, or from Emulation, "
-              "Prepare Shaders Now, when it shares the CPU with the game.\nTakes effect at the "
-              "next game start."));
+    INSERT(Settings, precache_shaders, tr("Precache shaders before game start:"),
+           tr("Builds shaders on the loading screen, on every CPU thread, so they don't stutter "
+              "the first time the game uses them: the compute shaders found in the game files. "
+              "The first launch reads the game files and takes a few minutes; later launches "
+              "only build what is new, until the GPU driver changes. The loading screen has a "
+              "Skip button.\nAsk asks at launch while the game has never been precached."));
+    INSERT(Settings, build_all_cached_shaders, tr("Build all cached shaders before game start"),
+           tr("Builds every shader saved by earlier play sessions on the loading screen and keeps "
+              "them built, so places you visited long ago don't stutter. Without it, only the "
+              "shaders of recent sessions are built there and the rest in the background or when "
+              "the game first needs them.\nLoading takes longer and uses more memory, about 0.3 "
+              "MB per shader, up to a quarter of the RAM. Takes effect when a game starts."));
+    INSERT(Settings, native_async_draws, tr("Switch 2 draws and compute with unbuilt shaders:"),
+           tr("Only applies when \"Don't wait for shaders that are still compiling\" is on. Decides "
+              "what Switch 2 work does when its pipeline is still building. Only work that redraws "
+              "what an earlier frame drew can be skipped: draws that are depth-tested into a "
+              "target drawn before, and compute passes whose outputs the GPU wrote before. Other "
+              "work always waits, so nothing drawn or computed once goes missing.\n"
+              "Wait stalls the GPU until the pipeline is ready (no missing effects, but long "
+              "stalls on new content). Skip drops that work, which can leave an effect missing "
+              "for a few frames. Bounded (default) waits up to the time below per frame, then "
+              "skips. The EDEN_NX2_ASYNC_DISCARD=1 environment variable still forces Skip."));
+    INSERT(Settings, native_pipeline_wait_ms, tr("Pipeline wait per frame (ms):"),
+           tr("Used by the Bounded mode: the most time per frame that Switch 2 draws and compute "
+              "passes may wait in total for pipelines that are still building. Once spent, the "
+              "remaining unbuilt work of that frame that can be skipped is skipped."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "
@@ -335,25 +436,30 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, use_video_framerate, tr("Sync to framerate of video playback"),
            tr("Run the game at normal speed during video playback, even when the framerate is "
               "unlocked."));
-    INSERT(Settings, oot_30fps, tr("Ocarina of Time: 30 FPS mode (lower-end PCs)"),
-           tr("Caps Ocarina of Time at 30 FPS. The game keeps its normal speed. Takes effect at "
-              "once; the 60 FPS / 30 FPS button in the status bar switches it too."));
-    INSERT(Settings, oot_high_refresh, QString(), QString());
-    INSERT(Settings, occlusion_speedup, tr("OoT occlusion speed-up:"),
-           tr("Lets OoT skip slow GPU checks for hidden things.\nFull skips more and can give more "
-              "fps on AMD cards.\nTakes effect when the game starts."));
-    INSERT(Settings, oot_high_refresh_cap, tr("OoT: high refresh rate (experimental)"),
-           tr("Lets Ocarina of Time run above 60 FPS, up to the chosen cap, at its normal speed. "
-              "Untested in much of the game: timers, cutscenes or minigames may run off. Takes "
-              "effect at once; Ctrl+U switches it while you play. The 30 FPS mode overrides "
-              "it."));
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
+              "Takes effect after restarting the game."));
+    INSERT(Settings, mkw_60fps, tr("Mario Kart World: 60 FPS mode"),
+           tr("Forces the game's 60 FPS mode everywhere, not only in cutscenes. The game "
+              "advances one 60 FPS step per frame, so it never runs fast. Takes effect after "
+              "restarting the game and takes precedence over the 30 FPS mode."));
+    INSERT(Settings, mkw_60fps_fallback, tr("Mario Kart World: drop to 30 FPS when slow"),
+           tr("Only applies with the 60 FPS mode. When your PC can't hold 60 FPS, the game "
+              "switches to its 30 FPS mode and keeps normal speed, then tries 60 again every few "
+              "seconds. Turn it off to stay at 60 FPS, where slow frames play in slow motion. "
               "Takes effect after restarting the game."));
     INSERT(Settings, mkw_dynamic_fps, tr("Mario Kart World: dynamic FPS (experimental)"),
            tr("Lets the game adjust between 30 and 60 FPS using whole-frame timing to maintain "
               "normal game speed. Takes effect after restarting the game and takes precedence over "
               "the 30 FPS mode."));
+    INSERT(Settings, hyrule_dynamic_fps,
+           tr("Hyrule Warriors: Age of Imprisonment: dynamic FPS (experimental)"),
+           tr("Drops to 30 FPS with the game's split-screen time step while the game runs below "
+              "about 50 FPS, so heavy slowdowns don't slow down the game, and tries 60 FPS again "
+              "every few seconds."));
+    INSERT(Settings, hyrule_30fps, tr("Hyrule Warriors: Age of Imprisonment: 30 FPS mode"),
+           tr("Always runs at 30 FPS with the game's split-screen time step, at normal game speed. "
+              "Takes precedence over dynamic FPS."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
@@ -375,8 +481,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Native uses the GPU's mesh shaders. Compute Fallback emulates them with compute "
               "shaders: it can be slower in scenes with a lot of foliage, and it can't draw every "
               "kind of mesh program.\n"
-              "Automatic uses the compute fallback on AMD GPUs, where native mesh shaders can hang "
-              "the GPU, and native mesh shaders everywhere else."));
+              "Automatic uses the compute fallback on AMD RDNA2 GPUs (RX 6000 series), where "
+              "native mesh shaders hang the GPU, and native mesh shaders everywhere else."));
 
     INSERT(
         Settings, sample_shading, tr("Sample Shading"),
@@ -479,12 +585,20 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(SpirvOptimizeMode, Always, tr("Always")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Index(),
-                          {PAIR(NvidiaDlssQuality, Automatic, tr("Automatic")),
+                          {PAIR(NvidiaDlssQuality, Automatic, tr("Automatic (game resolution)")),
                            PAIR(NvidiaDlssQuality, Native, tr("Native (DLAA)")),
                            PAIR(NvidiaDlssQuality, Quality, tr("Quality")),
                            PAIR(NvidiaDlssQuality, Balanced, tr("Balanced")),
                            PAIR(NvidiaDlssQuality, Performance, tr("Performance")),
                            PAIR(NvidiaDlssQuality, UltraPerformance, tr("Ultra Performance"))}});
+    translations->insert(
+        {Settings::EnumMetadata<Settings::NvidiaDlssPreset>::Index(),
+         {PAIR(NvidiaDlssPreset, M, tr("M (DLSS 4.5, default)")),
+          PAIR(NvidiaDlssPreset, NvidiaDefault, tr("NVIDIA default")),
+          PAIR(NvidiaDlssPreset, E, tr("E (legacy CNN)")),
+          PAIR(NvidiaDlssPreset, F, tr("F (legacy CNN)")),
+          PAIR(NvidiaDlssPreset, J, tr("J (DLSS 4)")), PAIR(NvidiaDlssPreset, K, tr("K (DLSS 4)")),
+          PAIR(NvidiaDlssPreset, L, tr("L (DLSS 4.5)"))}});
     translations->insert({Settings::EnumMetadata<Settings::AstcDecodeMode>::Index(),
                           {
                               PAIR(AstcDecodeMode, Cpu, tr("CPU")),
@@ -535,7 +649,6 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(NativeComputeWriteMark, Auto, tr("Auto (shader extent)")),
                               PAIR(NativeComputeWriteMark, Full, tr("Full binding")),
-                              PAIR(NativeComputeWriteMark, Cap64K, tr("64 KiB cap")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::GpuFenceBehavior>::Index(),
                           {
@@ -586,9 +699,14 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
              PAIR(ResolutionSetup, Res7X, tr("7X (5040p/7560p)")),
              PAIR(ResolutionSetup, Res8X, tr("8X (5760p/8640p)")),
          }});
+    translations->insert({Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+                          {
+                              PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
+                              PAIR(FrameGenType, Fsr3, tr("Optical Flow Interpolation (built-in)")),
+                              PAIR(FrameGenType, NvidiaDlssG, tr("NVIDIA DLSS Frame Generation")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                           {
-                              PAIR(ScalingFilter, Auto, tr("Auto (recommended)")),
                               PAIR(ScalingFilter, NearestNeighbor, tr("Nearest Neighbor")),
                               PAIR(ScalingFilter, Bilinear, tr("Bilinear")),
                               PAIR(ScalingFilter, Bicubic, tr("Bicubic")),
@@ -612,53 +730,21 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(AntiAliasing, Fxaa, tr("FXAA")),
                               PAIR(AntiAliasing, Smaa, tr("SMAA")),
                           }});
-    translations->insert({Settings::EnumMetadata<Settings::DlssPreset>::Index(),
-                          {
-                              PAIR(DlssPreset, Auto, tr("Automatic")),
-                              PAIR(DlssPreset, Default, tr("Default (NVIDIA's choice)")),
-                              PAIR(DlssPreset, J, tr("J")),
-                              PAIR(DlssPreset, K, tr("K (recommended)")),
-                              PAIR(DlssPreset, L, tr("L")),
-                              PAIR(DlssPreset, M, tr("M")),
-                          }});
-    translations->insert({Settings::EnumMetadata<Settings::HybridCpuPlacement>::Index(),
-                          {
-                              PAIR(HybridCpuPlacement, Automatic, tr("Automatic")),
-                              PAIR(HybridCpuPlacement, PinGpu, tr("Pin GPU to P-cores")),
-                          }});
-    translations->insert({Settings::EnumMetadata<Settings::OotMovieUpscale>::Index(),
-                          {
-                              PAIR(OotMovieUpscale, Automatic, tr("Automatic")),
-                              PAIR(OotMovieUpscale, Bilinear, tr("Bilinear (fast)")),
-                              PAIR(OotMovieUpscale, Game, tr("Game's own upscaler")),
-                          }});
     translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
                           {
                               PAIR(OotAntiAliasing, Game, tr("Game")),
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
-                              PAIR(OotAntiAliasing, Fsr3, tr("AMD FSR 3.1")),
-                              PAIR(OotAntiAliasing, Fsr4, tr("AMD FSR 4")),
                           }});
-    translations->insert({Settings::EnumMetadata<Settings::OcclusionSpeedup>::Index(),
+    translations->insert({Settings::EnumMetadata<Settings::HdrMode>::Index(),
                           {
-                              PAIR(OcclusionSpeedup, Off, tr("Off")),
-                              PAIR(OcclusionSpeedup, Standard, tr("Standard")),
-                              PAIR(OcclusionSpeedup, Full, tr("Full")),
+                              PAIR(HdrMode, Off, tr("Off")),
+                              PAIR(HdrMode, Auto, tr("Auto")),
+                              PAIR(HdrMode, On, tr("On")),
                           }});
-    translations->insert({Settings::EnumMetadata<Settings::OotRefreshCap>::Index(),
+    translations->insert({Settings::EnumMetadata<Settings::HdrSwapchain>::Index(),
                           {
-                              PAIR(OotRefreshCap, Display, tr("Monitor refresh rate")),
-                              PAIR(OotRefreshCap, Hz90, tr("90 FPS")),
-                              PAIR(OotRefreshCap, Hz120, tr("120 FPS")),
-                              PAIR(OotRefreshCap, Hz144, tr("144 FPS")),
-                              PAIR(OotRefreshCap, Hz165, tr("165 FPS")),
-                              PAIR(OotRefreshCap, Unlimited, tr("Unlimited (can crash with VSync off)")),
-                          }});
-    translations->insert({Settings::EnumMetadata<Settings::OotTextureSharpness>::Index(),
-                          {
-                              PAIR(OotTextureSharpness, Auto, tr("Auto")),
-                              PAIR(OotTextureSharpness, Sharper, tr("Sharper")),
-                              PAIR(OotTextureSharpness, Custom, tr("Custom")),
+                              PAIR(HdrSwapchain, Hdr10, tr("HDR10 (10-bit)")),
+                              PAIR(HdrSwapchain, Scrgb, tr("scRGB (16-bit float)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {
@@ -778,13 +864,24 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(MemoryLayout, Memory_6Gb, tr("6GB DRAM (Unsafe)")),
                               PAIR(MemoryLayout, Memory_8Gb, tr("8GB DRAM")),
                               PAIR(MemoryLayout, Memory_10Gb, tr("10GB DRAM (Unsafe)")),
-                              // Switch 2 games use it on their own while they run (core.cpp): not "unsafe" for them.
-                              PAIR(MemoryLayout, Memory_12Gb, tr("12GB DRAM (Switch 2)")),
+                              PAIR(MemoryLayout, Memory_12Gb, tr("12GB DRAM (Unsafe)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::ConsoleMode>::Index(),
                           {
                               PAIR(ConsoleMode, Docked, tr("Docked")),
                               PAIR(ConsoleMode, Handheld, tr("Handheld")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::PrecacheShaders>::Index(),
+                          {
+                              PAIR(PrecacheShaders, Off, tr("Off")),
+                              PAIR(PrecacheShaders, Ask, tr("Ask")),
+                              PAIR(PrecacheShaders, Always, tr("Always")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::NativeAsyncDraws>::Index(),
+                          {
+                              PAIR(NativeAsyncDraws, Wait, tr("Wait")),
+                              PAIR(NativeAsyncDraws, Bounded, tr("Bounded wait")),
+                              PAIR(NativeAsyncDraws, Skip, tr("Skip")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::CpuClock>::Index(),
                           {

@@ -183,7 +183,7 @@ public:
             .raw_value = input_engine->GetAxis(identifier, axis_y),
             .properties = properties_y,
         };
-        // This is a workaround to keep compatibility with old emulator versions. Vertical axis is
+        // This is a workaround to keep compatibility with old yuzu versions. Vertical axis is
         // inverted on SDL compared to Nintendo
         if (invert_axis_y) {
             status.y.raw_value = -status.y.raw_value;
@@ -819,6 +819,10 @@ public:
 
     bool IsVibrationEnabled() override {
         return input_engine->IsVibrationEnabled(identifier);
+    }
+
+    bool IsVibrationStreamed() override {
+        return input_engine->IsVibrationStreamed(identifier);
     }
 
     Common::Input::DriverResult SetPollingMode(Common::Input::PollingMode polling_mode) override {

@@ -5,11 +5,10 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <filesystem>
-#include <map>
-#include <optional>
-#include <string_view>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -17,11 +16,16 @@
 #include "common/settings_common.h"
 #include "common/settings_enums.h"
 #include "config.h"
-#include "core/file_sys/patch_manager.h"
 #include "frontend_common/profile_import.h"
 
 #ifdef _WIN32
+#include <io.h>
+#include <process.h>
 #include "common/string_util.h"
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #include <boost/algorithm/string/replace.hpp>
@@ -83,25 +87,93 @@ void Config::WriteToIni() const {
         break;
     }
     LOG_INFO(Config, "Writing {} configuration to: {}", config_type, config_loc);
-    FILE* fp = nullptr;
-#ifdef _WIN32
-    fp = _wfopen(Common::UTF8ToUTF16W(config_loc).data(), L"wb");
-#else
-    fp = fopen(config_loc.c_str(), "wb");
-#endif
 
+    // The config is written to a temporary file beside it, which replaces it only after a complete
+    // write: a process that ends during the save keeps the old config. A config behind a symlink
+    // is written at the link's target, and a config that exists but can't be written is kept.
+    std::error_code error;
+    std::filesystem::path target{FS::ToU8String(config_loc)};
+    for (int links = 0; links < 40 && std::filesystem::is_symlink(target, error); ++links) {
+        const std::filesystem::path link = std::filesystem::read_symlink(target, error);
+        if (error) {
+            break;
+        }
+        target = link.is_absolute() ? link : target.parent_path() / link;
+    }
+#ifdef _WIN32
+    const bool writable = _waccess(target.c_str(), 2) == 0;
+#else
+    const bool writable = access(target.c_str(), W_OK) == 0;
+#endif
+    if (!writable && errno != ENOENT) {
+        LOG_ERROR(Frontend, "Config file could not be saved: it can't be written");
+        return;
+    }
+    // A name of its own per save, created exclusively and owner-only, so overlapping saves don't
+    // write into each other's file and the contents are never readable by others.
+    // A name left by an earlier process with the same id is skipped, not removed.
+    static std::atomic<unsigned> save_serial{};
+    std::filesystem::path temporary;
+    FILE* fp = nullptr;
+    for (int attempt = 0; attempt < 16 && fp == nullptr; ++attempt) {
+        temporary = target;
+#ifdef _WIN32
+        temporary += fmt::format(".tmp.{}.{}", _getpid(), save_serial++);
+        fp = _wfopen(temporary.c_str(), L"wbx");
+#else
+        temporary += fmt::format(".tmp.{}.{}", getpid(), save_serial++);
+        const int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        fp = fd < 0 ? nullptr : fdopen(fd, "wb");
+        if (fd >= 0 && fp == nullptr) {
+            close(fd);
+            std::filesystem::remove(temporary, error);
+            break;
+        }
+#endif
+        if (fp == nullptr && errno != EEXIST) {
+            break;
+        }
+    }
     if (fp == nullptr) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
         return;
     }
 
     CSimpleIniA::FileWriter writer(fp);
-    const SI_Error rc = config->Save(writer, false);
-    fclose(fp);
-    if (rc < 0) {
+    // FileWriter ignores fputs errors, so the stream's error flag is checked too
+    const bool written = config->Save(writer, false) >= 0 && !std::ferror(fp);
+    const bool closed = std::fclose(fp) == 0;
+    if (!written || !closed) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
-    } else if (on_written) {
-        on_written(*this);
+        std::filesystem::remove(temporary, error);
+        return;
+    }
+    const auto status = std::filesystem::status(target, error);
+    if (!error && std::filesystem::exists(status)) {
+#ifndef _WIN32
+        // The replacement keeps the config's group, so the mode copied below means the same. If the
+        // group can't be kept, the replacement is owner-only rather than open to another group.
+        auto permissions = status.permissions();
+        struct stat target_stat {};
+        if (stat(target.c_str(), &target_stat) != 0 ||
+            chown(temporary.c_str(), static_cast<uid_t>(-1), target_stat.st_gid) != 0) {
+            permissions &= std::filesystem::perms::owner_all;
+        }
+#else
+        const auto permissions = status.permissions();
+#endif
+        std::filesystem::permissions(temporary, permissions, error);
+        if (error) {
+            LOG_ERROR(Frontend, "Config file could not be saved: {}", error.message());
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    // Replaces the target if it exists (MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows)
+    std::filesystem::rename(temporary, target, error);
+    if (error) {
+        LOG_ERROR(Frontend, "Config file could not be saved: {}", error.message());
+        std::filesystem::remove(temporary, error);
     }
 }
 
@@ -109,6 +181,13 @@ void Config::SetUpIni() {
     config = std::make_unique<CSimpleIniA>();
     config->SetUnicode(true);
     config->SetSpaces(false);
+
+#ifndef __ANDROID__
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(FS::ToU8String(config_loc), error);
+    const bool new_global_config = global && status.type() == std::filesystem::file_type::not_found &&
+                                   (!error || error == std::errc::no_such_file_or_directory);
+#endif
 
     FILE* fp = nullptr;
 #ifdef _WIN32
@@ -128,10 +207,27 @@ void Config::SetUpIni() {
         return;
     }
 
-    if (SI_Error rc = config->LoadFile(fp); rc < 0) {
-        LOG_ERROR(Frontend, "Config file could not be loaded!");
-    }
+    const SI_Error rc = config->LoadFile(fp);
     fclose(fp);
+    if (rc < 0) {
+        LOG_ERROR(Frontend, "Config file could not be loaded!");
+        return;
+    }
+
+#ifndef __ANDROID__
+    if (new_global_config) {
+        BeginGroup(Settings::TranslateCategory(Settings::Category::Renderer));
+        const auto seed = [this](const Settings::BasicSetting& setting, const std::string& value) {
+            WriteStringSetting(setting.GetLabel(), value);
+            WriteBooleanSetting(setting.GetLabel() + "\\default", false);
+        };
+        seed(Settings::values.scaling_filter, ToString(u32(Settings::ScalingFilter::Fsr3)));
+        seed(Settings::values.gpu_accuracy, ToString(u32(Settings::GpuAccuracy::Low)));
+        seed(Settings::values.nvdec_emulation, ToString(u32(Settings::NvdecEmulation::Gpu)));
+        seed(Settings::values.async_presentation, ToString(true));
+        EndGroup();
+    }
+#endif
 }
 
 bool Config::IsCustomConfig() const {
@@ -354,144 +450,6 @@ void Config::ReadDisabledAddOnValues() {
     EndGroup();
 }
 
-namespace {
-constexpr u64 OcarinaOfTimeId = 0x0400486024DEC000ULL;
-constexpr std::string_view MaxResolutionName = "Max Resolution (built-in)";
-
-// The mods on disk now, per title: load/<title>/ folders and cheat_ files, and "SDMC" for the SD
-// card's atmosphere/contents/<title>/ (the names FileSys::PatchManager lists them by).
-std::map<u64, std::vector<std::string>> ModsOnDisk() {
-    std::map<u64, std::vector<std::string>> out;
-    const auto parse_title = [](const std::filesystem::path& path) -> std::optional<u64> {
-        const std::string name = FS::PathToUTF8String(path.filename());
-        if (name.size() != 16 ||
-            !std::ranges::all_of(name, [](char c) { return std::isxdigit(u8(c)) != 0; })) {
-            return std::nullopt;
-        }
-        return std::stoull(name, nullptr, 16);
-    };
-    std::error_code error;
-    for (const auto& title : std::filesystem::directory_iterator(
-             FS::GetEdenPath(FS::EdenPath::LoadDir), error)) {
-        const auto title_id = parse_title(title.path());
-        if (!title_id || !title.is_directory(error)) {
-            continue;
-        }
-        std::error_code inner;
-        for (const auto& mod : std::filesystem::directory_iterator(title.path(), inner)) {
-            std::string name = FS::PathToUTF8String(mod.path().filename());
-            if (mod.is_directory(inner) || name.starts_with("cheat_")) {
-                out[*title_id].push_back(std::move(name));
-            }
-        }
-    }
-    for (const auto& title : std::filesystem::directory_iterator(
-             FS::GetEdenPath(FS::EdenPath::SDMCDir) / "atmosphere" / "contents", error)) {
-        if (const auto title_id = parse_title(title.path());
-            title_id && title.is_directory(error) &&
-            !std::filesystem::is_empty(title.path(), error)) {
-            out[*title_id].emplace_back("SDMC");
-        }
-    }
-    return out;
-}
-} // Anonymous namespace
-
-// New mods start disabled (FileSys::PatchManager): the add-on names Fritchii has seen per title.
-// The first time a config is read by such a build, tracking starts:
-// - a config used before (Frizti's config/frizti.ini, a disabled list or a tuned settings
-//   revision): every mod on disk now is seen and keeps its state, as the player chose them;
-// - a new config: nothing is seen, so every mod there starts disabled when first listed.
-// Max Resolution (built-in) is off by default (owner 2026-11-18): a new config starts with it
-// disabled; a config used before keeps its state (Fritchii's one-time v6 prompt covers those).
-// Once seen, the player's choice for any add-on sticks. The other built-ins, game updates and
-// DLC are never on this list.
-void Config::ReadSeenAddOnValues() {
-    const auto lock = FileSys::PatchManager::LockAddOns();
-    BeginGroup(std::string("SeenAddOns"));
-    const bool tracking = ReadBooleanSetting(std::string("tracking"));
-    Settings::values.seen_addons.clear();
-    const int size = BeginArray(std::string(""));
-    for (int i = 0; i < size; ++i) {
-        SetArrayIndex(i);
-        const auto title_id = ReadUnsignedIntegerSetting(std::string("title_id"), 0);
-        std::vector<std::string> out;
-        const int s_size = BeginArray("seen");
-        for (int j = 0; j < s_size; ++j) {
-            SetArrayIndex(j);
-            out.push_back(ReadStringSetting(std::string("s"), std::string("")));
-        }
-        EndArray(); // seen
-        Settings::values.seen_addons.insert_or_assign(title_id, std::move(out));
-    }
-    EndArray();
-    EndGroup();
-
-    if (!tracking) {
-        const bool used_before =
-            FS::Exists(FS::GetEdenPath(FS::EdenPath::ConfigDir) / "frizti.ini") ||
-            !Settings::values.disabled_addons.empty() ||
-            Settings::values.frizti_settings_revision.GetValue() > 0;
-        auto& oot_seen = Settings::values.seen_addons[OcarinaOfTimeId];
-        if (used_before) {
-            std::size_t mods = 0;
-            for (auto& [title_id, names] : ModsOnDisk()) {
-                auto& seen = Settings::values.seen_addons[title_id];
-                for (auto& name : names) {
-                    if (std::ranges::find(seen, name) == seen.end()) {
-                        seen.push_back(std::move(name));
-                        ++mods;
-                    }
-                }
-            }
-            LOG_INFO(Config, "Mods: new mods start disabled from now on; the {} already there "
-                             "keep their state", mods);
-        } else {
-            auto& disabled = Settings::values.disabled_addons[OcarinaOfTimeId];
-            if (std::ranges::find(disabled, MaxResolutionName) == disabled.end()) {
-                disabled.emplace_back(MaxResolutionName);
-            }
-            LOG_INFO(Config, "Mods: new config, every mod starts disabled (Max Resolution too)");
-        }
-        if (std::ranges::find(oot_seen, MaxResolutionName) == oot_seen.end()) {
-            oot_seen.emplace_back(MaxResolutionName);
-        }
-    }
-    Settings::values.seen_addons_tracking = true;
-}
-
-void Config::SaveSeenAddOnValues() {
-    BeginGroup(std::string("SeenAddOns"));
-    WriteBooleanSetting(std::string("tracking"), Settings::values.seen_addons_tracking);
-    int i = 0;
-    BeginArray(std::string(""));
-    for (const auto& [title_id, names] : Settings::values.seen_addons) {
-        SetArrayIndex(i);
-        WriteIntegerSetting(std::string("title_id"), title_id, std::make_optional(u64(0)));
-        BeginArray(std::string("seen"));
-        for (std::size_t j = 0; j < names.size(); ++j) {
-            SetArrayIndex(int(j));
-            WriteStringSetting(std::string("s"), names[j], std::make_optional(std::string("")));
-        }
-        EndArray(); // seen
-        ++i;
-    }
-    EndArray();
-    EndGroup();
-}
-
-void Config::SaveAddOnValues() {
-    if (!global) {
-        return;
-    }
-    {
-        const auto lock = FileSys::PatchManager::LockAddOns();
-        SaveDisabledAddOnValues();
-        SaveSeenAddOnValues();
-    }
-    WriteToIni();
-}
-
 void Config::ReadMiscellaneousValues() {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Miscellaneous));
 
@@ -584,10 +542,6 @@ void Config::ReadValues() {
     ReadRendererValues();
     ReadAudioValues();
     ReadSystemValues();
-    if (global) {
-        // After the data paths, the disabled list and the tuned settings revision it looks at.
-        ReadSeenAddOnValues();
-    }
 }
 
 void Config::SavePlayerValues(const std::size_t player_index) {
@@ -670,11 +624,7 @@ void Config::SaveValues() {
     if (global) {
         LOG_DEBUG(Config, "Saving global generic configuration values");
         SaveDataStorageValues();
-        {
-            const auto lock = FileSys::PatchManager::LockAddOns();
-            SaveDisabledAddOnValues();
-            SaveSeenAddOnValues();
-        }
+        SaveDisabledAddOnValues();
         SaveWebServiceValues();
         SaveMiscellaneousValues();
     } else {

@@ -35,6 +35,7 @@ public:
         // Cleared on the next read: the texture cache invalidates every channel's tables for
         // each image it deletes, dozens of times a frame while its collector runs.
         invalidated = true;
+        ++changes;
     }
 
     std::span<Id> LiveBoundIds() noexcept {
@@ -54,16 +55,8 @@ public:
         // This runs for every texture and sampler of every draw. An entry within one page is
         // contiguous in host memory, so a single page lookup replaces the generic block read.
         const bool one_page =
-            (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
-        const auto page_pointer = [&]() -> const u8* {
-            // Tegra::MemoryManager (EDEN_NX2_HANDLE_PTR_CACHE); test memories have GetPointer only.
-            if constexpr (requires { gpu_memory.GetPointerForDescriptor(gpu_addr); }) {
-                return gpu_memory.GetPointerForDescriptor(gpu_addr);
-            } else {
-                return gpu_memory.GetPointer(gpu_addr);
-            }
-        };
-        if (const u8* const host = one_page ? page_pointer() : nullptr) {
+            (gpu_addr & Core::Memory::LICHII_PAGEMASK) + sizeof(T) <= Core::Memory::LICHII_PAGESIZE;
+        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
             std::memcpy(std::addressof(result.first), host, sizeof(T));
         } else {
             gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
@@ -83,6 +76,7 @@ public:
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
         current_gpu_addr = gpu_addr;
         current_limit = limit;
+        ++changes;
         // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
         // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
         const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
@@ -100,6 +94,9 @@ public:
     GPUVAddr current_gpu_addr{};
     u32 current_limit{};
     bool invalidated{}; ///< read_descriptors is to be cleared before the next read
+    /// Bumped by every Invalidate and Refresh: the ids and descriptors read before are only good
+    /// while it stays the same.
+    u64 changes{};
 
 private:
     void ClearReadDescriptors() noexcept {

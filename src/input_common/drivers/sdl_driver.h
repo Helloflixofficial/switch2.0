@@ -7,6 +7,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include "common/container/unordered_map.h"
@@ -22,6 +24,9 @@ union SDL_Event;
 namespace InputCommon {
 
 class SDLJoystick;
+#ifdef HAVE_SWITCH2_BLE
+class Switch2Ble;
+#endif
 
 using ButtonBindings =
     std::array<std::pair<Settings::NativeButton::Values, SDL_GamepadButton>, 20>;
@@ -36,7 +41,8 @@ public:
     /// Unregisters SDL device factories and shut them down.
     ~SDLDriver() override;
 
-    void PumpEvents() const;
+    /// Pumps SDL events and restarts the motion sensors of controllers whose reports stopped.
+    void PumpEvents();
 
     /// Handle SDL_Events for joysticks from SDL_PollEvent
     void HandleGameControllerEvent(const SDL_Event& event);
@@ -68,6 +74,11 @@ public:
         const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) override;
 
     bool IsVibrationEnabled(const PadIdentifier& identifier) override;
+    bool IsVibrationStreamed(const PadIdentifier& identifier) override;
+
+    /// Why the controller does nothing, when it sent no input since it connected and its raw HID
+    /// device can't be opened. Empty otherwise.
+    std::string GetSilenceWarning(const Common::ParamPackage& params);
 
 private:
     void InitJoystick(SDL_JoystickID joystick_id);
@@ -116,8 +127,12 @@ private:
     /// Map of GUID of a list of corresponding virtual Joysticks
     ::Common::unordered_map<Common::UUID, std::vector<std::shared_ptr<SDLJoystick>>> joystick_map;
     std::mutex joystick_map_mutex;
+    std::chrono::steady_clock::time_point last_motion_stall_check{};
 
     std::atomic<bool> initialized = false;
     bool start_thread;
+#ifdef HAVE_SWITCH2_BLE
+    std::unique_ptr<Switch2Ble> switch2_ble;
+#endif
 };
 } // namespace InputCommon

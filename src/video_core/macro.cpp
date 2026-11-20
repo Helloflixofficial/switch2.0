@@ -38,6 +38,8 @@
 #include "common/bit_field.h"
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
 namespace Tegra {
@@ -1348,7 +1350,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                           std::span<const u32> parameters) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
     if (native_turing) {
-        maxwell3d.RefreshParameters();
+        // The parameters are the words the pusher fetched, as on the split front (FrontRunMacro):
+        // read again from guest memory, they are whatever reused that command memory since.
         const auto context = reinterpret_cast<std::uintptr_t>(this);
         static std::unordered_set<std::uintptr_t> captured_contexts;
         static const bool capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
@@ -1364,7 +1367,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         // Reused between calls (a macro never calls another: methods >= 0xe00 are refused below);
         // filled only for calls that are interpreted.
         auto& fifo = native_fifo;
-        native_interpreter.active_dram = &maxwell3d.GetNativeDataRam();
+        // The channel's data RAM is the split's front's while it runs macros (split_writes).
+        native_interpreter.active_dram =
+            split_writes != nullptr ? &native_interpreter.dram : &maxwell3d.GetNativeDataRam();
         // EDEN_NX2_MME_RECORD=<file>: write the first 200000 calls (u32 start, u32 count, the
         // parameters) and then the macro code to <file>.code, to check interpreter changes
         // offline against the previous interpreter. EDEN_NX2_MME_RECORD_SKIP=<n>: skip the first
@@ -1395,6 +1400,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         bool read_memory = false;
         const auto emit = [&](u32 address, u32 value) {
                 if (address >= 0xe00) return false;
+                if (split_writes != nullptr && !(*split_writes)[address]) {
+                    ++split_unexpected_writes;
+                }
                 if (address == 0x556) {
                     // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
                     // 2 never. Log a histogram every 20000 macro writes (pop-in diagnostics).
@@ -1434,11 +1442,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         }
                     }
                     // Accurate GPU mode holds report and semaphore writes in the query cache until a
-                    // fence: write them out, or occlusion predicates read stale values. The query
-                    // cache belongs to the split's back, so this runs there (owns_caches); the flush
-                    // itself waits out the pending reports through the fence manager. Skipping it
-                    // under the split made macro DMA reads return stale occlusion counts, which the
-                    // guest acted on as "nothing is visible" (Ocarina's missing vegetation).
+                    // fence: write them out, or occlusion predicates read stale values.
                     const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
                                              VideoCommon::GpuSplit::OnBackThread();
                     if (owns_caches && VideoCommon::QueryDma::TraceEnabled() &&
@@ -1447,16 +1451,27 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         VideoCommon::QueryDma::Trace(memory, maxwell3d.Rasterizer(), method, address,
                                                      source, read_bytes);
                     }
+                    // A call the split's back runs in its front's place (Maxwell3D::FrontRunOnBack)
+                    // counts its write-out for the async read-back line.
+                    const bool back_call =
+                        split_writes != nullptr && VideoCommon::Nx2Profile::Enabled();
+                    const u64 write_out_start = back_call ? VideoCore::AsyncReadback::Now() : 0;
                     if (owns_caches) {
                         VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(), source,
                                                             read_bytes);
                     }
-                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                    const bool dirty =
+                        memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                    if (dirty) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                         static u64 flushes{};
                         if (++flushes % 2000 == 1) {
                             LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
                         }
+                    }
+                    if (back_call) {
+                        VideoCore::AsyncReadback::CountBackDmaRead(
+                            dirty, VideoCore::AsyncReadback::Now() - write_out_start);
                     }
                     static u32 dma_logs{};
                     if (dma_logs < 400) {
@@ -1612,18 +1627,12 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
 
         UNREACHABLE();
     };
-    // EDEN_NX2_FASTDRAW_COUNT: HLE programs write registers directly, without the 3D
-    // engine's breaks, so a cached macro ends delta draw reuse before and after it runs.
-    const auto count_break = [method] {
-        if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
-            VideoCommon::Nx2FastDrawCount::BreakOn(VideoCommon::Nx2FastDrawCount::Reason::HleMacro,
-                                                   VideoCommon::Nx2FastDrawCount::Other, method);
-        }
-    };
+    // HLE programs write registers directly, without the 3D engine's fast draw breaks.
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
     if (auto const it = macro_cache.find(method); it != macro_cache.end()) {
-        count_break();
+        FastDraw::Break(FastDraw::Reason::Method, method);
         execute_variant(it->second.program);
-        count_break();
+        FastDraw::Break(FastDraw::Reason::Method, method);
         return;
     }
 
@@ -1664,9 +1673,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         ci.program = Compile(system, maxwell3d, code);
     }
 
-    count_break();
+    FastDraw::Break(FastDraw::Reason::Method, method);
     execute_variant(ci.program);
-    count_break();
+    FastDraw::Break(FastDraw::Reason::Method, method);
     if (Settings::values.dump_macros) {
         Dump(ci.hash, code, !std::holds_alternative<std::monostate>(ci.program));
     }

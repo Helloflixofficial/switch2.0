@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "core/arm/arm_interface.h"
-#include "core/hle/kernel/k_spin_lock.h"
 
 namespace Kernel {
 class KernelCore;
@@ -32,8 +31,8 @@ public:
     PhysicalCore(KernelCore& kernel, std::size_t core_index);
     ~PhysicalCore();
 
-    YUZU_NON_COPYABLE(PhysicalCore);
-    YUZU_NON_MOVEABLE(PhysicalCore);
+    LICHII_NON_COPYABLE(PhysicalCore);
+    LICHII_NON_MOVEABLE(PhysicalCore);
 
     // Execute guest code running on the given thread.
     void RunThread(KernelCore& kernel, KThread* thread);
@@ -52,11 +51,6 @@ public:
     // Log backtrace of current processor state.
     void LogBacktrace(KernelCore& kernel);
 
-    // Fritchii hang report: asks this core's thread for a backtrace of the guest thread it runs
-    // (logged when the JIT next returns). Returns that thread's id, or ~0 when the core runs no
-    // guest code now (idle). Any thread may call it.
-    u64 RequestBacktrace(const char* reason);
-
     // Wait for an interrupt.
     void Idle(KernelCore& kernel);
 
@@ -74,19 +68,11 @@ public:
     }
 
 private:
-    class ScopedGuard;
-
     const std::size_t m_core_index;
-    // EDEN_NX2_CORE_LOCK (boot switch, physical_core.cpp): m_fast_guard replaces m_guard, and
-    // Idle sleeps on m_is_interrupted with an address wait instead of m_on_interrupt. Fixed for
-    // the core's lifetime, so the two locks are never mixed.
-    const bool m_core_lock;
-    // EDEN_NX2_IDLE_STATS=1 (with EXP79): every 10 s, each core logs how often it went idle, how
-    // many of those periods its poll caught, and how long blocked periods took to wake after the
-    // interrupt. Read when the core is made, after nx2_switches.txt was applied.
+    // EDEN_NX2_IDLE_STATS=1: every 10 s, each core logs how often it went idle, how many of those
+    // periods its poll caught, and how long blocked periods took to wake after the interrupt.
     const bool m_idle_stats;
     std::mutex m_guard;
-    KSpinLock m_fast_guard;
     std::condition_variable m_on_interrupt;
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};

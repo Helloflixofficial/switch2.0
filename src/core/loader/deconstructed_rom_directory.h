@@ -18,10 +18,6 @@ class System;
 
 namespace Loader {
 
-/// The RomFS image of a loose romfs/ directory, built once and shared by every loader of that
-/// directory while any of them holds it.
-FileSys::VirtualFile BuildLooseRomFS(const FileSys::VirtualDir& romfs_dir);
-
 /**
  * This class loads a "deconstructed ROM directory", which are the typical format we see for Switch
  * game dumps. The path should be a "main" NSO, which must be in a directory that contains the other
@@ -32,7 +28,9 @@ class AppLoader_DeconstructedRomDirectory final : public AppLoader {
 public:
     explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile main_file, bool override_update_ = false);
     // Overload to accept exefs directory. Must contain 'main' and 'main.npdm'
-    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualDir directory, bool override_update_ = false);
+    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualDir directory,
+                                                 bool override_update_ = false,
+                                                 bool apply_installed_update_ = true);
 
     /**
      * Identifies whether or not the given file is a deconstructed ROM directory.
@@ -59,6 +57,7 @@ public:
     bool IsRomFSUpdatable() const override;
 
     ResultStatus ReadNSOModules(Modules& out_modules) override;
+    ResultStatus ReadMainBuildId(Core::System& system, std::array<u8, 0x20>& build_id) override;
 
 private:
     /// The loose RomFS next to the ExeFS, found (and built) on first use.
@@ -76,6 +75,7 @@ private:
     std::string romfs_version;            ///< "1.8.0" from the RomFS's Product.180 tables, if any
     u64 title_id{};
     bool override_update;
+    bool apply_installed_update{true};
 
     Modules modules;
 };

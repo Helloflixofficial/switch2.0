@@ -4,10 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
-#include <cstddef>
 #include <memory>
-#include <mutex>
-#include <type_traits>
 #include <vector>
 
 #include "common/assert.h"
@@ -16,42 +13,24 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
-#include "video_core/memstage_shadow.h"
+#include "video_core/nx2_back_idle_trace.h"
 
 namespace Tegra::Control {
-namespace {
-
-// The channel switch the split's back runs. A struct with a fixed layout, not a lambda: the
-// memory stage reads the bind id from payload word 0 (StageTag::Channel, memstage_shadow.h).
-struct BindChannelCall {
-    s64 bind_id;
-    GPU* gpu;
-    std::mutex* guard;
-
-    void operator()() const {
-        std::scoped_lock lk{*guard};
-        gpu->BindChannel(static_cast<s32>(bind_id));
-        if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
-            VideoCommon::MemStageShadow::BackChannel(static_cast<s32>(bind_id));
-        }
-    }
-};
-static_assert(offsetof(BindChannelCall, bind_id) == 0);
-static_assert(std::is_trivially_copyable_v<BindChannelCall>);
-
-} // Anonymous namespace
 
 void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer(BindChannelCall{bind_id, &gpu, &scheduling_guard},
-                    // Delta draw count: a real switch breaks in RasterizerVulkan::BindChannel.
-                    VideoCommon::GpuSplit::Effect::None,
-                    VideoCommon::Nx2FastDrawCount::Neutral() |
-                        VideoCommon::StageTagBits(VideoCommon::StageTag::Channel));
+        split.Defer(
+            [this, gpu_ptr = &gpu, bind_id] {
+                std::scoped_lock lk{scheduling_guard};
+                gpu_ptr->BindChannel(bind_id);
+            },
+            0, VideoCommon::GpuSplit::Writes::Noted);
         return;
     }
+    // ResumePending can bind a channel without popping a new GPUThread command.
+    VideoCommon::Nx2FastDraw::BreakUnsplit(VideoCommon::Nx2FastDraw::Reason::Call);
     std::scoped_lock lk{scheduling_guard};
     gpu.BindChannel(bind_id);
 }
@@ -81,7 +60,7 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
 }
 
 bool Scheduler::ResumePending(GPU& gpu) {
-    bool resumed = false;
+    bool any_progress = false;
     // Running one channel can release the semaphore another waits for: retry until none moves.
     for (bool progress = true; progress;) {
         progress = false;
@@ -91,22 +70,30 @@ bool Scheduler::ResumePending(GPU& gpu) {
             // pending: resuming it again counted as progress forever and the GPU thread never
             // reached its stop request (closing the game hung).
             if (!dma_pusher.system.IsPoweredOn()) {
-                return resumed;
+                return any_progress;
             }
             if (!dma_pusher.HasPendingAcquire() || !dma_pusher.CanResumeAcquire()) {
                 continue;
             }
+            VideoCommon::BackIdleTrace::SetFrontState(
+                VideoCommon::BackIdleTrace::FrontState::Parse);
             BindChannel(gpu, state->bind_id);
             dma_pusher.DispatchCalls();
             progress = true;
-            resumed = true;
+            any_progress = true;
         }
     }
     std::erase_if(pending_channels, [](const auto& state) {
         return !state->payload->dma_pusher.HasPendingAcquire();
     });
     any_pending.store(!pending_channels.empty(), std::memory_order_release);
-    return resumed;
+    return any_progress;
+}
+
+bool Scheduler::WaitsForListCopy() const {
+    return std::ranges::any_of(pending_channels, [](const auto& state) {
+        return state->payload->dma_pusher.WaitsForListCopy();
+    });
 }
 
 void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {

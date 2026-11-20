@@ -5,8 +5,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <string>
-#include <cstdlib>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,7 +25,6 @@
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
-#include "shader_recompiler/ir_opt/dominance.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/shader_info.h"
 
@@ -125,6 +122,32 @@ u32 DynamicDescriptorCount(u32 base_offset, u32 size_shift, u32 max_descriptors)
     return std::min(descriptor_limit, available_count);
 }
 
+// The elements a dynamic offset can select below the clamp to the last one: a bit index found by
+// FLO (FindUMsb, or 31 minus it for FLO.SH) takes one of 32. Its -1 for no bit set is past any
+// count, so it takes the last element as it does in a longer array.
+u32 DynamicDescriptorIndexLimit(const IR::U32& dynamic_offset, u32 size_shift) {
+    const IR::Inst* const offset = dynamic_offset.InstRecursive();
+    if (!offset || offset->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+        !offset->Arg(1).IsImmediate() || offset->Arg(1).U32() != size_shift) {
+        return ~0U;
+    }
+    const auto is_bit_index = [](const IR::Value& value) {
+        const IR::Inst* inst = value.IsImmediate() ? nullptr : value.InstRecursive();
+        if (inst && inst->GetOpcode() == IR::Opcode::BitwiseXor32 && inst->Arg(1).IsImmediate() &&
+            inst->Arg(1).U32() == 31) {
+            inst = inst->Arg(0).IsImmediate() ? nullptr : inst->Arg(0).InstRecursive();
+        }
+        return inst && (inst->GetOpcode() == IR::Opcode::FindUMsb32 ||
+                        inst->GetOpcode() == IR::Opcode::FindSMsb32);
+    };
+    const IR::Value index = offset->Arg(0);
+    const IR::Inst* const select = index.IsImmediate() ? nullptr : index.InstRecursive();
+    if (select && select->GetOpcode() == IR::Opcode::SelectU32) {
+        return is_bit_index(select->Arg(1)) && is_bit_index(select->Arg(2)) ? 32U : ~0U;
+    }
+    return is_bit_index(index) ? 32U : ~0U;
+}
+
 u32 SaturatingSub(u32 lhs, u32 rhs) {
     return lhs > rhs ? lhs - rhs : 0;
 }
@@ -138,43 +161,6 @@ u32 SaturatingSub(u32 lhs, u32 rhs) {
     return desc.count > 1 || desc.is_descriptor_array;
 }
 
-// EDEN_NX2_DEPTH_CENSUS: TextureDescriptor::census_use of one (indexed) texture instruction.
-[[nodiscard]] u8 CensusUse(const IR::Inst& inst, bool is_rect_sample) {
-    u8 use = TextureDescriptor::CensusKnown;
-    const auto has = [&inst](size_t arg) {
-        return arg < inst.NumArgs() && !inst.Arg(arg).IsEmpty();
-    };
-    switch (inst.GetOpcode()) {
-    case IR::Opcode::ImageFetch:
-        use |= TextureDescriptor::CensusFetch;
-        use |= has(2) ? TextureDescriptor::CensusOffset : 0;
-        break;
-    case IR::Opcode::ImageQueryDimensions:
-        use |= TextureDescriptor::CensusQuery;
-        break;
-    case IR::Opcode::ImageSampleImplicitLod:
-    case IR::Opcode::ImageSampleExplicitLod:
-    case IR::Opcode::ImageGradient:
-        use |= has(3) ? TextureDescriptor::CensusOffset : 0;
-        break;
-    case IR::Opcode::ImageSampleDrefImplicitLod:
-    case IR::Opcode::ImageSampleDrefExplicitLod:
-        use |= has(4) ? TextureDescriptor::CensusOffset : 0;
-        break;
-    case IR::Opcode::ImageGather:
-    case IR::Opcode::ImageGatherDref:
-        use |= TextureDescriptor::CensusGather;
-        use |= has(2) || has(3) ? TextureDescriptor::CensusOffset : 0;
-        break;
-    default:
-        break;
-    }
-    if (is_rect_sample) {
-        use |= TextureDescriptor::CensusRect;
-    }
-    return use;
-}
-
 template <typename T>
 [[nodiscard]] u32 StaticDescriptorCount(T const& descriptors) noexcept {
     return std::accumulate(descriptors.cbegin(), descriptors.cend(), 0U, [](auto const& acc, auto const& e) {
@@ -186,11 +172,8 @@ u32 DynamicSampledTextureCap(const Info& info, const HostTranslateInfo& host_inf
     auto const sampled_limit = (std::max)(1U, std::min(host_info.max_per_stage_descriptor_sampled_images,
                                                        host_info.max_descriptor_set_sampled_images));
     // A texture is a combined image sampler: it takes a sampler as well as a sampled image.
-    // EDEN_NX2_LIGHT_TABLE_ARRAYS off: no sampler limit, as before the port.
-    auto const sampler_limit = host_info.support_handle_table_arrays
-                                   ? (std::max)(1U, std::min(host_info.max_per_stage_descriptor_samplers,
-                                                             host_info.max_descriptor_set_samplers))
-                                   : (std::numeric_limits<u32>::max)();
+    auto const sampler_limit = (std::max)(1U, std::min(host_info.max_per_stage_descriptor_samplers,
+                                                       host_info.max_descriptor_set_samplers));
     auto const resource_limit = (std::max)(1U, host_info.max_per_stage_resources);
     if (dynamic_arrays > 0) {
         auto const sampler_static_count = StaticDescriptorCount(info.texture_descriptors);
@@ -418,20 +401,7 @@ TextureType ResolvedTextureType(Environment& env, const TextureInst& texture_ins
 
 u32 DynamicSampledTextureArrayCount(
     Environment& env, const TextureInstVector& to_replace,
-    const std::unordered_map<u32, TextureType>& handle_program_types,
-    const HostTranslateInfo& host_info) {
-    if (!host_info.support_handle_table_arrays) {
-        // EDEN_NX2_LIGHT_TABLE_ARRAYS off: instructions, as before the port.
-        u32 count{};
-        for (const TextureInst& inst : to_replace) {
-            const auto flags{inst.inst->Flags<IR::TextureInstInfo>()};
-            if (inst.cbuf.count > 1 && !IsStorageImageOpcode(IndexedInstruction(*inst.inst)) &&
-                flags.type != TextureType::Buffer) {
-                ++count;
-            }
-        }
-        return count;
-    }
+    const std::unordered_map<u32, TextureType>& handle_program_types) {
     // Arrays, not instructions: every instruction reading an array shares its descriptor (a
     // light loop samples one table of shadow maps from dozens of places). Arrays differ where
     // their descriptors do (Descriptors::Add) but for the count, which the cap sets: two arrays
@@ -668,9 +638,7 @@ std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, c
         // Nor into a texture instruction or floating-point math: no handle is made from them,
         // while a register the program reuses for the handle and for a sample result (a Phi of
         // both) would lead the search through the sample's coordinates to an unrelated word.
-        // (EDEN_NX2_LIGHT_TABLE_ARRAYS only.)
-        if (host_info.support_handle_table_arrays &&
-            (IsTextureInstruction(*inst) || IsFloatValue(*inst))) {
+        if (IsTextureInstruction(*inst) || IsFloatValue(*inst)) {
             continue;
         }
         for (size_t arg = inst->NumArgs(); arg--;) {
@@ -711,9 +679,6 @@ thread_local int g_handle_depth{};
 // reads whose address is being built), which is scaled to a byte offset (g_handle_scaled) to
 // give the address of another read, qualifies, and one word per program.
 thread_local bool g_handle_index_allowed{};
-// EDEN_NX2_LIGHT_TABLE_ARRAYS (HostTranslateInfo::support_handle_table_arrays) for the pass on
-// this thread: off, handle programs are built exactly as before the port.
-thread_local bool g_table_arrays{};
 thread_local IR::Value g_handle_index{};
 thread_local int g_handle_load_depth{};
 thread_local int g_handle_scaled{};
@@ -884,16 +849,9 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
     case IR::Opcode::CompositeExtractU32x3:
     case IR::Opcode::CompositeExtractU32x4: {
         // A word of a wider load (a handle in a table entry read 16 bytes at a time).
-        const bool is_x2{inst->GetOpcode() == IR::Opcode::CompositeExtractU32x2};
-        if (!g_table_arrays && !is_x2) {
-            g_handle_failure = inst->GetOpcode(); // as the default case, with the switch off
-            return false;
-        }
         const IR::Value element{inst->Arg(1)};
         if (!element.IsImmediate() || inst->Arg(0).IsImmediate()) {
-            if (g_table_arrays) {
-                g_handle_failure = inst->GetOpcode();
-            }
+            g_handle_failure = inst->GetOpcode();
             return false;
         }
         return load_word(inst->Arg(0).InstRecursive(), element.U32() * 4);
@@ -1130,8 +1088,85 @@ void TrimTrailingTees(std::vector<u32>& code) {
 // g_handle_index_allowed): the table entries a draw binds, larger indices taking the last one.
 constexpr u32 HANDLE_TABLE_SIZE = 64;
 
-// The dominators of the program the pass on this thread runs on (dominance.h), built when a
-// handle program first needs them.
+// The block of each instruction and the immediate dominator of each block of the program the
+// pass on this thread runs on, built when a handle program first needs them (Cooper, Harvey and
+// Kennedy, over post order numbers).
+class Dominance {
+public:
+    explicit Dominance(const IR::Program& program) : order{program.post_order_blocks} {
+        for (size_t number = 0; number < order.size(); ++number) {
+            numbers.emplace(order[number], number);
+            for (const IR::Inst& inst : order[number]->Instructions()) {
+                blocks.emplace(&inst, order[number]);
+            }
+        }
+        idom.assign(order.size(), NONE);
+        if (order.empty()) {
+            return;
+        }
+        const size_t entry{order.size() - 1};
+        idom[entry] = entry;
+        const auto intersect = [this](size_t lhs, size_t rhs) {
+            while (lhs != rhs) {
+                while (lhs < rhs) lhs = idom[lhs];
+                while (rhs < lhs) rhs = idom[rhs];
+            }
+            return lhs;
+        };
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t number = entry; number-- > 0;) {
+                size_t dominator{NONE};
+                for (const IR::Block* const predecessor : order[number]->ImmPredecessors()) {
+                    const auto it{numbers.find(predecessor)};
+                    if (it == numbers.end() || idom[it->second] == NONE) {
+                        continue;
+                    }
+                    dominator = dominator == NONE ? it->second : intersect(it->second, dominator);
+                }
+                if (dominator != idom[number]) {
+                    idom[number] = dominator;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    /// Whether def runs before use on every path to use.
+    [[nodiscard]] bool Dominates(const IR::Inst* def, const IR::Inst* use) const {
+        const auto def_block{blocks.find(def)};
+        const auto use_block{blocks.find(use)};
+        if (def_block == blocks.end() || use_block == blocks.end()) {
+            return false;
+        }
+        if (def_block->second == use_block->second) {
+            for (const IR::Inst& inst : def_block->second->Instructions()) {
+                if (&inst == def) return true;
+                if (&inst == use) return false;
+            }
+            return false;
+        }
+        const size_t target{numbers.at(def_block->second)};
+        for (size_t number = numbers.at(use_block->second); idom[number] != NONE;) {
+            if (idom[number] == number) {
+                return false; // the entry
+            }
+            number = idom[number];
+            if (number == target) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    static constexpr size_t NONE{~size_t{0}};
+    const IR::BlockList& order;
+    std::unordered_map<const IR::Block*, size_t> numbers;
+    std::unordered_map<const IR::Inst*, const IR::Block*> blocks;
+    std::vector<size_t> idom;
+};
+
 thread_local const IR::Program* g_program{};
 thread_local std::optional<Dominance> g_dominance;
 
@@ -1281,7 +1316,10 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         .secondary_offset = 0,
         .secondary_shift_left = 0,
         .dynamic_offset = dynamic_offset,
-        .count = DynamicDescriptorCount(base_offset, size_shift, (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, resource_limit})),
+        .count = (std::min)(DynamicDescriptorCount(base_offset, size_shift,
+                                                   (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit,
+                                                               resource_limit})),
+                            DynamicDescriptorIndexLimit(dynamic_offset, size_shift)),
         .has_secondary = false,
     };
 }
@@ -1332,50 +1370,11 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                     throw NotImplementedException("Failed to track bindless texture constant buffer (stopped at {}, budget {})",
                                                   g_handle_failure, budget);
                 }
-                // EDEN_NX2_HANDLE_FALLBACK_TRACE: what the per-draw handle program stopped at.
-                static const bool trace_fallback = std::getenv("EDEN_NX2_HANDLE_FALLBACK_TRACE") != nullptr;
-                if (trace_fallback) {
-                    std::string chain;
-                    std::vector<const IR::Inst*> queue;
-                    std::unordered_set<const IR::Inst*> seen;
-                    if (!inst.Arg(0).IsImmediate()) queue.push_back(inst.Arg(0).InstRecursive());
-                    for (size_t i = 0; i < queue.size() && i < 48; ++i) {
-                        const IR::Inst* const node = queue[i];
-                        chain += fmt::format(" [{:p}]{}(", static_cast<const void*>(node), node->GetOpcode());
-                        for (size_t arg = 0; arg < node->NumArgs(); ++arg) {
-                            const IR::Value value = node->Arg(arg);
-                            if (value.IsImmediate()) {
-                                const IR::Type type = value.Type();
-                                if (type == IR::Type::U32 || type == IR::Type::F32) {
-                                    chain += fmt::format("{}{:#x}", arg ? "," : "", value.U32());
-                                } else if (type == IR::Type::U1) {
-                                    chain += fmt::format("{}{}", arg ? "," : "", value.U1());
-                                } else {
-                                    chain += fmt::format("{}{}", arg ? "," : "", IR::NameOf(type));
-                                }
-                            } else {
-                                const IR::Inst* const def = value.InstRecursive();
-                                chain += fmt::format("{}{:p}", arg ? "," : "", static_cast<const void*>(def));
-                                if (seen.insert(def).second) queue.push_back(def);
-                            }
-                        }
-                        chain += ")";
-                    }
-                    LOG_WARNING(Shader, "Bindless handle fallback: program stopped at {} (budget {}); using c{}[{:#x}] shift {} secondary {} c{}[{:#x}]; chain:{}",
-                                g_handle_failure, budget, legacy->index, legacy->offset, legacy->shift_left, legacy->has_secondary,
-                                legacy->secondary_index, legacy->secondary_offset, chain);
-                }
                 // The word the search found may be the pointer a load reads the handle through
-                // (a light table's address): that binds no texture. Only
-                // with EDEN_NX2_LIGHT_TABLE_ARRAYS, whose fallback took the pointer word: off,
-                // the translation stays as before the port.
-                const bool pointer_word{host_info.support_handle_table_arrays &&
-                                        !ReachesOutsideLoads(inst.Arg(0), legacy_inst, block)};
-                // EDEN_NX2_LIGHT_TABLE_ARRAYS: the fallback's texture is likely
-                // the wrong one, say so (a few times) with the switch on.
+                // (a light table's address): that binds no texture.
+                const bool pointer_word{!ReachesOutsideLoads(inst.Arg(0), legacy_inst, block)};
                 static std::atomic<int> warnings{};
-                if (host_info.support_handle_table_arrays &&
-                    warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
+                if (warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
                     LOG_WARNING(Shader, "Bindless {} handle not computable per draw (stopped at {}): "
                                 "taking cbuf{}+{:#x}{}",
                                 inst.GetOpcode(), g_handle_failure, legacy->index, legacy->offset,
@@ -1385,9 +1384,7 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 return TextureInst{
                     .cbuf = *legacy, .inst = &inst, .block = block, .pointer_word = pointer_word};
             }
-            if (host_info.support_handle_table_arrays) {
-                TrimTrailingTees(code);
-            }
+            TrimTrailingTees(code);
             auto& programs{*g_handle_programs};
             auto it{std::ranges::find(programs, code)};
             if (it == programs.end()) {
@@ -1515,7 +1512,6 @@ public:
         texture_descriptors[index].is_multisample |= desc.is_multisample;
         texture_descriptors[index].is_integer |= desc.is_integer;
         texture_descriptors[index].is_descriptor_array |= desc.is_descriptor_array;
-        texture_descriptors[index].census_use |= desc.census_use;
         return index;
     }
 
@@ -1676,11 +1672,9 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     g_handle_programs = &program.info.handle_programs;
     g_program = &program;
     g_dominance.reset();
-    g_table_arrays = host_info.support_handle_table_arrays;
     SCOPE_EXIT {
         g_program = nullptr;
         g_dominance.reset();
-        g_table_arrays = false;
     };
     for (IR::Block* const block : program.post_order_blocks) {
         env.track_cache.clear();
@@ -1735,7 +1729,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     }
     const u32 sampled_dynamic_cap = DynamicSampledTextureCap(
         program.info, host_info,
-        DynamicSampledTextureArrayCount(env, to_replace, handle_program_types, host_info));
+        DynamicSampledTextureArrayCount(env, to_replace, handle_program_types));
     for (TextureInst& texture_inst : to_replace) {
         // TODO: Handle arrays
         IR::Inst* const inst{texture_inst.inst};
@@ -1886,13 +1880,10 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .secondary_shift_left = cbuf.secondary_shift_left,
                     .count = count,
                     // One element has no stride (see CapTextureArrays).
-                    .size_shift = count > 1 || !host_info.support_handle_table_arrays
-                                      ? size_shift
-                                      : DESCRIPTOR_SIZE_SHIFT,
+                    .size_shift = count > 1 ? size_shift : DESCRIPTOR_SIZE_SHIFT,
                     .handle_program = cbuf.handle_program,
-                    .is_descriptor_array = host_info.support_handle_table_arrays && cbuf.count > 1,
+                    .is_descriptor_array = cbuf.count > 1,
                     .handle_is_pointer_word = texture_inst.pointer_word,
-                    .census_use = CensusUse(*inst, is_rect_sample),
                 });
                 if (texture_inst.pointer_word &&
                     std::ranges::none_of(program.info.storage_buffers_descriptors,
@@ -1913,7 +1904,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         if (count > 1) {
             const auto insert_point{IR::Block::InstructionList::s_iterator_to(*inst)};
             IR::IREmitter ir{*texture_inst.block, insert_point};
-            const IR::U32 element{size_shift != 0 || !host_info.support_handle_table_arrays
+            const IR::U32 element{size_shift != 0
                                       ? IR::U32{ir.ShiftRightLogical(cbuf.dynamic_offset, ir.Imm32(size_shift))}
                                       : cbuf.dynamic_offset};
             inst->SetArg(0, ir.UMin(element, ir.Imm32(count - 1)));
@@ -1934,76 +1925,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     }
 }
 
-// LimitSampledTextureArrays as before the port, for
-// EDEN_NX2_LIGHT_TABLE_ARRAYS off: the same programs, so the same SPIR-V.
-static void LimitSampledTextureArraysLegacy(IR::Program& program, const HostTranslateInfo& host_info) {
-    auto& info = program.info;
-    const u32 arrays = static_cast<u32>(std::ranges::count_if(
-        info.texture_descriptors, [](const auto& desc) { return desc.count > 1; }));
-    if (arrays == 0) {
-        return;
-    }
-    const u32 buffers_and_images = NumDescriptors(info.constant_buffer_descriptors) +
-                                   NumDescriptors(info.storage_buffers_descriptors) +
-                                   NumDescriptors(info.image_descriptors) +
-                                   NumDescriptors(info.image_buffer_descriptors);
-    const u32 original_sampled = NumDescriptors(info.texture_descriptors) +
-                                 NumDescriptors(info.texture_buffer_descriptors);
-    if (original_sampled <= host_info.max_per_stage_descriptor_sampled_images &&
-        original_sampled <= host_info.max_descriptor_set_sampled_images &&
-        original_sampled + buffers_and_images <= host_info.max_per_stage_resources) {
-        return;
-    }
-    const u32 cap = DynamicSampledTextureCap(info, host_info, arrays);
-    for (auto& desc : info.texture_descriptors) {
-        desc.count = std::min(desc.count, cap);
-    }
-    const u32 sampled = NumDescriptors(info.texture_descriptors) +
-                        NumDescriptors(info.texture_buffer_descriptors);
-    const u32 resources = sampled + buffers_and_images;
-    if (sampled > host_info.max_per_stage_descriptor_sampled_images ||
-        sampled > host_info.max_descriptor_set_sampled_images ||
-        resources > host_info.max_per_stage_resources) {
-        throw NotImplementedException("Texture arrays exceed descriptor limits: sampled={}, resources={}",
-                                      sampled, resources);
-    }
-    for (IR::Block* const block : program.post_order_blocks) {
-        for (IR::Inst& inst : block->Instructions()) {
-            switch (inst.GetOpcode()) {
-            case IR::Opcode::ImageSampleImplicitLod:
-            case IR::Opcode::ImageSampleExplicitLod:
-            case IR::Opcode::ImageSampleDrefImplicitLod:
-            case IR::Opcode::ImageSampleDrefExplicitLod:
-            case IR::Opcode::ImageGather:
-            case IR::Opcode::ImageGatherDref:
-            case IR::Opcode::ImageFetch:
-            case IR::Opcode::ImageQueryDimensions:
-            case IR::Opcode::ImageQueryLod:
-            case IR::Opcode::ImageGradient:
-                break;
-            default:
-                continue;
-            }
-            const auto flags = inst.Flags<IR::TextureInstInfo>();
-            if (flags.type == TextureType::Buffer || inst.Arg(0).IsEmpty()) {
-                continue;
-            }
-            const u32 count = info.texture_descriptors[flags.descriptor_index].count;
-            if (count == 1) {
-                inst.SetArg(0, IR::Value{});
-                continue;
-            }
-            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
-            inst.SetArg(0, ir.UMin(IR::U32{inst.Arg(0)}, ir.Imm32(count - 1)));
-        }
-    }
-}
-
 void LimitSampledTextureArrays(IR::Program& program, const HostTranslateInfo& host_info) {
-    if (!host_info.support_handle_table_arrays) {
-        LimitSampledTextureArraysLegacy(program, host_info);
-        return;
-    }
     auto& info = program.info;
     // Arrays a cap (the pass's, or this one's for a half of a joined stage) has cut to a single
     // element count too: the stage must still fit with them.
@@ -2081,28 +2003,6 @@ void LimitSharedStageSampledTextureArrays(std::span<IR::Program* const> programs
                     host_info.max_per_stage_descriptor_sampled_images,
                     SaturatingSub(host_info.max_per_stage_resources, other_resources)});
     LimitPipelineSampledTextureArrays(programs, shared);
-}
-
-void JoinTextureInfoLegacy(Info& base, Info& source) {
-    base.requires_coherent_image_memory |= source.requires_coherent_image_memory;
-    Descriptors descriptors{
-        base.texture_buffer_descriptors,
-        base.image_buffer_descriptors,
-        base.texture_descriptors,
-        base.image_descriptors,
-    };
-    for (auto& desc : source.texture_buffer_descriptors) {
-        descriptors.Add(desc);
-    }
-    for (auto& desc : source.image_buffer_descriptors) {
-        descriptors.Add(desc);
-    }
-    for (auto& desc : source.texture_descriptors) {
-        descriptors.Add(desc);
-    }
-    for (auto& desc : source.image_descriptors) {
-        descriptors.Add(desc);
-    }
 }
 
 JoinedDescriptors JoinTextureInfo(Info& base, Info& source, std::span<const u32> storage_bindings) {

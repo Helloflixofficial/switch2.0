@@ -7,8 +7,8 @@
 #pragma once
 
 #include <chrono>
-#include <algorithm>
 #include <filesystem>
+#include <algorithm>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -151,9 +151,12 @@ void Start();
 /// Explicitly stops the logger thread and flushes the buffers
 void Stop();
 
-/// The file this session logs to (empty without a file log). `primary_locked` is set when the
-/// usual log file was held by another process, so the session logs to a fallback file.
-std::filesystem::path FilePath(bool* primary_locked = nullptr);
+/// Writes buffered lines to the log file, so a copy of it is complete.
+void Flush();
+
+/// The file this session logs to (eden_log.txt, or eden_log_2.txt when that one was busy); empty
+/// without a file log. The previous session's log is this path plus ".old.txt".
+[[nodiscard]] std::filesystem::path FilePath();
 
 /// The global filter will prevent any messages from even being processed if they are filtered.
 void SetGlobalFilter(const Filter& filter);

@@ -6,7 +6,9 @@
 #pragma once
 
 #include <deque>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "common/assert.h"
@@ -35,18 +37,6 @@ public:
         /* Do Nothing */
     }
 
-    /// EXP119 (fritchii_report_runs.h): ResetCounter without queuing its amend reset, which the
-    /// caller queues in a report run instead (ResetAmend). False: not split, nothing done.
-    virtual bool ResetCounterWithoutOperation() {
-        return false;
-    }
-
-    /// The operation ResetCounter queues (EXP119 runs it from a report run).
-    void ResetAmend() {
-        amend_value = 0;
-        accumulation_value = 0;
-    }
-
     virtual void CloseCounter() {
         /* Do Nothing */
     }
@@ -63,20 +53,8 @@ public:
         /* Do Nothing */
     }
 
-    /// EDEN_NX2_EXP28 & 1: a fence went without this streamer's pending syncs; they wait for a
-    /// later fence or wait for idle while their query slots may be reused.
-    virtual void NoteSyncDeferred() {
-        /* Do Nothing */
-    }
-
     virtual size_t WriteCounter(VAddr address, bool has_timestamp, u32 value,
                                 std::optional<u32> subreport = std::nullopt) = 0;
-
-    /// One follower (fable_b 16.2's mirror check): whether a report written now would make a
-    /// pending sync (the samples streamer: a query is running since the last reset).
-    virtual bool ReportMakesPendingSync() const {
-        return false;
-    }
 
     virtual bool HasUnsyncedQueries() const {
         return false;
@@ -91,6 +69,13 @@ public:
     }
 
     virtual void Free(size_t query_id) = 0;
+
+    /// Free for each id, as one batch.
+    virtual void FreeMany(std::span<const size_t> query_ids) {
+        for (const size_t query_id : query_ids) {
+            Free(query_id);
+        }
+    }
 
     size_t GetId() const {
         return id;
@@ -144,31 +129,39 @@ protected:
         ReleaseQuery(query_id);
     }
 
+    virtual void FreeMany(std::span<const size_t> query_ids) override {
+        std::scoped_lock lk(guard);
+        for (const size_t query_id : query_ids) {
+            ReleaseQuery(query_id);
+        }
+    }
+
+    /// Called by the one thread that records reports (the GPU thread, or the split's back while it
+    /// runs). Free ids are taken from `reusable`, which only this thread touches, and moved there
+    /// from `old_queries` in batches: one lock per batch instead of one per query (a report per
+    /// draw builds two).
     template <typename... Args, typename = decltype(QueryType(std::declval<Args>()...))>
     size_t BuildQuery(Args&&... args) {
-        std::scoped_lock lk(guard);
-        if (old_queries_head != old_queries.size()) {
-            size_t new_id = old_queries[old_queries_head++];
-            if (old_queries_head == old_queries.size()) {
-                old_queries.clear();
-                old_queries_head = 0;
+        if (reusable_head == reusable.size()) {
+            reusable.clear();
+            reusable_head = 0;
+            std::scoped_lock lk(guard);
+            if (old_queries.empty()) {
+                const size_t new_id = slot_queries.size();
+                slot_queries.emplace_back(std::forward<Args>(args)...);
+                return new_id;
             }
-            new (&slot_queries[new_id]) QueryType(std::forward<Args>(args)...);
-            return new_id;
+            // Oldest first, as they were freed.
+            reusable.swap(old_queries);
         }
-        size_t new_id = slot_queries.size();
-        slot_queries.emplace_back(std::forward<Args>(args)...);
+        const size_t new_id = reusable[reusable_head++];
+        new (&slot_queries[new_id]) QueryType(std::forward<Args>(args)...);
         return new_id;
     }
 
     void ReleaseQuery(size_t query_id) {
 
         if (query_id < slot_queries.size()) {
-            if (old_queries_head >= 1024 && old_queries_head * 2 >= old_queries.size()) {
-                old_queries.erase(old_queries.begin(),
-                                  old_queries.begin() + static_cast<std::ptrdiff_t>(old_queries_head));
-                old_queries_head = 0;
-            }
             old_queries.push_back(query_id);
             return;
         }
@@ -177,10 +170,12 @@ protected:
 
     std::mutex guard;
     std::deque<QueryType> slot_queries;
-    /// Free ids, oldest first from old_queries_head: MSVC's deque of size_t allocated a block
-    /// every two pushes, and a report per draw frees two queries.
+    /// Free ids, oldest first, until BuildQuery takes them all: MSVC's deque of size_t allocated
+    /// a block every two pushes, and a report per draw frees two queries.
     std::vector<size_t> old_queries;
-    size_t old_queries_head{};
+    /// Free ids BuildQuery took from old_queries, used from reusable_head (its thread only).
+    std::vector<size_t> reusable;
+    size_t reusable_head{};
 };
 
 } // namespace VideoCommon

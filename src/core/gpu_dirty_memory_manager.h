@@ -3,7 +3,6 @@
 #pragma once
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <bit>
 #include <functional>
@@ -11,7 +10,6 @@
 #include <utility>
 #include <vector>
 
-#include "common/fritchii_page_flags.h"
 #include "core/device_memory_manager.h"
 
 namespace Core {
@@ -25,28 +23,24 @@ public:
 
     ~GPUDirtyMemoryManager() = default;
 
+    /// Off unless EDEN_NX2_BACKX_VERIFY counts the writes that add bits (Collects).
+    static inline bool count_collects{};
+
     void Collect(PAddr address, size_t size) {
-        TransformAddress t = BuildTransform(address, size);
-        TransformAddress tmp, original;
-        do {
-            tmp = current.load(std::memory_order_acquire);
-            original = tmp;
-            if (tmp.address != t.address) {
-                if (IsValid(tmp.address)) {
-                    std::scoped_lock lk(guard);
-                    back_buffer.emplace_back(tmp);
-                    current.exchange(t, std::memory_order_relaxed);
-                    return;
-                }
-                tmp.address = t.address;
-                tmp.mask = 0;
-            }
-            if ((tmp.mask | t.mask) == tmp.mask) {
-                return;
-            }
-            tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
-                                                std::memory_order_relaxed));
+        // A transform covers one page: a write past its page goes in a page at a time. Its mask
+        // was otherwise built with shifts of 32 or more, which could leave it empty and lose the
+        // write (with an older one left in back_buffer and `current` showing nothing).
+        while (size != 0) {
+            const size_t in_page = (std::min<size_t>)(size, page_size - (address & page_mask));
+            CollectInPage(address, in_page);
+            address += in_page;
+            size -= in_page;
+        }
+    }
+
+    /// Writes collected that added bits, ever (only while count_collects is set).
+    [[nodiscard]] u64 Collects() const {
+        return collects.load(std::memory_order_acquire);
     }
 
     /// Calls `callback` for each write collected and not yet applied, without consuming them: those
@@ -74,41 +68,25 @@ public:
         std::scoped_lock gather_lk(gather_guard);
         {
             std::scoped_lock lk(guard);
-            // Nothing collected (front_buffer is always empty here): nothing to take, and no
-            // clear for the store memo to hear of. A Collect landing after this look is the next
-            // gather's, as if this one had run just before it (the exchange below races it the
-            // same way); `current` already holds the empty word NothingCollected relies on.
-            if (!IsValid(current.load(std::memory_order_acquire).address) && back_buffer.empty()) {
-                return;
-            }
-            // FRITCHII_STORE_MEMO: the collected writes are taken here (g_store_memo_epoch).
-            const Common::StoreMemoClear clear{Common::StoreMemoGatherGen};
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
             front_buffer.swap(back_buffer);
             if (IsValid(t.address)) {
                 front_buffer.emplace_back(t);
             }
         }
-        // FRITCHII_WRITE_REMARK: the collected writes are taken, and their pages read from guest
-        // memory after this; a write whose mark was taken and whose bytes may not have landed yet
-        // sees the move after its store and marks again (Core::g_pages_tracked_generation).
-        g_pages_tracked_generation.fetch_add(1, std::memory_order_seq_cst);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
         for (auto& transform : front_buffer) {
             ForEachRun(transform, callback);
         }
         front_buffer.clear();
     }
 
-    /// FRITCHII_GATHER_EMPTY_TEST: true when no collected write waits for a gather, without a lock.
-    /// Only Gather stores the empty word, in the locked section that also takes back_buffer;
-    /// every Collect that adds bits leaves `current` holding a word that is not the empty one
-    /// (its CAS, or the push's exchange, made in the same locked section as the push). So a
-    /// Collect that happens before this load is seen as its own store or a later one: another
-    /// Collect's (not empty) or a Gather's empty word, which took it (atomics' coherence).
-    [[nodiscard]] bool NothingCollected() const noexcept {
-        const TransformAddress t = current.load(std::memory_order_acquire);
-        return t.address == default_transform.address && t.mask == default_transform.mask;
+    /// False when Gather would find nothing. Every Collect that adds a write leaves its transform
+    /// in `current` (by compare-exchange, or by exchange after pushing the one before to
+    /// back_buffer under `guard`), and only Gather, which takes back_buffer too, empties `current`
+    /// again. An empty transform has no mask bits. Without the locks: a Collect it misses is one
+    /// the caller may order after itself.
+    [[nodiscard]] bool MayHavePending() const {
+        return current.load(std::memory_order_acquire).mask != 0;
     }
 
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
@@ -143,6 +121,40 @@ private:
         u32 address;
         u32 mask;
     };
+
+    /// [address, address + size) lies in one page and size is not 0, so the mask has bits.
+    void CollectInPage(PAddr address, size_t size) {
+        TransformAddress t = BuildTransform(address, size);
+        TransformAddress tmp, original;
+        do {
+            tmp = current.load(std::memory_order_acquire);
+            original = tmp;
+            if (tmp.address != t.address) {
+                if (IsValid(tmp.address)) {
+                    std::scoped_lock lk(guard);
+                    back_buffer.emplace_back(tmp);
+                    current.exchange(t, std::memory_order_relaxed);
+                    CountCollect();
+                    return;
+                }
+                tmp.address = t.address;
+                tmp.mask = 0;
+            }
+            if ((tmp.mask | t.mask) == tmp.mask) {
+                return;
+            }
+            tmp.mask |= t.mask;
+        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
+                                                std::memory_order_relaxed));
+        CountCollect();
+    }
+
+    /// After the write is in `current`: a reader that sees the count sees the write.
+    void CountCollect() {
+        if (count_collects) {
+            collects.fetch_add(1, std::memory_order_release);
+        }
+    }
 
     template <typename Func>
     static void ForEachRun(const TransformAddress& transform, Func&& callback) {
@@ -194,18 +206,11 @@ private:
     }
 
     std::atomic<TransformAddress> current{};
+    std::atomic<u64> collects{};
     std::mutex guard;
     std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
 };
-
-/// The bank check's page flags live in common (common/fritchii_page_flags.h), where the write
-/// ring and the guest store's after-store point set them too.
-using Common::DevicePageFlags;
-static_assert(DevicePageFlags::PageBits == DEVICE_PAGEBITS);
-inline DevicePageFlags& g_collected_write_pages = Common::g_collected_write_pages;
-inline DevicePageFlags& g_buffer_write_pages = Common::g_buffer_write_pages;
-inline DevicePageFlags& g_watch_write_pages = Common::g_watch_write_pages;
 
 } // namespace Core

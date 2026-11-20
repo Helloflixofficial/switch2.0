@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -61,6 +62,11 @@ public:
     ~QueryCacheBase();
 
     void InvalidateRegion(VAddr addr, std::size_t size) {
+        // Compute inline writes come by the thousand a frame, mostly where no report ever was:
+        // pages never registered (page_filter) need no look under cache_mutex.
+        if (!page_filter.Any(addr, size)) {
+            return;
+        }
         IterateCache<true>(addr, size,
                            [this](QueryLocation location) { InvalidateQuery(location); });
     }
@@ -73,6 +79,9 @@ public:
 
     /// Writes out the finalized reports in the region. True when some still wait for host results.
     bool SemiFlushRegion(VAddr addr, std::size_t size) {
+        if (!page_filter.Any(addr, size)) {
+            return false;
+        }
         bool result = false;
         // Visits every query in the range: each final value not written yet is written here.
         IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
@@ -89,16 +98,42 @@ public:
         return mask;
     }
 
-    /// Whether a report in the region is still listed (pending host results, or written and not
-    /// unregistered yet). Only the cache mutex: callable from the split front.
-    [[nodiscard]] bool HasCachedReports(VAddr addr, size_t size) {
-        bool result = false;
-        IterateCache<false>(addr, size, [&result](QueryLocation) { result = true; });
-        return result;
+    /// Any thread: whether the cache holds a report that can still land in [addr, addr + size),
+    /// written out by SemiFlushRegion or once its host result comes in: one whose value and
+    /// timestamp (16 bytes from its address) reach into the range.
+    [[nodiscard]] bool HoldsQueries(VAddr addr, size_t size) {
+        if (size == 0) {
+            return false;
+        }
+        constexpr u64 report_size = 16;
+        const u64 begin = addr >= report_size - 1 ? addr - (report_size - 1) : 0;
+        const u64 end = addr + size;
+        if (!page_filter.Any(begin, end - begin)) {
+            return false;
+        }
+        std::scoped_lock lock(cache_mutex);
+        for (u64 page = begin >> Core::DEVICE_PAGEBITS; page <= (end - 1) >> Core::DEVICE_PAGEBITS;
+             ++page) {
+            const auto it = cached_queries.find(page);
+            if (it == cached_queries.end()) {
+                continue;
+            }
+            const u64 page_start = page << Core::DEVICE_PAGEBITS;
+            for (const auto& entry : it->second) {
+                const u64 query = page_start + entry.first;
+                if (query >= begin && query < end) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size) {
+        if (!page_filter.Any(addr, size)) {
+            return false;
+        }
         bool result = false;
         IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
             result |= IsQueryDirty(location);
@@ -116,26 +151,6 @@ public:
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
                        u32 payload, u32 subreport);
 
-    /// One follower (FRITCHII_ONEF_QUERY_OPS=2): whether a report of `type` lands later, at a
-    /// fence or flush (a streamer exists), not inside CounterReport (the payload write a type
-    /// without a streamer becomes).
-    [[nodiscard]] bool ReportLandsLater(QueryType type) const;
-    /// One follower (fable_b 16.2): whether a report of `type` written now makes a pending sync.
-    [[nodiscard]] bool ReportMakesPendingSync(QueryType type) const;
-    /// One follower (fable_b 19.4, FRITCHII_ONEF_SEM_E), E at the report's place: a payload
-    /// write to game memory, the waiters and the listeners, as CounterReport's immediate write
-    /// (`completion` false) or a synced fence report's operation (true) does it. The streamers
-    /// (R's) are not touched.
-    void WritePayloadNow(DAddr cpu_addr, GPUVAddr addr, u32 payload, bool has_timestamp,
-                         bool completion);
-    /// R: the streamer's side of a payload write E made, its pending sync for the next fence.
-    void NotePayloadWritten(DAddr cpu_addr, bool has_timestamp, u32 payload, u32 subreport);
-
-    /// CounterReport with `addr` already translated (FRITCHII_ONEF_QUERY_OPS: E translates at
-    /// its stream place, R writes the report).
-    void CounterReportAt(GPUVAddr addr, std::optional<DAddr> device, QueryType counter_type,
-                         QueryPropertiesFlags flags, u32 payload, u32 subreport);
-
     void NotifyWFI();
 
     bool AccelerateHostConditionalRendering();
@@ -146,15 +161,7 @@ public:
     bool HasUncommittedFlushes() const;
 
     /// Whether a new fence has queries to flush or host writes to sync for this cache.
-    /// `ignore_payload_sync` (EDEN_NX2_EXP28 & 1, the original's FENCE_TRIM): payload
-    /// releases' host buffer syncs don't count; they wait for a later fence or wait for idle.
-    bool HasPendingFenceWork(bool ignore_payload_sync = false) const;
-
-    /// Whether NotifyWFI would sync query results now (a streamer has pending syncs).
-    bool HasPendingSync() const;
-
-    /// EXP28 & 1: a fence was skipped although payload releases wait for their host sync.
-    void NotePayloadSyncDeferred();
+    bool HasPendingFenceWork() const;
 
     bool ShouldWaitAsyncFlushes();
 
@@ -173,6 +180,47 @@ protected:
             std::is_same_v<std::invoke_result_t<Func, QueryLocation>, bool>;
         const u64 addr_begin = addr;
         const u64 addr_end = addr_begin + size;
+
+        // A read of a few words (the macro DMA reads of reports, ~1,700 a frame at Ocarina of
+        // Time's water) looks up the offsets a query overlapping it can start at, instead of
+        // walking every query of the page (hundreds there). Same queries, from the same pages.
+        static constexpr u64 MaxProbes = 32;
+        const u64 page_first = (addr_begin >> Core::DEVICE_PAGEBITS) << Core::DEVICE_PAGEBITS;
+        const u64 probe_first =
+            (std::max)(addr_begin >= sizeof(u32) - 1 ? addr_begin - (sizeof(u32) - 1) : 0,
+                       page_first);
+        if (addr_end > probe_first && addr_end - probe_first <= MaxProbes) {
+            std::scoped_lock lock(cache_mutex);
+            u64 cached_page = ~u64{0};
+            ::Common::unordered_map<u32, QueryLocation>* contents = nullptr;
+            for (u64 query_addr = probe_first; query_addr < addr_end; ++query_addr) {
+                const u64 page = query_addr >> Core::DEVICE_PAGEBITS;
+                if (page != cached_page) {
+                    cached_page = page;
+                    const auto it = cached_queries.find(page);
+                    contents = it != cached_queries.end() ? &it->second : nullptr;
+                }
+                if (contents == nullptr) {
+                    continue;
+                }
+                const auto query =
+                    contents->find(static_cast<u32>(query_addr & Core::DEVICE_PAGEMASK));
+                if (query == contents->end()) {
+                    continue;
+                }
+                if constexpr (RETURNS_BOOL) {
+                    if (func(query->second)) {
+                        return;
+                    }
+                } else {
+                    func(query->second);
+                }
+                if constexpr (remove_from_cache) {
+                    contents->erase(query);
+                }
+            }
+            return;
+        }
 
         const u64 page_end = addr_end >> Core::DEVICE_PAGEBITS;
         std::scoped_lock lock(cache_mutex);
@@ -221,10 +269,10 @@ protected:
     bool IsQueryDirty(QueryLocation location);
     bool SemiFlushQueryDirty(QueryLocation location);
     void RequestGuestHostSync();
-    /// Before a report's bytes go to guest memory: a download for a guest read still on its way
-    /// would write the GPU's older copy over them later (as MemoryManager::Write; EXP49).
-    void FinishReads(DAddr address, size_t size);
     void UnregisterPending();
+    /// Before a report's bytes go to guest memory: a download for a guest read still on its way
+    /// would write the GPU's older copy over them later (as MemoryManager::Write).
+    void FinishReads(DAddr address, size_t size);
 
     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
     std::mutex cache_mutex;

@@ -184,26 +184,6 @@ struct StorageBufferDescriptor {
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
-/// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF / FRITCHII_STORE_FOOTPRINT: what the store
-/// analysis found for a written storage buffer (Info::storage_write_extras).
-struct StorageWriteExtra {
-    /// Why write_extent is unknown (Known when proven)
-    ExtentUnknownWhy write_unknown{};
-    /// The store extent with constant buffer words in it (unbounded when none was found)
-    StorageCbufExtent cbuf_extent{};
-    /// FRITCHII_STORE_FOOTPRINT: the bytes its stores can land on, as residues (none unless
-    /// written and every store's offset is the pointer plus a known congruence)
-    StorageStoreFootprint footprint{};
-    /// FRITCHII_EXTENT_SHARED: Known when cbuf_extent was proven by following offsets through
-    /// shared memory slots (cbuf_extent.via_shared), else why that try failed (Unrecorded: not
-    /// tried, the plain or cbuf extent already held or no shared load was involved)
-    ExtentUnknownWhy shared_why{};
-    /// FRITCHII_EXTENT_GUARD: Known when cbuf_extent was proven with the branch conditions on the
-    /// stores' paths (cbuf_extent.via_guard), else why that try failed (Unrecorded: not tried,
-    /// an earlier extent already held)
-    ExtentUnknownWhy guard_why{};
-};
-
 struct TextureBufferDescriptor {
     bool has_secondary;
     u32 cbuf_index;
@@ -264,16 +244,6 @@ struct TextureDescriptor {
     /// Whether the constant buffer word above reaches the handle only as the address of a load:
     /// a pointer, never a texture handle, which binds no texture (see HandleIsStoragePointer)
     bool handle_is_pointer_word{};
-    /// EDEN_NX2_DEPTH_CENSUS (fable52_answer_potroom 4): how the shader reads the texture, the
-    /// Census* bits of every instruction on it. Not stored with the info (info_serialize.cpp):
-    /// 0 for an info from the precompiled cache, CensusKnown unset. In the struct's padding.
-    u8 census_use{};
-    static constexpr u8 CensusKnown = 1;  ///< Set by the texture pass
-    static constexpr u8 CensusFetch = 2;  ///< texelFetch
-    static constexpr u8 CensusQuery = 4;  ///< textureSize (ImageQueryDimensions)
-    static constexpr u8 CensusOffset = 8; ///< a sample, fetch or gather with texel offsets
-    static constexpr u8 CensusGather = 16;
-    static constexpr u8 CensusRect = 32;  ///< a rectangle texture sampled (normalized by size)
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
@@ -355,6 +325,9 @@ struct Info {
     bool stores_tess_level_inner{};
 
     bool stores_indexed_attributes{};
+    /// The vertex shader stores one value to position z and w, putting every vertex on viewport
+    /// 0's far plane (z / w = 1), the usual way to draw a sky
+    bool position_on_far_plane{};
 
     bool stores_global_memory{};
     bool uses_local_memory{};
@@ -373,6 +346,11 @@ struct Info {
     bool uses_sparse_residency{};
     bool uses_demote_to_helper_invocation{};
     bool uses_subgroup_vote{};
+    /// Set when a barrier in divergent control flow lost its execution barrier, see
+    /// ConditionalBarrierPass.
+    bool demoted_conditional_barrier{};
+    /// Set when ConditionalBarrierPass made barriers wait only while the workgroup's branches agree
+    bool uses_barrier_vote{};
     bool uses_subgroup_mask{};
     bool uses_fswzadd{};
     bool uses_derivatives{};
@@ -428,16 +406,6 @@ struct Info {
     boost::container::static_vector<ConstantBufferDescriptor, MAX_CBUFS>
         constant_buffer_descriptors;
     boost::container::static_vector<StorageBufferDescriptor, MAX_SSBOS> storage_buffers_descriptors;
-    /// One per storage_buffers_descriptors entry, same order: how far the program's loads and
-    /// atomics reach past the pointer. A size other than the descriptors' means unknown.
-    std::vector<StorageWriteExtent> storage_read_extents;
-    /// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: one per storage_buffers_descriptors entry,
-    /// same order, or empty (no written buffer with an unknown extent, or not recorded). A size
-    /// other than the descriptors' means none. Not stored with the info (info_serialize.cpp): empty
-    /// for an info from the precompiled cache.
-    std::vector<StorageWriteExtra> storage_write_extras;
-    // (FRITCHII_STORE_FOOTPRINT keeps its footprints in the extras too: they are there for every
-    // program with a written storage buffer now.)
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;
@@ -445,6 +413,8 @@ struct Info {
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;
     ImageDescriptors image_descriptors;
+
+    bool operator==(const Info&) const = default;
 };
 
 template <typename Descriptors>
@@ -454,26 +424,6 @@ u32 NumDescriptors(const Descriptors& descriptors) {
         num += desc.count;
     }
     return num;
-}
-
-/// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: storage descriptor `index`'s extra, or null
-/// when the info has none (every BindComputeStorageBuffer caller passes this).
-[[nodiscard]] inline const StorageWriteExtra* StorageWriteExtraOf(const Info& info,
-                                                                  size_t index) {
-    return info.storage_write_extras.size() == info.storage_buffers_descriptors.size() &&
-                   index < info.storage_write_extras.size()
-               ? &info.storage_write_extras[index]
-               : nullptr;
-}
-
-/// FRITCHII_FEEDER_LANE: storage descriptor `index`'s read extent (its loads and atomics), or null
-/// when the info has none.
-[[nodiscard]] inline const StorageWriteExtent* StorageReadExtentOf(const Info& info,
-                                                                   size_t index) {
-    return info.storage_read_extents.size() == info.storage_buffers_descriptors.size() &&
-                   index < info.storage_read_extents.size()
-               ? &info.storage_read_extents[index]
-               : nullptr;
 }
 
 

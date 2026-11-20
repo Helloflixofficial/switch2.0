@@ -8,6 +8,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include "common/common_types.h"
@@ -16,7 +17,7 @@ struct ZSTD_DDict_s;
 
 namespace VideoCommon::ShaderWarm {
 
-/// Readers for the NVN2 shader containers found in Switch 2 game files. Port of the
+/// Readers for the NVN2 shader containers found in Switch 2 game files. Port of the PR #214
 /// Python extractor (tools/nx2/extract_static_shaders.py, shader_archive.py,
 /// shader_containers.py): every check and every error case is kept, so both find the same
 /// programs.
@@ -64,6 +65,18 @@ public:
 private:
     std::unordered_map<u32, ZSTD_DDict_s*> dictionaries;
 };
+
+/// What the precache builder does with a RomFS file.
+enum class GameFileKind : u8 {
+    Other,            ///< Not read
+    ShaderArchive,    ///< *.bfsha, *.sarc, *.bnsh, *.cgsb, *.shn or *.sharcb, raw or zstd (.zs)
+    Effect,           ///< Effect/*.vsetb.byml.zs or *.esetb.byml.zs and *.ptcl (raw or zstd), read
+                      ///< after every shader archive
+    ZstdDictionaries, ///< Pack/ZsDic.pack.zs
+};
+
+/// Kind of the RomFS file at `path` ('/' separated, file extensions in any case).
+[[nodiscard]] GameFileKind ClassifyGameFile(std::string_view path);
 
 /// Walks one archive file (zstd, DCX, SARC, BND4, BFSHA, BNSH, effect bundles, CGSB, SHN, BAHS)
 /// and calls `on_record` for every shader program found. Errors inside a SARC or BND4 member

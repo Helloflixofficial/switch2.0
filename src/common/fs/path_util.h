@@ -13,7 +13,7 @@
 namespace Common::FS {
 
 enum class EdenPath {
-    EdenDir,        // Where yuzu stores its data.
+    EdenDir,        // Where Lichii stores its data.
     AmiiboDir,      // Where Amiibo backups are stored.
     CacheDir,       // Where cached filesystem data is stored.
     ConfigDir,      // Where config files are stored.
@@ -22,12 +22,13 @@ enum class EdenPath {
     KeysDir,        // Where key files are stored.
     LoadDir,        // Where cheat/mod files are stored.
     LogDir,         // Where log files are stored.
+    LosslessDir,    // Where the user-supplied Lossless Scaling library is stored.
     NANDDir,        // Where the emulated NAND is stored.
     PlayTimeDir,    // Where play time data is stored.
     PostPresetDir,
     PostShaderDir,  // Where user post-processing shaders are stored.
     SaveDir,        // Where save data is stored.
-    ScreenshotsDir, // Where yuzu screenshots are stored.
+    ScreenshotsDir, // Where Lichii screenshots are stored.
     SDMCDir,        // Where the emulated SDMC is stored.
     ShaderDir,      // Where shaders are stored.
     TASDir,         // Where TAS scripts are stored.
@@ -41,10 +42,6 @@ enum EmuPath {
     LegacyEdenDir,
     LegacyEdenConfigDir,
     LegacyEdenCacheDir,
-
-    LichiiDir,
-    LichiiConfigDir,
-    LichiiCacheDir,
 
     CitronDir,
     CitronConfigDir,
@@ -277,7 +274,7 @@ void SetAppDirectory(const std::string& app_directory);
 void SetEdenPath(EdenPath eden_path, const std::filesystem::path& new_path);
 
 /**
- * Creates all necessary Fritchii paths in the filesystem.
+ * Creates all necessary Eden paths in the filesystem.
  */
 void CreateEdenPaths();
 
@@ -319,14 +316,14 @@ void SetEdenPath(EdenPath eden_path, const Path& new_path) {
 [[nodiscard]] std::filesystem::path GetHomeDirectory();
 
 /**
- * Gets the relevant paths for Fritchii to store its data based on the given XDG environment variable.
+ * Gets the relevant paths for Lichii to store its data based on the given XDG environment variable.
  * See https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
  * Defaults to $HOME/.local/share for main application data,
  * $HOME/.cache for cached data, and $HOME/.config for configuration files.
  *
  * @param env_name XDG environment variable name
  *
- * @returns The path where Fritchii should store its data.
+ * @returns The path where Lichii should store its data.
  */
 [[nodiscard]] std::filesystem::path GetDataDirectory(const std::string& env_name);
 
@@ -350,11 +347,11 @@ enum class DirectorySeparator {
 };
 
 // Splits the path on '/' or '\' and put the components into a vector
-// i.e. "C:\Users\Yuzu\Documents\save.bin" becomes {"C:", "Users", "Yuzu", "Documents", "save.bin" }
+// i.e. "C:\Users\Lichii\Documents\save.bin" becomes {"C:", "Users", "Lichii", "Documents", "save.bin" }
 [[nodiscard]] std::vector<std::string_view> SplitPathComponents(std::string_view filename);
 
 // Splits the path on '/' or '\' and put the components into a vector
-// i.e. "C:\Users\Yuzu\Documents\save.bin" becomes {"C:", "Users", "Yuzu", "Documents", "save.bin" }
+// i.e. "C:\Users\Lichii\Documents\save.bin" becomes {"C:", "Users", "Lichii", "Documents", "save.bin" }
 [[nodiscard]] std::vector<std::string> SplitPathComponentsCopy(std::string_view filename);
 
 // Normalizes directory separators, removes duplicate and non-root trailing separators, and resolves

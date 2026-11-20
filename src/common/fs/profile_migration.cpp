@@ -119,6 +119,28 @@ void CheckTree(const fs::path& root) {
     }
 }
 
+// A source root may itself be a link to a directory, for example a junction that keeps the old
+// profile on another drive. Import from the directory it points to, so every overlap check and
+// the recovery journal use the real path. Links inside the tree are still refused by CheckTree.
+// Move is refused for a linked root: it would rename the real directory behind the link, which
+// other links or programs may still use.
+fs::path ResolveSourceRoot(const fs::path& root, Strategy strategy) {
+    if (!Common::FS::IsSymlink(root)) {
+        return root;
+    }
+    if (strategy == Strategy::Move) {
+        throw std::runtime_error("Move cannot import a linked profile folder, use Copy or Link: " +
+                                 root.string());
+    }
+    std::error_code error;
+    const auto target = fs::canonical(root, error);
+    if (error || Common::FS::IsSymlink(target) || !fs::is_directory(target)) {
+        throw std::runtime_error("Migration source link does not lead to a real directory: " +
+                                 root.string());
+    }
+    return target;
+}
+
 std::vector<Root> Validate(const Plan& plan) {
     if (plan.roots.empty() || plan.state_dir.empty()) {
         throw std::runtime_error("Migration requires roots and an external state directory");
@@ -130,11 +152,11 @@ std::vector<Root> Validate(const Plan& plan) {
         if (root.source.empty() || root.destination.empty()) {
             throw std::runtime_error("Migration paths cannot be empty");
         }
-        CheckTree(root.source);
+        const auto source = ResolveSourceRoot(root.source, plan.strategy);
+        CheckTree(source);
         const auto destination = Absolute(root.destination);
-        Root normalized{fs::weakly_canonical(Absolute(root.source)),
-                        fs::weakly_canonical(destination.parent_path()) / destination.filename(),
-                        root.strategy};
+        Root normalized{fs::weakly_canonical(Absolute(source)),
+                        fs::weakly_canonical(destination.parent_path()) / destination.filename()};
         if (Overlaps(normalized.source, fs::weakly_canonical(destination))) {
             throw std::runtime_error("Migration source and destination must not overlap");
         }
@@ -396,15 +418,10 @@ void RunImport(const Plan& plan, const Prepare& prepare) {
     }
     WriteJournal(plan.state_dir, entries);
     std::vector<Root> staged;
-    const auto strategy_of = [&](const Entry& entry) {
-        return entry.root.strategy.value_or(plan.strategy);
-    };
-    const bool any_copy = std::ranges::any_of(
-        entries, [&](const Entry& entry) { return strategy_of(entry) != Strategy::Link; });
     try {
         for (const auto& entry : entries) {
             fs::create_directories(entry.stage.parent_path());
-            if (strategy_of(entry) == Strategy::Link) {
+            if (plan.strategy == Strategy::Link) {
                 const bool linked = plan.create_link
                                         ? plan.create_link(entry.root.source, entry.stage)
                                         : Common::FS::CreateSymlink(entry.root.source, entry.stage);
@@ -418,7 +435,7 @@ void RunImport(const Plan& plan, const Prepare& prepare) {
             }
             staged.push_back({entry.root.source, entry.stage});
         }
-        if (prepare && any_copy) {
+        if (prepare && plan.strategy != Strategy::Link) {
             prepare(staged);
         }
         for (const auto& entry : entries) {
@@ -441,8 +458,8 @@ void RunImport(const Plan& plan, const Prepare& prepare) {
         }
         fs::rename(entry.stage, entry.root.destination);
     }
-    for (const auto& entry : entries) {
-        if (strategy_of(entry) == Strategy::Move) {
+    if (plan.strategy == Strategy::Move) {
+        for (const auto& entry : entries) {
             fs::rename(entry.root.source, entry.source_backup);
         }
     }

@@ -4,7 +4,6 @@
 #include <array>
 #include <initializer_list>
 #include <map>
-#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -13,7 +12,6 @@
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
-#include "shader_recompiler/info_serialize.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/shader_handle_program.h"
 
@@ -263,7 +261,6 @@ TEST_CASE("Texture arrays reserve the final static and buffer resources",
             info.storage_buffers_descriptors.push_back({.count = 1});
         }
         Shader::HostTranslateInfo host;
-        host.support_handle_table_arrays = true; // EDEN_NX2_LIGHT_TABLE_ARRAYS
         host.ApplyDescriptorLimitPolicy();
         host.max_per_stage_resources = 16;
         host.max_per_stage_descriptor_sampled_images = 16;
@@ -307,7 +304,6 @@ TEST_CASE("Texture arrays fit the sampler limits of their stage and pipeline",
         first.texture_buffer_descriptors.push_back({.count = 1});
     }
     Shader::HostTranslateInfo host;
-    host.support_handle_table_arrays = true; // EDEN_NX2_LIGHT_TABLE_ARRAYS
     host.ApplyDescriptorLimitPolicy();
     host.max_per_stage_descriptor_sampled_images = 12;
     host.max_per_stage_descriptor_samplers = 8;
@@ -340,7 +336,6 @@ TEST_CASE("Texture arrays a cap cut to one element still count as arrays",
     // With one sampler a stage, the pass cuts the array to one element before it has the other
     // textures of the stage. The limits of the stage and of the pipeline still count it.
     Shader::HostTranslateInfo host;
-    host.support_handle_table_arrays = true; // EDEN_NX2_LIGHT_TABLE_ARRAYS
     host.ApplyDescriptorLimitPolicy();
     host.max_per_stage_descriptor_samplers = 1;
     std::array<HandleProgram, 2> stages;
@@ -373,6 +368,40 @@ TEST_CASE("Texture arrays a cap cut to one element still count as arrays",
     CHECK_NOTHROW(Shader::Optimization::LimitSampledTextureArrays(shader.program, host));
 }
 
+TEST_CASE("A texture array indexed by a found bit has 32 elements",
+          "[video_core][texture_handles]") {
+    for (const bool shift : {false, true}) {
+        CAPTURE(shift);
+        HandleProgram shader;
+        shader.env.cbuf_values = {{{14, 0x300}, 0xabc}};
+        const Value msb{shader.Emit(Opcode::FindUMsb32, {shader.Storage(0)})};
+        const Value index{
+            shift ? shader.Emit(Opcode::SelectU32,
+                                {shader.Emit(Opcode::IEqual, {msb, Value{~0U}}), msb,
+                                 shader.Emit(Opcode::BitwiseXor32, {msb, Value{31U}})})
+                  : msb};
+        const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {index, Value{3U}})};
+        auto& sample{shader.Sample(
+            shader.Emit(Opcode::GetCbufU32, {Value{14U}, shader.Add(offset, Value{0x300U})}))};
+        shader.Run();
+        const auto& descriptor = shader.Descriptor(sample);
+        CHECK(descriptor.handle_program == ~0U);
+        CHECK(descriptor.count == 32);
+        CHECK(descriptor.size_shift == 3);
+        CHECK(descriptor.cbuf_index == 14);
+        CHECK(descriptor.cbuf_offset == 0x300);
+        REQUIRE(sample.Arg(0).InstRecursive()->GetOpcode() == Opcode::UMin32);
+        CHECK(sample.Arg(0).InstRecursive()->Arg(1).U32() == 31);
+    }
+    HandleProgram shader;
+    shader.env.cbuf_values = {{{14, 0x300}, 0xabc}};
+    const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {shader.Storage(0), Value{3U}})};
+    auto& sample{shader.Sample(
+        shader.Emit(Opcode::GetCbufU32, {Value{14U}, shader.Add(offset, Value{0x300U})}))};
+    shader.Run();
+    CHECK(shader.Descriptor(sample).count > 32);
+}
+
 TEST_CASE("Texture descriptors a cap makes equal share one binding",
           "[video_core][texture_handles]") {
     // An array of the textures at c0[0] and the texture at c0[0] read on its own: cut to one
@@ -389,7 +418,6 @@ TEST_CASE("Texture descriptors a cap makes equal share one binding",
     auto& scaled{*shader.Emit(Opcode::IsTextureScaled, {Value{1U}}).Inst()};
 
     Shader::HostTranslateInfo host;
-    host.support_handle_table_arrays = true; // EDEN_NX2_LIGHT_TABLE_ARRAYS
     host.ApplyDescriptorLimitPolicy();
     host.max_per_stage_descriptor_samplers = 1;
     Shader::Optimization::LimitSampledTextureArrays(shader.program, host);
@@ -690,7 +718,7 @@ TEST_CASE("Dual vertex programs join the descriptors and storage buffers of both
             {{}, IR::AbstractSyntaxNode::Type::Return},
         };
     }
-    const Shader::HostTranslateInfo host{.support_handle_table_arrays = true};
+    const Shader::HostTranslateInfo host{};
     const IR::Program merged{Shader::Maxwell::MergeDualVertexPrograms(
         vertex_a.program, vertex_b.program, vertex_b.env, host)};
 
@@ -815,7 +843,6 @@ TEST_CASE("Texture arrays that become distinct descriptors share the cap",
         samples.push_back(&shader.Sample(shader.Emit(Opcode::BitwiseOr32, {texture, sampler})));
     }
     Shader::HostTranslateInfo host;
-    host.support_handle_table_arrays = true; // EDEN_NX2_LIGHT_TABLE_ARRAYS
     host.ApplyDescriptorLimitPolicy();
     host.max_per_stage_descriptor_sampled_images = 16;
     host.max_descriptor_set_sampled_images = 16;
@@ -897,6 +924,14 @@ TEST_CASE("Storage handle words are read from the host-aligned buffer base",
     }
 }
 
+TEST_CASE("Handle table support distinguishes cached environment reads",
+          "[video_core][texture_handles]") {
+    Shader::HostTranslateInfo host;
+    const u32 without_tables{host.EnvironmentReadProperties()};
+    host.support_handle_table_arrays = true;
+    CHECK(host.EnvironmentReadProperties() == (without_tables | (1U << 9)));
+}
+
 TEST_CASE("Task and mesh texture arrays share the compute stage budget",
           "[video_core][texture_handles]") {
     // Each guest stage fits by itself; their arrays, texel buffers and auxiliary output buffers
@@ -913,7 +948,6 @@ TEST_CASE("Task and mesh texture arrays share the compute stage budget",
         }
         stages[0].program.info.texture_buffer_descriptors.push_back({.count = 1});
         Shader::HostTranslateInfo host;
-        host.support_handle_table_arrays = true; // EDEN_NX2_LIGHT_TABLE_ARRAYS
         host.ApplyDescriptorLimitPolicy();
         host.max_per_stage_resources = 21;
         host.max_per_stage_descriptor_sampled_images = 32;
@@ -992,51 +1026,4 @@ TEST_CASE("A handle word the translation saw dereferenced is not a handle withou
     CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
     desc.handle_program = 0;
     CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
-}
-
-TEST_CASE("Kept infos keep a texture's light table flags without changing the old bytes",
-          "[video_core][texture_handles]") {
-    Shader::TextureDescriptor desc{};
-    desc.is_depth = true;
-    desc.count = 64;
-    desc.handle_program = 0;
-    desc.handle_is_pointer_word = true;
-    desc.is_descriptor_array = true;
-    Shader::Info info;
-    info.texture_descriptors.push_back(desc);
-    std::vector<u8> bytes;
-    Shader::SerializeInfo(info, bytes);
-    std::span<const u8> in{bytes};
-    Shader::Info read;
-    REQUIRE(Shader::DeserializeInfo(in, read));
-    CHECK(in.empty());
-    REQUIRE(read.texture_descriptors.size() == 1);
-    CHECK(read.texture_descriptors[0].is_depth);
-    CHECK(read.texture_descriptors[0].handle_is_pointer_word);
-    CHECK(read.texture_descriptors[0].is_descriptor_array);
-    CHECK(read.texture_descriptors[0].count == 64);
-
-    // Both flags false (EDEN_NX2_LIGHT_TABLE_ARRAYS off): is_depth's byte is 1 as before.
-    Shader::Info plain;
-    desc.handle_is_pointer_word = false;
-    desc.is_descriptor_array = false;
-    plain.texture_descriptors.push_back(desc);
-    std::vector<u8> plain_bytes;
-    Shader::SerializeInfo(plain, plain_bytes);
-    REQUIRE(plain_bytes.size() == bytes.size());
-    size_t differing = 0;
-    for (size_t i = 0; i < bytes.size(); ++i) {
-        if (bytes[i] != plain_bytes[i]) {
-            ++differing;
-            CHECK(plain_bytes[i] == 1);
-            CHECK(bytes[i] == 7);
-        }
-    }
-    CHECK(differing == 1);
-    std::span<const u8> plain_in{plain_bytes};
-    Shader::Info plain_read;
-    REQUIRE(Shader::DeserializeInfo(plain_in, plain_read));
-    CHECK(plain_read.texture_descriptors[0].is_depth);
-    CHECK_FALSE(plain_read.texture_descriptors[0].handle_is_pointer_word);
-    CHECK_FALSE(plain_read.texture_descriptors[0].is_descriptor_array);
 }

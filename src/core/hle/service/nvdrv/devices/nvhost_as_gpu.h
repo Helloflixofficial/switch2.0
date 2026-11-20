@@ -12,7 +12,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include "common/container/unordered_set.h"
 #include <vector>
 
 #include "common/address_space.h"
@@ -112,8 +111,6 @@ private:
     };
     static_assert(sizeof(IoctlRemapEntry) == 20, "IoctlRemapEntry is incorrect size");
 
-    ::Common::unordered_set<s64_le> map_buffer_offsets{};
-
     struct IoctlMapBufferEx {
         MappingFlags flags{}; // bit0: fixed_offset, bit2: cacheable
         u32_le kind{};        // -1 is default
@@ -196,8 +193,8 @@ private:
     std::mutex mutex; //!< Locks all AS operations
 
     struct VM {
-        static constexpr u32 YUZU_PAGESIZE{0x1000};
-        static constexpr u32 PAGE_SIZE_BITS{static_cast<u32>(std::countr_zero<u32>(YUZU_PAGESIZE))};
+        static constexpr u32 LICHII_PAGESIZE{0x1000};
+        static constexpr u32 PAGE_SIZE_BITS{static_cast<u32>(std::countr_zero<u32>(LICHII_PAGESIZE))};
 
         static constexpr u32 SUPPORTED_BIG_PAGE_SIZES{0x30000};
         static constexpr u32 DEFAULT_BIG_PAGE_SIZE{0x20000};
@@ -219,7 +216,7 @@ private:
         bool initialised{};
         bool absolute_big_page_limit{}; //!< Switch 2 layout: big-page limit is va_range_end
     } vm;
-    std::unique_ptr<Tegra::MemoryManager> gmmu;
+    std::shared_ptr<Tegra::MemoryManager> gmmu;
 
     struct IoctlNx2SyncpointShimInfo {
         u64_le address;
@@ -250,13 +247,6 @@ private:
     // A tile of a sparse region (nx2:gpu 216): its device pages show process memory, or nothing.
     void Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size);
     std::map<u64, std::pair<u64, DAddr>> nx2_sparse_ranges; ///< GPU address -> (size, device)
-    /// Sparse blocks Nx2BackSparse mapped behind their region's device pages: GPU address ->
-    /// (CPU address, size), under `mutex`. A block reaches here both from BackSparse and from
-    /// Nx2Sparse's replay of the recorded blocks; the SMMU keeps a duplicate map, so each is
-    /// mapped once. Dropped with the region and under a tile.
-    std::map<u64, std::pair<u64, u64>> nx2_backed_blocks;
-    /// Needs `mutex`: forgets the backed blocks overlapping [gpu_address, +size).
-    void Nx2ForgetBackedBlocks(u64 gpu_address, u64 size);
 };
 
 } // namespace Service::Nvidia::Devices

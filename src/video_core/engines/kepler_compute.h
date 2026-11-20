@@ -8,7 +8,6 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
@@ -23,9 +22,6 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
-#include "video_core/nx2_list_dispatch.h"
-#include "video_core/nx2_list_reader.h"
-#include "video_core/split_write_tracker.h"
 #include "video_core/textures/texture.h"
 
 namespace Core {
@@ -35,15 +31,17 @@ class System;
 namespace VideoCommon {
 class GpuSplit;
 }
-namespace VideoCommon::QmdPrediction {
-struct Record;
-}
-namespace VideoCommon::OotNetwork {
-struct BypassState;
+
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
 }
 
 namespace Tegra {
 class MemoryManager;
+}
+
+namespace Tegra::Nx2ListIndirect {
+class ComputeFront;
 }
 
 namespace VideoCore {
@@ -51,13 +49,6 @@ class RasterizerInterface;
 }
 
 namespace Tegra::Engines {
-
-/// EXP13=2-4: bytes another engine's front knows (a 3D inline upload) land at GPU [address,
-/// address + size) of `memory` when the back runs the work that ends at ring `position`, written
-/// with write-stamp tag `tag`: the QMD copy's inline QMD overlays and upload shadow blocks that
-/// still hold those bytes take them, as compute inline uploads patch them.
-void Nx2PatchQmdCopy(VideoCommon::GpuSplit& split, const MemoryManager& memory, GPUVAddr address,
-                     const u8* data, u64 size, u64 position, u64 tag);
 
 /// Draws left to trace after an upscale fallback (debug aid).
 extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
@@ -75,6 +66,8 @@ extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
     (offsetof(Tegra::Engines::KeplerCompute::LaunchParams, field_name) / sizeof(u32))
 
 class KeplerCompute final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     explicit KeplerCompute(MemoryManager& memory_manager);
     ~KeplerCompute();
@@ -82,8 +75,6 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
-    /// Whether a write to `method` can write memory (a dispatch, upload or report): with the
-    /// native class, every method besides those that only store their value; macros always.
     [[nodiscard]] bool MayWriteMemory(u32 method) const {
         if (method >= native_plain_methods.size()) {
             return true;
@@ -265,109 +256,77 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
-    /// EXP124: a macro's inline upload words (GpuSplit::MacroWords), each called as its
-    /// MacroWrite was; where the flush writes them in place, one flush for them all
-    /// (Upload::State, AccelerateInlineWords).
-    void CallMacroWords(Core::System& system, u32 method, const u32* words, u32 amount) override;
-
     std::optional<GPUVAddr> GetIndirectComputeAddress() const {
         return indirect_compute;
     }
 
+    /// The slot of GPU-written list words (Nx2ListIndirect) the dispatch being made takes its
+    /// group counts from, indirectly: its QMD's grid is the slot's placeholders.
+    std::optional<u32> GetIndirectListSlot() const {
+        return indirect_list_slot;
+    }
+
     bool IsNativeMode() const { return native_mode; }
-    /// One follower (FRITCHII_ONEF_OP_DISPATCH): R's view of a channel's compute engine, which
-    /// runs no method, takes E's native mode by value for a played dispatch (nothing else of
-    /// SetNativeMacroMode applies to a view).
-    void SetViewNativeMode(bool native) noexcept { native_mode = native; }
-    /// One follower, the same view: the indirect arguments' address E's dispatch had (or none).
-    void SetViewIndirect(std::optional<GPUVAddr> address) noexcept { indirect_compute = address; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
     /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
     /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
     /// tonemapped image.
     bool BypassOotNetwork(u64 program_id, u64 native_key);
-    /// Native program key of the dispatch being processed (0 until its shader is known).
-    u64 current_native_key{};
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
     /// uploads against a copy of the registers and sends the register writes to the back.
     bool FrontRunsMacros() const { return native_mode; }
-    /// List dispatches (nx2_list_dispatch.h): the call of macro `method`
-    /// whose three parameters are the GPU-written words at `address`. If the macro only stores a
-    /// dispatch's grid, the front stores a marker instead and the dispatch that carries it takes
-    /// its grid from `address` on the host GPU. False when the words have to be read.
-    bool FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 method, GPUVAddr address,
-                               const Nx2ListDispatch::ListReader& reader);
-    /// List guard (nx2_list_dispatch.h): where the channel keeps the list of the grid the data RAM's
-    /// marker stands for (the 3D engine's, which shares the data RAM).
-    void SetGridMarker(Nx2ListDispatch::GridMarker* marker) {
-        grid_marker = marker;
-    }
+    /// Whether FrontCallMethod takes `method`'s next word as a parameter of a macro it runs.
+    bool FrontRunsMacroWord(u32 method) const;
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call, const GPUVAddr* segment);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
+    /// The front, at a GPU-written list of `count` words that are all the parameters of the call
+    /// of macro method `method` about to start: whether the call takes the words as the
+    /// placeholders of `slot` (Nx2ListIndirect), the back's copy of them, instead of the words.
+    bool FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method, u32 count, u32 slot);
 
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
+    void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
+    /// `last_call`: the method's last word (the back's is_last_call; macro writes are their own).
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                         bool last_call);
+    void FrontNoteUpload(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                         bool last_call);
+    void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control);
+    void FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 last_word);
+    void FrontQmdCheck(VideoCommon::GpuSplit& split);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-    /// Tells the split a semaphore release just sent writes a known payload.
-    void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& state, u32 control) const;
-    bool FrontPlainWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
-                         u32 argument);
-    void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
-    /// What a method sent from the front may write on the back (GpuSplit::Effect).
-    VideoCommon::SplitWriteTracker::Effect FrontEffect(u32 method) const;
-    /// After sending it: the memory it writes, for the front's reads.
-    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
-    /// After sending it: what it may write as compute work, for the front's macro memory reads
-    /// (GpuSplit::NoteWriterRange, NoteUnboundedWriter, NoteDispatchWriter).
-    void FrontNoteWriter(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
-    /// EXP13: predicts the releases of the QMD a launch just sent signals (nx2_qmd_prediction.h).
-    void FrontPredictQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
-                         u32 argument) const;
-    /// EXP13=2: feeds the front's QMD scheduler copy the signal just sent (0xaf, 0xb0, 0x107).
-    void FrontMirrorQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
-                        u32 argument) const;
-    /// EXP13=2: runs the copy's scheduler for a signal of the QMD at `qmd_address`.
-    void FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_address, u32 argument) const;
-    /// EXP13=2: the QMD at `address` as the back will read it; `unknown` when the copy can't
-    /// tell (it resyncs then).
-    bool FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
-                      NativeQmdScheduler::Descriptor& descriptor, bool& unknown,
-                      VideoCommon::QmdPrediction::Record& info) const;
-    /// An exec_upload with `exec` was sent: the range its data writes.
-    void FrontNoteUpload(FrontState& state, u32 exec);
-    /// EXP13=2: data_upload words just sent: the inline QMD overlays they fall in take them.
-    void FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState& state, const u32* words,
-                            u32 count, u64 position) const;
-    /// EXP13=2: the data_upload words batched since (FrontState::upload_batch) to the copy.
-    void FrontFlushUploads(VideoCommon::GpuSplit& split, FrontState& state) const;
-    /// EXP124: the data_upload words a macro emitted since (FrontState::macro_upload_words) as
-    /// one entry, then the notes their MacroWrites made (the upload's range, EXP13's batch).
-    void FrontSendUploadWords(VideoCommon::GpuSplit& split, FrontState& state);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
-    /// FRITCHII_OOT_BYPASS_SAMPLED: No sharpening from the image the output pass samples.
-    bool BypassOotNetworkSampled(VideoCommon::OotNetwork::BypassState& state, u64 native_key);
+    bool BypassOotBaseNetwork();
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
     std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();
     bool TryFireEmblemUpscale(bool allow_history = true);
+    bool ScaleDlssRenderRegion(GPUVAddr constants, const std::optional<Texture::TICEntry>& input,
+                               const std::optional<Texture::TICEntry>& output,
+                               const std::optional<VideoCommon::FireEmblemUpscale::JitterSample>& jitter,
+                               const std::optional<Texture::TICEntry>& motion,
+                               const std::optional<Texture::TICEntry>& depth);
     void CaptureFireEmblemJitter();
     bool FinishDlssEvaluation();
     void CheckDlssNetwork();
+    /// Whether the network failed its checks for the rest of the session: its passes are skipped.
+    [[nodiscard]] bool DlssNetworkDroppedForGood() const;
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
     std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
@@ -378,19 +337,23 @@ private:
     struct DlssChain {
         bool active{};
         bool spatial_only{};
+        bool render_region{};
         bool output_pass{};
         u32 rejected{};
         u32 clean_evaluations{};
         bool native{};
         /// Health checks of the network's output against its input (CheckDlssNetwork): whether
-        /// this backend has them, good and bad results in a row, and why the network failed them
-        /// (None while it hasn't; then the replacement upscale draws the output for the session).
+        /// this backend has them, good and bad results in a row, why the network failed them
+        /// (None while it hasn't; then the replacement upscale draws the output) and how often it
+        /// was dropped for mismatched output (it is shown again once its output checks out, up
+        /// to DLSS_NETWORK_MAX_DROPS times).
         bool checked{};
         u32 good_checks{};
         u32 bad_checks{};
         VideoCore::GameDlssReason failure{};
-        /// Programs of evaluations that reached their output pass; they are skipped only after
-        /// the network fails its health checks.
+        u32 drops{};
+        /// Programs of evaluations that reached their output pass; they are skipped only once
+        /// the network is dropped for good (DlssNetworkDroppedForGood).
         std::unordered_set<u64> programs;
         /// This evaluation's programs and dispatches so far. Its programs join `programs` only
         /// at its output pass, so compute work after a look-alike first pass keeps running.
@@ -409,8 +372,7 @@ private:
     /// Native dispatches left to skip while a retained network is being replaced (bounded, so a
     /// non-network pass cannot silence the engine forever).
     u32 network_skip_remaining{};
-    /// Set when the replacement copy fails, so the full network runs from then on. Settings
-    /// oot_movie_upscale chooses the network itself (OotMovieNetworkChosen in the .cpp).
+    /// Set when the replacement copy fails, so the full network runs from then on.
     bool native_upscale_disabled{};
 
     /// Motion vectors and depth of Fire Emblem: Fortune's Weave's DLSS evaluation, from its first
@@ -443,7 +405,6 @@ private:
     void ProcessLaunch();
 
     void ConsumeSinkImpl(Core::System& system) override;
-    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.
     Texture::TICEntry GetTICEntry(u32 tic_index) const;
@@ -466,14 +427,9 @@ private:
     static constexpr size_t MaxPendingUploads = 4096;
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
-    Nx2ListDispatch::GridMarker* grid_marker{};
-    /// List dispatches, back: the lists taken last, by keep id (the low bits of a marker's x
-    /// carry it), and where each one's grid is.
-    struct ListDispatchEntry {
-        u64 keep_id{};
-        GPUVAddr address{};
-    };
-    std::array<ListDispatchEntry, 1024> list_dispatches{};
+    std::optional<u32> indirect_list_slot{};
+    /// The front's GPU-written list words in this engine's macros (Nx2ListIndirect).
+    std::unique_ptr<Nx2ListIndirect::ComputeFront> list_front;
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

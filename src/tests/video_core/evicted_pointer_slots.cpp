@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <algorithm>
 #include <array>
-#include <tuple>
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/evicted_pointer_slots.h"
@@ -47,15 +45,6 @@ public:
         return std::nullopt;
     }
 
-    /// A classification as translation leaves it, with the slot's two words when it read them.
-    void Classify(u64 key, bool mapped, std::optional<std::pair<u32, u32>> words = std::nullopt) {
-        storage_pointer_types.insert_or_assign(key, u8{mapped});
-        if (words) {
-            cbuf_values.insert_or_assign(key, words->first);
-            cbuf_values.insert_or_assign(key + 4, words->second);
-        }
-    }
-
 private:
     u32 value;
 };
@@ -88,32 +77,6 @@ TEST_CASE("A re-translation keeps the pointer slots of the pipeline it replaces"
     REQUIRE(unmapped_slot.MappedStoragePointerKeys() == std::vector<u64>{Slot});
 }
 
-TEST_CASE("Slots unbound at translation are watched, null, unmapped or in a pointer table",
-          "[video_core][evicted_pointer_slots]") {
-    constexpr auto TableKey = [](u32 index, u32 offset, u32 indirect) {
-        return (u64{1} << 63) | (u64{indirect} << 40) | SlotKey(index, offset);
-    };
-    SlotEnvironment env{0};
-    env.Classify(SlotKey(4, 0xd0), false, std::pair{0u, 0u});
-    env.Classify(SlotKey(4, 0x130), false, std::pair{0xdead0000u, 0x1u});
-    env.Classify(SlotKey(4, 0x170), true, std::pair{0x40000u, 0x11u});
-    env.Classify(SlotKey(3, 0x10), false);
-    env.Classify(TableKey(4, 0x90, 0x18), false);
-    env.Classify(TableKey(4, 0x90, 0x20), true);
-
-    auto slots = env.UnboundStoragePointerSlots();
-    std::ranges::sort(slots, [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.index, lhs.offset, lhs.indirect) <
-               std::tie(rhs.index, rhs.offset, rhs.indirect);
-    });
-    const std::vector<Shader::StoragePointerSlot> expected{
-        {4, 0x90, 0x18},
-        {4, 0xd0, std::nullopt},
-        {4, 0x130, std::nullopt},
-    };
-    REQUIRE(slots == expected);
-}
-
 TEST_CASE("Evicted pointer slots are taken once and bounded",
           "[video_core][evicted_pointer_slots]") {
     EvictedPointerSlots evicted;
@@ -129,16 +92,6 @@ TEST_CASE("Evicted pointer slots are taken once and bounded",
     REQUIRE(taken.has_value());
     REQUIRE((*taken)[5] == slots[5]);
     REQUIRE_FALSE(evicted.Take(2).has_value());
-    REQUIRE(evicted.Size() == 0);
-
-    // Found until forgotten (a queued translation may be queued again)
-    REQUIRE(evicted.Find(3) == nullptr);
-    evicted.Remember(3, slots);
-    REQUIRE(evicted.Find(3) != nullptr);
-    REQUIRE((*evicted.Find(3))[5] == slots[5]);
-    REQUIRE(evicted.Find(3) != nullptr);
-    evicted.Forget(3);
-    REQUIRE(evicted.Find(3) == nullptr);
     REQUIRE(evicted.Size() == 0);
 
     for (u64 hash = 0; hash < EvictedPointerSlots::MaxEntries + 100; ++hash) {

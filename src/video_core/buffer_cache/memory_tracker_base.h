@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <deque>
 #include <limits>
@@ -15,7 +16,6 @@
 
 #include "common/alignment.h"
 #include "common/common_types.h"
-#include "common/fritchii_bind_skip.h"
 #include "video_core/buffer_cache/word_manager.h"
 #include "video_core/page_filter.h"
 
@@ -57,38 +57,6 @@ public:
         });
     }
 
-    /// The memory stage's P3 (fable_stage_p3 4.2): whether no page of the region is CPU-modified
-    /// or untracked (a cached write's page), so an upload walk over it (SynchronizeBuffer's, any
-    /// of its forms) finds and changes nothing: it uploads the first and re-tracks both. Missing
-    /// managers are created, as the walk creates them (all dirty: not clean).
-    [[nodiscard]] bool IsRegionSyncClean(VAddr query_cpu_addr, u64 query_size) noexcept {
-        return !IteratePages<true>(query_cpu_addr, query_size,
-                                   [](Manager* manager, u64 offset, size_t size) {
-                                       return manager->IsRegionModified(Type::CPU, offset, size) ||
-                                              manager->IsRegionModified(Type::Untracked, offset,
-                                                                        size);
-                                   });
-    }
-
-    /// Returns true if every page of a region is CPU-modified and none is GPU-modified or
-    /// Preflushable. False where the tracker has no manager yet (nothing to prove it).
-    [[nodiscard]] bool IsRegionWhollyCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
-        if (query_size == 0) {
-            return false;
-        }
-        const size_t first = query_cpu_addr >> HIGHER_PAGE_BITS;
-        const size_t last = (query_cpu_addr + query_size - 1) >> HIGHER_PAGE_BITS;
-        for (size_t page_index = first; page_index <= last; ++page_index) {
-            if (top_tier[page_index] == nullptr) {
-                return false;
-            }
-        }
-        return !IteratePages<false>(query_cpu_addr, query_size,
-                                    [](Manager* manager, u64 offset, size_t size) {
-                                        return !manager->IsRegionWhollyCpuModified(offset, size);
-                                    });
-    }
-
     /// Returns true if a region has been modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
@@ -105,15 +73,17 @@ public:
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        ForgetSynchronized(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
         });
     }
 
-    /// EXP108: as MarkRegionAsCpuModified, for data the GPU's own engines
-    /// wrote to guest memory (inline constant buffer data): the pages stay tracked, as no guest CPU
-    /// write needs to be let through, and the next upload has nothing to track again.
+    /// As MarkRegionAsCpuModified, for data the GPU's own engines wrote to guest memory (inline
+    /// constant buffer data): the pages stay tracked, as no guest CPU write needs to be let
+    /// through, and the next upload has nothing to track again.
     void MarkRegionAsWrittenTracked(VAddr dirty_cpu_addr, u64 query_size) {
+        ForgetSynchronized(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->MarkWrittenTracked(manager->cpu_addr + offset, size);
         });
@@ -130,7 +100,6 @@ public:
     /// Mark region as modified from the host GPU
     void MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         ever_synchronized_pages.Mark(dirty_cpu_addr, query_size);
-        ever_gpu_modified_pages.Mark(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::GPU, true, manager->cpu_addr + offset, size);
         });
@@ -161,7 +130,7 @@ public:
     /// Mark region as modified from the CPU
     /// but don't mark it as modified until FlusHCachedWrites is called.
     void CachedCpuWrite(VAddr dirty_cpu_addr, u64 query_size) {
-        ever_synchronized_pages.Mark(dirty_cpu_addr, query_size);
+        ForgetSynchronized(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [this](Manager* manager, u64 offset, size_t size) {
             const VAddr cpu_address = manager->cpu_addr + offset;
             manager->ChangeRegionState(Type::CachedCPU, true, cpu_address, size);
@@ -171,24 +140,44 @@ public:
 
     /// Flushes cached CPU writes, and notify the device_tracker about the deltas
     void FlushCachedWrites(VAddr query_cpu_addr, u64 query_size) noexcept {
+        synchronized_mask = 0;
         IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, [[maybe_unused]] u64 offset, [[maybe_unused]] size_t size) {
             manager->FlushCachedWrites();
         });
     }
 
     void FlushCachedWrites() noexcept {
+        if (!cached_pages.empty()) {
+            synchronized_mask = 0;
+        }
         for (auto id : cached_pages) {
             top_tier[id]->FlushCachedWrites();
         }
         cached_pages.clear();
     }
 
+    /// A range an upload scan just cleared (BufferCache::SynchronizeGeometryBuffer). Only a CPU
+    /// mark or a cached-write flush sets CPU or Untracked bits again, so until one reaches its
+    /// pages another scan would find and change nothing.
+    void WatchSynchronized(u32 slot, VAddr cpu_addr, u64 size) noexcept {
+        synchronized_ranges[slot] = {Common::AlignDown(cpu_addr, BYTES_PER_PAGE),
+                                     Common::AlignUp(cpu_addr + size, BYTES_PER_PAGE)};
+        synchronized_mask |= u64{1} << slot;
+    }
+
+    [[nodiscard]] bool IsSynchronized(u32 slot) const noexcept {
+        return ((synchronized_mask >> slot) & 1) != 0;
+    }
+
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     template <typename Func>
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        ever_synchronized_pages.Mark(query_cpu_range, query_size);
-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
-            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
+        const auto upload = [this, &func](VAddr address, u64 size) {
+            ever_synchronized_pages.Mark(address, size);
+            func(address, size);
+        };
+        IteratePages<true>(query_cpu_range, query_size, [&upload](Manager* manager, u64 offset, size_t size) {
+            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, upload);
         });
     }
 
@@ -216,116 +205,31 @@ public:
     }
 
     /// ForEachUploadRange without the clean words (word_manager.h) at either end of each manager's
-    /// part of the range: they have nothing to find or change. A per-word form of a ported skip.
-    /// Returns false when every word was clean (nothing walked at all).
+    /// part of the range: they have nothing to find or change. A per-word form of PR #161's skip.
     template <typename Func>
-    bool ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        ever_synchronized_pages.Mark(query_cpu_range, query_size);
-        bool walked = false;
-        IteratePages<true>(query_cpu_range, query_size, [&func, &walked](Manager* manager, u64 offset, size_t size) {
-            const auto [begin, end] = manager->DirtyWindow(offset, size);
-            if (begin >= end) {
+    void ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        const auto upload = [this, &func](VAddr address, u64 size) {
+            ever_synchronized_pages.Mark(address, size);
+            func(address, size);
+        };
+        IteratePages<true>(query_cpu_range, query_size, [&upload](Manager* manager, u64 offset, size_t size) {
+            const u64 dirty =
+                manager->DirtyWords(offset / BYTES_PER_WORD, (offset + size - 1) / BYTES_PER_WORD);
+            if (dirty == 0) {
                 return;
             }
-            walked = true;
+            const u64 begin = (std::max<u64>)(offset, std::countr_zero(dirty) * BYTES_PER_WORD);
+            const u64 end =
+                (std::min<u64>)(offset + size, (64 - std::countl_zero(dirty)) * BYTES_PER_WORD);
             manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
-                                          static_cast<s64>(end - begin), func);
+                                          static_cast<s64>(end - begin), upload);
         });
-        return walked;
     }
-
-    /// EDEN_NX2_STORAGE_SYNC_SCAN: ForEachUploadRange over only each manager's part of the range
-    /// from its first to its last word with a CPU or Untracked page, found by reading the words
-    /// (WordManager::ScannedDirtyWindow; clean_words is not used). The words left out have
-    /// nothing the full walk would upload or re-protect. Missing managers are created, as the
-    /// full walk creates them (every page CPU-modified, so walked whole). Returns false when
-    /// nothing was walked.
-    template <typename Func>
-    bool ForEachScannedUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        ever_synchronized_pages.Mark(query_cpu_range, query_size);
-        bool walked = false;
-        IteratePages<true>(query_cpu_range, query_size, [&func, &walked](Manager* manager, u64 offset, size_t size) {
-            const auto [begin, end] = manager->ScannedDirtyWindow(offset, size);
-            if (begin >= end) {
-                return;
-            }
-            walked = true;
-            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
-                                          static_cast<s64>(end - begin), func);
-        });
-        return walked;
-    }
-
-    /// EDEN_NX2_STORAGE_SYNC_MEMO: the sum of the dirty generations (WordManager::dirty_gen) of
-    /// the managers over a range. The generations only grow, so the sum is unchanged exactly
-    /// when none of them moved: no page of those managers gained a CPU or Untracked bit. False
-    /// when a manager is missing (nothing to prove; the walk would create it all dirty).
-    [[nodiscard]] bool DirtyGenerationSum(VAddr query_cpu_addr, u64 query_size,
-                                          u64& sum) const noexcept {
-        if (query_size == 0) {
-            return false;
-        }
-        const size_t first = query_cpu_addr >> HIGHER_PAGE_BITS;
-        const size_t last = (query_cpu_addr + query_size - 1) >> HIGHER_PAGE_BITS;
-        if (last >= NUM_HIGH_PAGES) {
-            return false;
-        }
-        u64 total = 0;
-        for (size_t page_index = first; page_index <= last; ++page_index) {
-            const Manager* const manager = top_tier[page_index];
-            if (manager == nullptr) {
-                return false;
-            }
-            total += manager->dirty_gen;
-        }
-        sum = total;
-        return true;
-    }
-
-    struct DirtyWalkCheck {
-        u64 cpu_pages = 0;       ///< CPU pages the full walk uploads and the dirty-word walk would not
-        u64 untracked_pages = 0; ///< Untracked pages it re-tracks and the dirty-word walk would not
-        bool walks = false;      ///< The dirty-word walk would walk anything (a manager to create counts)
-    };
-    /// EDEN_NX2_EXP59 & 8: what ForEachDirtyUploadRange would leave out of the range that
-    /// ForEachUploadRange finds or changes. Changes nothing; call it before the full walk.
-    [[nodiscard]] DirtyWalkCheck CheckDirtyWalk(VAddr query_cpu_range, u64 query_size) {
-        DirtyWalkCheck check;
-        if (query_size == 0) {
-            return check;
-        }
-        // A missing manager is created by both walks with every word dirty: no difference.
-        const size_t first = query_cpu_range >> HIGHER_PAGE_BITS;
-        const size_t last =
-            (query_cpu_range + query_size - 1) >> HIGHER_PAGE_BITS;
-        for (size_t page_index = first; page_index <= last; ++page_index) {
-            check.walks |= top_tier[page_index] == nullptr;
-        }
-        IteratePages<false>(query_cpu_range, query_size, [&check](Manager* manager, u64 offset, size_t size) {
-            const auto [begin, end] = manager->DirtyWindow(offset, size);
-            check.walks |= begin < end;
-            const auto [cpu_pages, untracked_pages] = manager->DirtyWalkMisses(offset, size);
-            check.cpu_pages += cpu_pages;
-            check.untracked_pages += untracked_pages;
-        });
-        return check;
-    }
-    /// EDEN_NX2_STORAGE_SYNC_SCAN=2: what ForEachScannedUploadRange would leave out of the range
-    /// that ForEachUploadRange finds or changes (counted over every word). Changes nothing; call
-    /// it before the full walk. A missing manager is created whole by both walks: no difference.
-    [[nodiscard]] DirtyWalkCheck CheckScannedWalk(VAddr query_cpu_range, u64 query_size) {
-        DirtyWalkCheck check;
-        if (query_size == 0) {
-            return check;
-        }
-        IteratePages<false>(query_cpu_range, query_size, [&check](Manager* manager, u64 offset, size_t size) {
-            const auto [begin, end] = manager->ScannedDirtyWindow(offset, size);
-            check.walks |= begin < end;
-            const auto [cpu_pages, untracked_pages] = manager->ScannedWalkMisses(offset, size);
-            check.cpu_pages += cpu_pages;
-            check.untracked_pages += untracked_pages;
-        });
-        return check;
+    /// Whether a page of the range ever left the CPU-modified state (an upload or an unmark) or
+    /// was marked GPU-modified or preflushable. Pages without any are CPU-modified as their
+    /// managers were created. Any thread, without a lock.
+    [[nodiscard]] bool IsRegionEverSynchronized(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        return ever_synchronized_pages.Any(query_cpu_addr, query_size);
     }
 
     /// Verify mode: true when the clean words of the managers over a range match a recount.
@@ -340,30 +244,20 @@ public:
         return true;
     }
 
-    /// EXP88: whether a page of the range may ever have left
-    /// the CPU-modified state: an upload walk asked for it, an unmark, a cached write, a GPU or
-    /// Preflushable mark. Pages without any are CPU-modified and untracked as their managers
-    /// are made, so a CPU mark there changes nothing. Bits never clear. Any thread, no lock.
-    [[nodiscard]] bool IsRegionEverSynchronized(VAddr query_cpu_addr, u64 query_size) const noexcept {
-        return ever_synchronized_pages.Any(query_cpu_addr, query_size);
-    }
-
-    /// EXP88: whether a page of the range was ever marked GPU-modified (IsRegionGpuModified can
-    /// only be true there). Bits never clear. Any thread, no lock.
-    [[nodiscard]] bool IsRegionEverGpuModified(VAddr query_cpu_addr, u64 query_size) const noexcept {
-        return ever_gpu_modified_pages.Any(query_cpu_addr, query_size);
-    }
-
-    /// EXP88 verify: a CPU mark of the range would change no page's state (missing managers are
-    /// made with every page CPU-modified and untracked). Under the buffer cache's lock.
-    [[nodiscard]] bool IsRegionUntouched(VAddr query_cpu_addr, u64 query_size) noexcept {
-        return !IteratePages<false>(query_cpu_addr, query_size,
-                                    [](Manager* manager, u64 offset, size_t size) {
-                                        return !manager->IsRegionUntouched(offset, size);
-                                    });
-    }
-
 private:
+    /// The tracker marks whole pages: a write next to a range on one of its pages reaches it.
+    void ForgetSynchronized(VAddr cpu_addr, u64 size) noexcept {
+        const VAddr write_begin = Common::AlignDown(cpu_addr, BYTES_PER_PAGE);
+        const VAddr write_end = Common::AlignUp(cpu_addr + size, BYTES_PER_PAGE);
+        for (u64 mask = synchronized_mask; mask != 0; mask &= mask - 1) {
+            const u32 slot = static_cast<u32>(std::countr_zero(mask));
+            const auto [begin, end] = synchronized_ranges[slot];
+            if (write_begin < end && begin < write_end) {
+                synchronized_mask &= ~(u64{1} << slot);
+            }
+        }
+    }
+
     template <bool create_region_on_fail, typename Func>
     bool IteratePages(VAddr cpu_address, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, Manager*, u64, size_t>::type;
@@ -441,8 +335,6 @@ private:
     void CreateRegion(std::size_t page_index) {
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         top_tier[page_index] = GetNewManager(base_cpu_addr);
-        // FRITCHII_BIND_SKIP: its pages start CPU-modified and untracked, no hook saw it.
-        ::Common::BindSkip::NoteTrackerWide();
     }
 
     Manager* GetNewManager(VAddr base_cpu_address) {
@@ -464,8 +356,9 @@ private:
     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;
     std::deque<Manager*> free_managers;
     ::Common::unordered_set<u32> cached_pages;
-    PageFilter ever_synchronized_pages;  ///< EXP88: IsRegionEverSynchronized
-    PageFilter ever_gpu_modified_pages;  ///< EXP88: IsRegionEverGpuModified
+    std::array<std::pair<VAddr, VAddr>, 64> synchronized_ranges{};
+    u64 synchronized_mask{};
+    PageFilter ever_synchronized_pages;
     DeviceTracker* device_tracker = nullptr;
 };
 

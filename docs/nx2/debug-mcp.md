@@ -5,7 +5,7 @@ package, wait for the owner to launch the game, press a hotkey and send the log 
 dumps. Every new question costs a relaunch, and most cost a rebuild, because every
 `EDEN_NX2_*` switch is read once at startup.
 
-This document designs an opt-in debug server inside Fritchii and an MCP adapter that agents run on
+This document designs an opt-in debug server inside Lichii and an MCP adapter that agents run on
 the PC, so an agent can ask a running game questions directly. Phase 1 is implemented on the
 `feat/debug-mcp` branch; the later phases are proposals with the hook points they need.
 
@@ -24,7 +24,7 @@ Line numbers refer to `feat/debug-mcp` at the time of writing.
 ## Architecture
 
 ```
-agent ──stdio MCP──> tools/nx2/debug_mcp.py ──TCP 127.0.0.1, JSON lines──> Fritchii
+agent ──stdio MCP──> tools/nx2/debug_mcp.py ──TCP 127.0.0.1, JSON lines──> Lichii
   (on the PC)          (Python, stdlib only)                               ├─ "DebugServer" thread
                                                                            │    tools: status, screenshot, log_*, ...
                                                                            └─ rasterizer thread
@@ -57,7 +57,7 @@ server copies its threading model, not its protocol.
 - MCP's own transports are stdio, which needs the agent to launch the process (it cannot launch
   the emulator, which the owner starts), and Streamable HTTP, which needs sessions and
   server-sent events. Neither fits inside the emulator cheaply.
-- A JSON-lines socket is about 200 lines of C++ with libraries Fritchii already links (Boost.Asio,
+- A JSON-lines socket is about 200 lines of C++ with libraries Lichii already links (Boost.Asio,
   nlohmann::json, both already used by `core`). Anything can drive it: the adapter, a test,
   or `python -c`.
 - The adapter owns everything that is MCP: tool descriptions, input schemas, image content, error
@@ -87,7 +87,7 @@ Three kinds of work, three places:
    is safe.
 3. **Existing renderer hooks.** The screenshot uses `RendererBase::RequestScreenshot`
    (`src/video_core/renderer_base.cpp:38`), the path the Qt screenshot hotkey uses
-   (`src/yuzu/bootmanager.cpp:819`). It is already safe to call from another thread, and the
+   (`src/lichii/bootmanager.cpp:819`). It is already safe to call from another thread, and the
    renderer fills the buffer at the next present (`renderer_vulkan.cpp:350`).
 
 The server thread waits for rasterizer-thread work with a timeout (5 s for screenshots and
@@ -98,8 +98,9 @@ service ends the session first, which wakes every waiter, then stops the `io_con
 shutdown waits at most about 50 ms for a handler.
 
 Cost when unused: if `EDEN_NX2_DEBUG_SERVER` is unset, `MaybeStartService` returns at its first
-`getenv`. No thread, no socket, no log ring. The per-frame check is one relaxed atomic load. The
-runtime reject check in the lowering is one relaxed atomic load per lowered program. When the
+`getenv`. No thread, no socket, no log ring. The per-frame check is one relaxed atomic load,
+and each guest present stores a steady-clock timestamp in the 4096-entry ring that
+`frame_times` and the bug bundle read. The runtime reject check in the lowering is one relaxed atomic load per lowered program. When the
 server is on but idle, its thread sleeps in `epoll`/IOCP.
 
 ## Safety
@@ -112,8 +113,10 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 - **Writes only under the dump directory.** `EDEN_NX2_DEBUG_DIR`, by default
   `<log dir>/debug-server`. Clients never send paths. The server names every file itself:
   `capture-<session>-<n>/`, `screenshot-<session>-<n>.png`.
-- **Nothing the server returns comes from game files, keys or firmware.** It returns rendered
-  pixels, log lines, frame-dump manifests and shader hashes, which the owner already sends today.
+- **Captures and memory reads can contain game data.** Frame captures, bug bundles and memory
+  reads can expose game code, shaders, textures, buffers and personal information. Do not publish
+  them or add them to the repository. Ask a maintainer for handling instructions before sharing
+  the minimum necessary material, and share only what you have permission to disclose.
   The memory tools read only the application's guest virtual memory and GPU virtual memory,
   through their page tables, and never write either. They cannot reach host memory, the key area
   or the file system: an address resolves only through a page the guest has mapped. The adapter's `capture_image` reads only PNGs inside
@@ -130,9 +133,11 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 | Tool | Today | With the server | Phase |
 |---|---|---|---|
 | `status` | Ask the owner what is on screen, read the log header | One call: title, program id, build, paused, presents, fps, renderer, rejected hashes | 1 |
+| `frame_times` | Frame trace and manual interval analysis | Guest-present interval statistics and VSync histogram over a timed window | 1 |
 | `screenshot` | Owner takes and sends a screenshot | PNG of the next presented frame, as MCP image content | 1 |
 | `log_tail`, `log_filter` | Relaunch with a new filter, owner sends the log | Read new lines since the last call, change the filter live | 1 |
 | `capture_frame` | Relaunch with `EDEN_NX2_FRAME_DUMP`, owner touches `capture.now`, agent copies the dump | Capture the next frame now, sampled textures and bound buffers optional, get the manifest summary back; `capture_image` returns any pass PNG | 1 |
+| `capture_bundle` | Owner zips logs, settings and screenshots by hand | The Report a Bug bundle: logs, settings, screenshot, frame times and a frame capture with shaders, in one zip | 1 |
 | `reject_shaders` | Rebuild the env, relaunch, replay to the spot, once per bisection step | Reject or restore hashes live; bisection becomes a loop of reject, screenshot | 1 |
 | `pause`, `resume`, `step_frames` | Not possible | Freeze on the broken frame, capture it, step one present | 2 |
 | `input`, `input_sequence` (buttons, sticks, frame-timed sequences) | Owner plays to the spot | Agent walks to the spot itself and replays a repro (done) | 2 |
@@ -150,6 +155,18 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 `Common::g_build_fullname` and `g_scm_rev`, and `System::IsPaused`. It measures fps from
 `Core::g_nx2_present_count` (`src/core/core.cpp:78`) over a short window. It does not call
 `GetAndResetPerfStats`, which would reset the Qt status bar's counters.
+
+**`frame_times`** `{seconds?, refresh_hz?}` waits for `seconds` (default 5, > 0, at most 60),
+interruptible on shutdown like `status`. It measures intervals between guest presents inside
+that window, not display scanout or GPU execution time. `frames` counts those intervals;
+`mean_ms`, `fps` (1000 / mean), `p50_ms`, `p90_ms`, `p99_ms`, `min_ms`, `max_ms` describe them.
+Percentiles interpolate between sorted samples. `vsync_buckets` gives fractions (0 to 1) under
+keys `1`, `2`, `3`, `4+`, using boundaries 1.5, 2.5 and 3.5 refresh intervals (`refresh_hz`
+defaults to 60 and must be positive). `stutters` counts intervals strictly above twice the
+median. `intervals_ms` contains the last up to 120 intervals in chronological order, rounded
+to 0.1 ms. With fewer than two presents, statistics are zero and the interval list is empty.
+Only available samples from the 4096-timestamp ring are used; overflow sets `truncated: true`.
+For example: `{"method":"frame_times","params":{"seconds":5,"refresh_hz":60}}`.
 
 **`screenshot`** `{height?, save?, timeout_s?}`. It requests a 16:9 layout from
 `Layout::DefaultFrameLayout`, and the renderer blits the presented framebuffers into it. The
@@ -194,7 +211,27 @@ command. With `index: true`, the adapter runs that command itself. The adapter-o
 threads (default `GPU,GPUBack`) about 1000 times a second for `seconds` (default 10) and returns
 the self, self-and-caller and inclusive counts per function. The report and its folded stacks go
 to `samples-<session>-<n>.txt` in the dump directory. Windows only; the threads run slower while
-sampled, so read fps from a run without it.
+sampled, so read fps from a run without it. A stack ends at its first frame in generated code,
+shown as `(jit)`: a guest core thread (`CPUCore_*`) shows `(jit)` while it runs guest code and
+the host functions above `(jit)` while the JIT calls out.
+
+**`speed_limit`** `{on?}`. Lifts (`false`) or restores (`true`) the speed limit live and returns
+the `previous` and current `on` state, so a test script can boot through the logos and menus
+unlimited. Without `on` it only reports the state. Use it through `--call`; the MCP adapter does
+not list it.
+
+**`host_timing`** `{stats?}`. Turns the per-second `HostTiming wait` log line
+(`EDEN_NX2_HOSTTIMING_STATS`) on or off and returns the `previous` and current `stats` state.
+Read the lines with `log_tail` (`contains: "HostTiming wait"`).
+
+**`capture_bundle`** `{description?, size_limit_mib?, timeout_s?}` (`index?` in the adapter). It
+writes the bug-report bundle that Help → Report a Bug writes ([bug-bundle.md](bug-bundle.md)):
+logs, system and settings, screenshot, the last 10 s of frame times, and the next frame captured
+with its shaders, SPIR-V and pipeline keys, zipped under `size_limit_mib` (default 19, 1 to 100)
+into `<log dir>/bug-reports`. It waits up to `timeout_s` (default 90) for the frame capture and
+returns `path`, `bytes`, `dropped`, `frame_error`, `manifest` (the bundle's `bundle.json`) and
+`index_command`. In the adapter, `index` runs `bundle_index.py` on the zip and returns its
+`index.html`.
 
 **`reject_shaders`** `{hashes?, reject?, timeout_s?}`. This is `EDEN_NX2_REJECT_HASH` at
 runtime: the same keys (native program key or shader hash) and the same effect. Pipeline
@@ -305,7 +342,10 @@ or setting, so it works with whatever the owner has mapped and leaves nothing be
 goes to player 1, or to the handheld controller when player 1 is not connected; the result names
 which. When no injector is installed, each getter costs one atomic load.
 
-Timing is by presents, not wall time. `RunInput` starts the script at `g_nx2_present_count + 1`,
+Timing is by presents, not wall time. Switch 1 advances the counter when a newly acquired,
+visible game buffer is composed; overlay-only updates and cached-buffer repeats do not count.
+Switch 2 advances it on vi2 present calls. Generated display frames do not count.
+`RunInput` starts the script at `g_nx2_present_count + 1`,
 the next present. The injector looks up the active step from the present count at every read
 (`InputAt`), so a step changes at the first npad update after its present: the npad updates
 every 1 ms (`src/hid_core/resource_manager.cpp:48`). A slow frame stretches the step in time but
@@ -323,58 +363,6 @@ Use it when the owner has put the controller down: injected buttons add to whate
 presses. For an A/B test, run the same `input_sequence` from the same spot under each variant
 (for example with a `reject_shaders` change in between), then compare screenshots or captures.
 
-**`input_record`** records what the game receives while the owner plays, so the agent can replay
-it later:
-
-- `{"action": "start", "controller"?: "player1" | "handheld"}` starts sampling (default: player 1,
-  or the handheld controller when player 1 is not connected). It is refused while a recording
-  runs or while debug server input is injected into that controller. Starting again discards a
-  recording whose file could not be written.
-- `{"action": "status"}` returns `{recording, unsaved, controller, first_present, frames, steps,
-  missed, full}`.
-- `{"action": "stop", "path"?: "<file>"}` stops and writes the file (default
-  `input_<unix ms>.json` in the dump directory; a relative path is under it). It returns the
-  status plus `path`. When the write fails the recording is kept, and `stop` again retries it.
-
-A dedicated thread polls `g_nx2_present_count` every 0.5 ms (the frontends set the Windows timer
-to its finest resolution). When the count moves to P, it reads `GetNpadButtons` and `GetSticks`
-of the controller, the getters the npad service reads, and records that as the input of present
-P: exactly what `input_sequence` replays while the count is P. If the count jumped by more than
-one, the presents in between get the previous sample and are counted in `missed`. Buttons are
-reduced to the ones `ParseInputStep` accepts; sticks are quantized to 1/1024 of full scale, and
-an axis below 0.02 is 0, so a held stick merges into one step. Both sticks are always written,
-so a replay owns the sticks (owner drift does not leak in); buttons the owner presses during a
-replay are still ORed in. Equal consecutive presents merge into one step, and a step is split at
-36000 frames. Sampling stops by itself at 864000 frames (4 hours at 60 fps), `full` in the
-status.
-
-The file is one step per line:
-
-```
-{"version":1,"controller":"player1","first_present":5321,"frames":1830,"missed":0,"steps":[
-{"buttons":["A"],"frames":4,"left_stick":[0.0,0.0],"right_stick":[0.0,0.0]},
-{"frames":120,"left_stick":[0.0,1.0],"right_stick":[0.0,0.0]},
-...
-]}
-```
-
-Every entry of `steps` is an `input_sequence` step. A file within 1000 steps and 36000 frames can
-be fed to `input_sequence` as is; chunks of a longer one would leave gaps between calls, so play
-it with **`input_replay`** `{"path": "<file>", "at_present"?: N, "controller"?: ..., "timeout_s"?}`
-instead: one run of the whole file (at most 864000 frames) through the same injector, which finds
-the active step by binary search. It starts at the next present, or at absolute present count
-`at_present` (refused once that has been presented; the count restarts at 0 on every boot), and
-uses the file's controller unless `controller` is given. It returns like `input_sequence`, plus
-`path`. Like every handler it runs on the server thread, so the server answers nothing else
-until it ends.
-
-Not recorded: analog triggers (GC), motion, touch, mouse and keyboard, Home and Capture, the
-debug pad, and controllers other than the one named. Timing is per present: a press shorter
-than a frame is lost or stretched to a frame, and an input the game read a little after the
-present it changed in may land one frame early or late. The replay is frame-exact relative to
-its own start; it matches the recording only if it starts from the same game state at the same
-point (for example right after the same save is loaded, or at the same `at_present` after boot).
-
 ### Phase 2: control and input (about 4 to 5 days)
 
 - **pause, resume, step_frames.** The core has `System::Pause` and `Run` (`src/core/core.cpp:279`).
@@ -384,7 +372,7 @@ point (for example right after the same save is loaded, or at the same `at_prese
   pause button uses. `step_frames {n}` resumes, waits until `g_nx2_present_count` advances by
   `n`, then pauses. That is present-granular, not exact, because the GPU drains a frame or two
   behind the CPU. Use a capture to get an exact frame.
-- **input**, **input_sequence**, **input_record** and **input_replay** are done; see "Input".
+- **input** and **input_sequence** are done; see "Input".
 - **shaders.** An inventory from `ShaderCache::lookup_cache` (key, hash, size, address) and
   `rejected_native` (address plus the exception message), copied on the rasterizer thread like
   the reject change. Each entry carries its stage and whether it was lowered, rejected by the
@@ -419,17 +407,16 @@ Live switch classification, from the switches in `src/`:
 ### Save states
 
 The core cannot save state. There is no serialisation of the kernel, services, the dynarmic and
-NCE CPU state, or the GPU caches, and the emulator never had it. The `saveState` in
-`src/yuzu/main_window.cpp` is Qt window geometry. Adding save states is a project of its own,
+NCE CPU state, or the GPU caches, and Eden and yuzu never had it. The `saveState` in
+`src/lichii/main_window.cpp` is Qt window geometry. Adding save states is a project of its own,
 not a tool. The practical substitute is a reproduction script: phase 2 input sequences, recorded
-once with `input_record` and replayed with `input_replay` after the same save is loaded
-(`EDEN_NX2_KEY_RECORD` in `eden-cli` records keys by wall time instead).
+once (`EDEN_NX2_KEY_RECORD` already records keys in `eden-cli`) and replayed after boot.
 
 ## Running it on the PC
 
 1. Build the branch as usual:
    `bash C:/lx/build-fix.sh feat/debug-mcp debug-mcp "Any - debug server" "EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545"`.
-   Optionally add `EDEN_NX2_DEBUG_DIR=C:/Users/<you>/debug-mcp/dumps`
+   Optionally add `EDEN_NX2_DEBUG_DIR=C:/Users/Zortos/.capy/work/lichii-debug/debug-mcp/dumps`
    so dumps land next to the build.
 2. The owner launches the game from the shortcut. The log shows
    `Debug server listening on 127.0.0.1:6545, dump dir ...`.
@@ -438,7 +425,7 @@ once with `input_record` and replayed with `input_replay` after the same save is
    request, prints its JSON result, and saves any PNG to `--out`:
 
    ```
-   PY=/c/Users/<you>/AppData/Local/Programs/Python/Python314/python.exe
+   PY=/c/Users/Zortos/AppData/Local/Programs/Python/Python314/python.exe
    $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 --call '{"method":"status"}'
    $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
        --call '{"method":"screenshot","params":{"height":1080}}' --out C:/lx/shot.png
@@ -446,12 +433,6 @@ once with `input_record` and replayed with `input_replay` after the same save is
        --call '{"method":"reject_shaders","params":{"hashes":["3ddfb1d7621c4755"]}}'
    $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
        --call '{"method":"input_sequence","params":{"steps":[{"right_stick":[1,0],"frames":60},{"frames":30}]}}'
-   $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
-       --call '{"method":"input_record","params":{"action":"start"}}'
-   $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
-       --call '{"method":"input_record","params":{"action":"stop","path":"walk.json"}}'
-   $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
-       --call '{"method":"input_replay","params":{"path":"walk.json"}}'
    ```
 
    The request is `{"method": <tool>, "params": {...}}`, the same format the socket uses. Adapter-only

@@ -7,8 +7,6 @@
 
 #include <functional>
 #include <memory>
-#include <utility>
-#include <vector>
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -149,14 +147,6 @@ public:
     void FlushCommands();
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache();
-    /// The memory stage (FRITCHII_MEMSTAGE_PASS): takes the game's collected CPU writes into
-    /// `out` without applying them (nothing when every collector is empty), and lists `out` as
-    /// pending until ReleaseTakenWrites (rule T: landings of downloaded bytes leave them out).
-    /// `out` must not move or change while listed. True when listed.
-    bool TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out);
-    void ReleaseTakenWrites(const std::vector<std::pair<DAddr, u64>>* list);
-    /// The lists taken and not applied yet (applying_writes; rule T's check).
-    [[nodiscard]] size_t ListedWrites();
     /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
     /// applied yet.
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);
@@ -166,6 +156,9 @@ public:
     void OnCommandListEnd();
 
     std::shared_ptr<Control::ChannelState> AllocateChannel();
+
+    /// Every channel allocated so far.
+    [[nodiscard]] std::vector<std::shared_ptr<Control::ChannelState>> Channels() const;
 
     void InitChannel(Control::ChannelState& to_init, u64 program_id);
 
@@ -229,15 +222,13 @@ public:
 
     [[nodiscard]] u64 GetTicks() const;
 
+    /// The running application changed: re-decides the report timestamp units for it.
+    void NotifyApplicationChanged(u64 program_id);
+
     [[nodiscard]] bool IsAsync() const;
 
     /// Whether a channel is suspended on a semaphore acquire (callable from any thread).
     [[nodiscard]] bool HasSuspendedChannels() const;
-
-    /// The hang report (FRITCHII_HANG_REPORT_S): logs the acquires channels are suspended on
-    /// (address, wait, value now, for how long), the syncpoint waits, and the GPU split / one
-    /// follower state. Read only, from any thread; never blocks on a lock for long.
-    void LogHangState();
 
     [[nodiscard]] bool UseNvdec() const;
 
@@ -273,8 +264,10 @@ public:
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     void FlushRegion(DAddr addr, u64 size);
 
-    /// Runs func on the GPU thread after the command lists submitted so far.
-    void RunInOrder(std::function<void()>&& func);
+    /// Runs func on the GPU thread after the command lists submitted so far. With
+    /// before_later_reads, also before the GPU thread reads the lists submitted later (the GPU
+    /// split drains), for a func that changes what they read.
+    void RunInOrder(std::function<void()>&& func, bool before_later_reads = false);
 
     /// RunInOrder for GPU memory maps: also done before the GPU thread reads the command lists
     /// submitted later (with the GPU split, on its front rather than its back).

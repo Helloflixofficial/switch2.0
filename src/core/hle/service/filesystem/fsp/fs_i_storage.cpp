@@ -5,18 +5,22 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <thread>
 
+#include "common/settings.h"
+#include "core/core.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/errors.h"
-#include "common/nx2_hitch.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
+#include "core/hle/service/filesystem/fsp/fs_read_trace.h"
 
 namespace Service::FileSystem {
 
 IStorage::IStorage(Core::System& system_, FileSys::VirtualFile backend_)
     : ServiceFramework{system_, "IStorage"}, backend(std::move(backend_)) {
+    throttle = ReadThrottle::For(Settings::CurrentProgramIsSwitch2(),
+                                 FileSys::GetBaseTitleID(system.GetApplicationProcessProgramID()));
     static const FunctionInfo functions[] = {
         {0, D<&IStorage::Read>, "Read"},
         {1, nullptr, "Write"},
@@ -36,29 +40,18 @@ Result IStorage::Read(
     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
 
-    // EDEN_NX2_READ_THROTTLE=0 (boot): no 40 MB/s pacing of game file reads. The original code added it
-    // for video freezes in other games; in Ocarina of Time it slept 36-151 ms at
-    // boot and area loads and 47 ms when a killed Peahat loaded its effects (2026-11-10).
-    static const bool throttle = [] {
-        const char* const value = std::getenv("EDEN_NX2_READ_THROTTLE");
-        return value == nullptr || value[0] != '0';
-    }();
-    const auto now = std::chrono::steady_clock::now();
-    if (throttle && now < next_read_tick) {
-        // Hitch attribution: sleep_for rounds up to whole ms (1 ms takes ~1.5 ms), on the one FS
-        // thread (fable52_answer_11).
-        const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::FileThrottle};
-        std::this_thread::sleep_for(next_read_tick - now);
+    if (throttle.bytes_per_second > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_read_tick) {
+            std::this_thread::sleep_for(next_read_tick - now);
+        }
+        next_read_tick = std::chrono::steady_clock::now() +
+                         throttle.Delay(std::min(length, static_cast<s64>(out_bytes.size())));
     }
-    next_read_tick = std::chrono::steady_clock::now() +
-                     std::chrono::nanoseconds{std::min(length, MaxChargedReadSize) *
-                                              1'000'000'000 / ReadBytesPerSecond};
 
     // Read the data from the Storage backend
-    {
-        const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::FileRead};
-        backend->Read(out_bytes.data(), length, offset);
-    }
+    const ReadTraceScope trace{ReadTraceSource::Storage, length};
+    backend->Read(out_bytes.data(), length, offset);
 
     R_SUCCEED();
 }

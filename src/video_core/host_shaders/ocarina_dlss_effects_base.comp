@@ -10,7 +10,6 @@ void main() {
     if (any(greaterThanEqual(pixel, imageSize(effects_base)))) {
         return;
     }
-    // An exact copy: ocarina_dlss_effects.comp compares it with the unclamped live scene, so it
-    // must not be clamped like the upscaler's input.
+    // An exact copy: ocarina_dlss_effects.comp compares it with the unclamped live scene.
     imageStore(effects_base, pixel, vec4(texelFetch(scene, pixel, 0).rgb, 1.0));
 }

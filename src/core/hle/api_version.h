@@ -9,7 +9,7 @@
 #include <fmt/format.h>
 #include "common/common_types.h"
 
-// This file contains the emulator's HLE API version constants.
+// This file contains Lichii's HLE API version constants.
 
 namespace HLE::ApiVersion {
 

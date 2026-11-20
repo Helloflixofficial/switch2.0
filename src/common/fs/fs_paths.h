@@ -5,16 +5,13 @@
 
 #pragma once
 
-// yuzu data directories
+// Lichii data directories
 
-// Fritchii keeps its own profile (v5.8, the owner's call): imported from eden (Eden, Lichii
-// before build 150, earlier Fritchii) or lichii (Lichii 150+) on the first launch.
-#define EDEN_DIR "fritchii"
+#define EDEN_DIR "lichii"
 #define EDEN_LEGACY_DIR "eden"
-#define LICHII_DIR "lichii"
 #define PORTABLE_DIR "user"
 
-// Sub-directories contained within a yuzu data directory
+// Sub-directories contained within a Lichii data directory
 #define AMIIBO_DIR "amiibo"
 #define CACHE_DIR "cache"
 #define CONFIG_DIR "config"
@@ -23,6 +20,7 @@
 #define KEYS_DIR "keys"
 #define LOAD_DIR "load"
 #define LOG_DIR "log"
+#define LOSSLESS_DIR "lossless"
 #define NAND_DIR "nand"
 #define PLAY_TIME_DIR "play_time"
 #define POST_PRESET_DIR "post_presets"
@@ -42,5 +40,7 @@
 #define SUYU_DIR "suyu"
 #define RYUJINX_DIR "Ryujinx"
 
-// yuzu-specific files
+// Lichii-specific files
 #define LOG_FILE "eden_log.txt"
+#define LOSSLESS_DLL_FILE "Lossless.dll"
+#define LOSSLESS_CACHE_FILE "lsfg_spirv.cache"

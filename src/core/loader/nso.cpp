@@ -4,17 +4,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
-#include <optional>
 #include <span>
 #include <vector>
 
+#include "common/alignment.h"
 #include "common/common_funcs.h"
 #include "common/game_presets.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/npln_patch_catalog.h"
+#include "common/npln_patch_manifest.h"
 #include "common/lz4_compression.h"
 #include "common/zbic_compression.h"
 #include "common/settings.h"
@@ -47,7 +50,7 @@ struct MODHeader {
 static_assert(sizeof(MODHeader) == 0x1c, "MODHeader has incorrect size.");
 
 constexpr u32 PageAlignSize(u32 size) {
-    return static_cast<u32>((size + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK);
+    return static_cast<u32>((size + Core::Memory::LICHII_PAGEMASK) & ~Core::Memory::LICHII_PAGEMASK);
 }
 } // Anonymous namespace
 
@@ -117,10 +120,25 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     // space can neither wrap that arithmetic nor ask for gigabytes.
     const bool pass_arguments =
         should_pass_arguments && !Settings::values.program_args.GetValue().empty();
-    const u64 image_extent =
+    // A Split or PostData patch appends its section after the image when it is copied in, and
+    // the image size is narrowed to u32 after that: count the section too.
+    const size_t post_patch_size = [&]() -> size_t {
+#ifdef HAS_NCE
+        if (patches && load_into_process) {
+            auto* patch = &patches->operator[](patch_index);
+            if (patch->GetPatchMode() == Core::NCE::PatchMode::Split ||
+                patch->GetPatchMode() == Core::NCE::PatchMode::PostData) {
+                return patch->GetSectionSize();
+            }
+        }
+#endif
+        return 0;
+    }();
+    const u64 aligned_extent =
         (u64{module_start} + segments_end + (pass_arguments ? NSO_ARGUMENT_DATA_ALLOCATION_SIZE : 0) +
-         nso_header.segments[2].bss_size + Core::Memory::YUZU_PAGEMASK) &
-        ~u64{Core::Memory::YUZU_PAGEMASK};
+         nso_header.segments[2].bss_size + Core::Memory::LICHII_PAGEMASK) &
+        ~u64{Core::Memory::LICHII_PAGEMASK};
+    const u64 image_extent = aligned_extent + post_patch_size;
     if (image_extent > std::numeric_limits<u32>::max()) {
         LOG_ERROR(Loader, "{}: segments end at {:#x}, past a 32-bit image", nso_file.GetName(),
                   image_extent);
@@ -144,26 +162,39 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                 return std::nullopt;
             }
             if (nso_header.IsSegmentCompressed(i)) {
+                const u32 segment_size = nso_header.segments[i].size;
                 if (nso_header.IsZBICCompressed()) {
                     // ZBIC compression
                     const int r = Common::Compression::DecompressDataZBIC(
-                        std::span<u8>{decompressed_size}.first(nso_header.segments[i].size),
+                        std::span<u8>{decompressed_size}.first(segment_size),
                         std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
                     );
-                    ASSERT(r > 0);
+                    // A failed segment would leave the previous segment's bytes in the buffer and
+                    // boot a corrupt image that hangs without presenting; refuse to load instead.
+                    if (r <= 0) {
+                        LOG_ERROR(Loader, "{}: segment {} failed ZBIC decompression",
+                                  nso_file.GetName(), i);
+                        return std::nullopt;
+                    }
+                    if (static_cast<u32>(r) != segment_size) {
+                        LOG_WARNING(Loader, "{}: segment {} decompressed to {:#x} of {:#x} bytes",
+                                    nso_file.GetName(), i, r, segment_size);
+                        std::fill(decompressed_size.begin() + r,
+                                  decompressed_size.begin() + segment_size, u8{0});
+                    }
                 } else {
                     // LZ4 compression
                     int r = Common::Compression::DecompressDataLZ4(
                         decompressed_size.data(),
-                        nso_header.segments[i].size,
+                        segment_size,
                         compressed_data.data(),
                         nso_header.segments_compressed_size[i]
                     );
-                    // A segment that does not decompress to its size would boot with the previous
-                    // segment's bytes in its place, and hang without presenting.
-                    if (r != int(nso_header.segments[i].size)) {
+                    // As for ZBIC: a segment that does not decompress to its size would boot with
+                    // the previous segment's bytes in its place.
+                    if (r != int(segment_size)) {
                         LOG_ERROR(Loader, "{}: segment {} decompressed to {} of {:#x} bytes",
-                                  nso_file.GetName(), i, r, nso_header.segments[i].size);
+                                  nso_file.GetName(), i, r, segment_size);
                         return std::nullopt;
                     }
                 }
@@ -208,6 +239,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Apply patches if necessary
     const auto name = nso_file.GetName();
+    bool frame_rate_unlocked = false;
     if (pm && (pm->HasNSOPatch(nso_header.build_id, name) || Settings::values.dump_nso)) {
         std::span<u8> patchable_section(codeset.memory.data() + module_start, codeset.memory.size() - module_start);
         std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
@@ -215,30 +247,43 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
                     patchable_section.size());
 
-        pi_header = pm->PatchNSO(pi_header, name);
+        pi_header = pm->PatchNSO(pi_header, name, &frame_rate_unlocked);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
     }
 
-    // Ocarina of Time's high refresh rate patch (Settings oot_high_refresh): where its speed scale
-    // word ended up, for the present pacing (nx2_gsv.h), and whether it applied at all.
-    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
-    const bool oot_main = name == "main" && process.GetProgramId() == OcarinaOfTimeProgramId;
-    std::optional<size_t> oot_high_refresh_scale;
-    if (oot_main) {
-        oot_high_refresh_scale = FileSys::OotHighRefreshScaleOffset(
-            std::span<const u8>{codeset.memory}.subspan(module_start));
+    // The signed Nextendo patch fixed for this launch, applied after mods as citron-nextendo does.
+    static_assert(sizeof(NSOHeader) == Common::NplnPatchCatalog::NsoHeaderSize);
+    if (pm) {
+        const auto build_id = Common::HexToString(nso_header.build_id);
+        if (const auto applied = Common::NplnPatchCatalog::Apply(
+                pm->GetTitleID(), build_id, name,
+                std::span(codeset.memory).subspan(module_start))) {
+            LOG_INFO(Loader, "Nextendo: NPLN patch {} v{} applied to {} build {}", applied->id,
+                     applied->version, name, build_id);
+        }
     }
 
     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
-    // 30 FPS mode, or let it choose dynamically using the whole frame time (CPU + GPU wait).
-    // Match the instruction sequence instead of relying on a title-version-specific address.
+    // 30 FPS mode, or let it choose dynamically. In dynamic mode the game keeps a time account
+    // (frame cost - interval * 16.67 ms) and advances 1 or 2 steps per frame, so it stays in real
+    // time as long as the cost it reads is the real frame time: use the whole frame time and skip
+    // the game's own wait for the second vblank, or every 2-step frame reads as 33 ms and the game
+    // never leaves 30 FPS (found by SerkiGohan). Presents are then paced with interval 1.
+    // Match the instruction sequences instead of relying on a title-version-specific address.
+    // 60 FPS forces mode 1 (one 1/60 s step a frame): a slow frame plays in slow motion. With the
+    // 30 FPS fallback, the mode load becomes a call to `ldr w8, <word>; ret` in the padding after
+    // .text, a word nx2:vi2 switches between 1 and 2 (one 1/30 s step a frame) at runtime: 60
+    // while frames make it, 30 at full speed while they don't.
     const bool mkw_dynamic = Settings::values.mkw_dynamic_fps.GetValue();
+    const bool mkw_60 = !mkw_dynamic && Settings::values.mkw_60fps.GetValue();
+    const bool mkw_60_switching = mkw_60 && Settings::values.mkw_60fps_fallback.GetValue();
     bool mkw_dynamic_fps_patch_applied = false;
-    if ((mkw_dynamic || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
+    u64 mkw_mode_word_offset = 0;
+    if ((mkw_dynamic || mkw_60 || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
         process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         constexpr u32 ModeLoadInsn = 0xB9421268; // ldr w8, [x19, #0x210]
-        const u32 mode = mkw_dynamic ? 0U : 2U;
+        const u32 mode = mkw_dynamic ? 0U : mkw_60 ? 1U : 2U;
         const u32 mode_instruction = 0x52800008U | (mode << 5); // mov w8, #mode
         const auto& text = nso_header.segments[0];
         u8* const code = codeset.memory.data() + module_start + text.location;
@@ -276,22 +321,121 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             }
         }
 
-        if (mode_matches == 1 && (!mkw_dynamic || frame_time_matches == 1)) {
+        // The vsync function waits until 0.99 * interval / 60 s after the frame start:
+        // ldr w8, [x19, #0x88] ; cmp w8, #2 ; b.lo <done> ; ucvtf ; mov w8, #60.0f
+        size_t vblank_wait_site = 0;
+        size_t vblank_wait_matches = 0;
+        if (mkw_dynamic) {
+            for (size_t i = 0; i + 4 < count; ++i) {
+                if (word(i) == 0xB9408A68 && word(i + 1) == 0x7100091F &&
+                    (word(i + 2) & 0xFF00001F) == 0x54000003 && word(i + 4) == 0x52A84E08) {
+                    vblank_wait_site = i + 2;
+                    ++vblank_wait_matches;
+                }
+            }
+        }
+
+        // The padding between .text and the next segment is mapped with .text and is zero.
+        const size_t cave = Common::AlignUp(text.location + text.size, sizeof(u32));
+        const bool cave_fits =
+            nso_header.segments.size() > 1 && cave + 12 <= nso_header.segments[1].location &&
+            std::all_of(code + (cave - text.location), code + (cave - text.location) + 12,
+                        [](u8 byte) { return byte == 0; });
+
+        if (mode_matches == 1 && mkw_60_switching && cave_fits) {
+            const std::array<u32, 3> stub{0x18000048U, // ldr w8, #8 (the mode word below)
+                                          0xD65F03C0U, // ret
+                                          1U};         // mode, switched by nx2:vi2
+            std::memcpy(code + (cave - text.location), stub.data(), sizeof(stub));
+            const s64 delta = (static_cast<s64>(cave) -
+                               static_cast<s64>(text.location + mode_site * sizeof(u32))) / 4;
+            const u32 call = 0x94000000U | (static_cast<u32>(delta) & 0x03FFFFFFU); // bl stub
+            std::memcpy(code + mode_site * sizeof(u32), &call, sizeof(call));
+            mkw_mode_word_offset = cave + 8;
+            LOG_INFO(Loader, "Mario Kart World: 60 FPS mode enabled, 30 at full speed when slow "
+                             "(main+{:#x}, mode word main+{:#x})",
+                     text.location + mode_site * sizeof(u32), cave + 8);
+        } else if (mode_matches == 1 && !mkw_60_switching &&
+                   (!mkw_dynamic || (frame_time_matches == 1 && vblank_wait_matches == 1))) {
             std::memcpy(code + mode_site * sizeof(u32), &mode_instruction,
                         sizeof(mode_instruction));
             if (mkw_dynamic) {
                 const u32 whole_frame_time = 0xF9407660 | (word(frame_time_site) & 0x1F);
                 std::memcpy(code + frame_time_site * sizeof(u32), &whole_frame_time,
                             sizeof(whole_frame_time));
+                // b.lo -> b to the same target.
+                const s32 offset = static_cast<s32>(word(vblank_wait_site) << 8) >> 13;
+                const u32 branch = 0x14000000U | (static_cast<u32>(offset) & 0x03FFFFFFU);
+                std::memcpy(code + vblank_wait_site * sizeof(u32), &branch, sizeof(branch));
                 mkw_dynamic_fps_patch_applied = true;
             }
             LOG_INFO(Loader, "Mario Kart World: {} FPS mode enabled (main+{:#x})",
-                     mkw_dynamic ? "dynamic" : "30",
+                     mkw_dynamic ? "dynamic" : mkw_60 ? "60" : "30",
                      text.location + mode_site * sizeof(u32));
         } else {
             LOG_WARNING(Loader,
-                        "Mario Kart World FPS patch skipped (mode matches {}, frame-time matches {})",
-                        mode_matches, frame_time_matches);
+                        "Mario Kart World FPS patch skipped (mode matches {}, frame-time matches "
+                        "{}, vblank-wait matches {}, room after .text {})",
+                        mode_matches, frame_time_matches, vblank_wait_matches, cave_fits);
+        }
+    }
+
+    // Hyrule Warriors' frame interval (core/hle/service/nx2_frame_interval.h). Its only copy into
+    // the global is
+    //   adrp x9, got; ...; ldr x9, [x9, #got]; ...; adrp x8, global; add x8, x8, #global;
+    //   ldr w19, [x9]; str w19, [x8]
+    // Nothing is patched; the present path writes both words with hyrule_dynamic_fps or
+    // hyrule_30fps.
+    u64 frame_interval_offset = 0;
+    u64 frame_interval_source_offset = 0;
+    if (name == "main" && process.GetProgramId() == Settings::HyruleWarriorsProgramId) {
+        const auto& text = nso_header.segments[0];
+        const u8* const image = codeset.memory.data() + module_start;
+        const u64 image_end = codeset.memory.size() - module_start;
+        const auto word = [image](u64 offset) {
+            u32 value;
+            std::memcpy(&value, image + offset, sizeof(value));
+            return value;
+        };
+        const auto fits = [image_end](u64 offset, u64 size) {
+            return image_end >= size && offset <= image_end - size;
+        };
+        const auto adrp_page = [](u64 pc, u32 insn) {
+            s64 pages = static_cast<s64>((((insn >> 5) & 0x7FFFF) << 2) | ((insn >> 29) & 3));
+            if (pages & (s64{1} << 20)) {
+                pages -= s64{1} << 21;
+            }
+            return (pc & ~u64{0xFFF}) + static_cast<u64>(pages * 0x1000);
+        };
+        size_t matches = 0;
+        for (u64 pc = text.location + 32; pc + 8 <= text.location + text.size; pc += 4) {
+            if (word(pc) != 0xB9400133 || word(pc + 4) != 0xB9000113) { // ldr w19, [x9]; str w19, [x8]
+                continue;
+            }
+            const u32 adrp_global = word(pc - 8);
+            const u32 add_global = word(pc - 4);
+            const u32 adrp_got = word(pc - 32);
+            const u32 ldr_got = word(pc - 24);
+            if ((adrp_global & 0x9F00001F) != 0x90000008 || (add_global & 0xFFC003FF) != 0x91000108 ||
+                (adrp_got & 0x9F00001F) != 0x90000009 || (ldr_got & 0xFFC003FF) != 0xF9400129) {
+                continue;
+            }
+            ++matches;
+            frame_interval_offset = adrp_page(pc - 8, adrp_global) + ((add_global >> 10) & 0xFFF);
+            const u64 got = adrp_page(pc - 32, adrp_got) + ((ldr_got >> 10) & 0xFFF) * 8;
+            frame_interval_source_offset = 0;
+            if (fits(got, sizeof(u64))) {
+                // Not relocated yet: the entry still holds the module-relative address.
+                std::memcpy(&frame_interval_source_offset, image + got, sizeof(u64));
+            }
+        }
+        if (matches == 1 && fits(frame_interval_offset, sizeof(u32)) &&
+            frame_interval_source_offset != 0 && fits(frame_interval_source_offset, sizeof(u32))) {
+            LOG_INFO(Loader, "Hyrule Warriors frame interval at main+{:#x} (from main+{:#x})",
+                     frame_interval_offset, frame_interval_source_offset);
+        } else {
+            LOG_WARNING(Loader, "Hyrule Warriors frame interval not found ({} matches)", matches);
+            frame_interval_offset = frame_interval_source_offset = 0;
         }
     }
 
@@ -355,7 +499,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Apply cheats if they exist and the program has a valid title ID
     if (pm) {
-        // TODO: Check if there is a better way to check
+        // TODO(Maufeat): Check if there is a better way to check
         if (name == "main")
             system.SetApplicationProcessBuildID(nso_header.build_id);
 
@@ -382,23 +526,15 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
+        process.SetMkwFrameModeAddress(
+            mkw_mode_word_offset != 0 ? load_base + module_start + mkw_mode_word_offset : 0);
     }
-    if (oot_main) {
-        const u64 scale_address =
-            oot_high_refresh_scale ? load_base + module_start + *oot_high_refresh_scale : 0;
-        process.SetOotHighRefreshScaleAddress(scale_address);
-        Settings::SetOotHighRefreshPatched(scale_address != 0);
-        // Ctrl+U switches the mode live (FileSys::SwitchOotHighRefreshLive), where its state fits.
-        const auto& data = nso_header.segments[2];
-        const u64 bss_start = u64{data.location} + data.size;
-        process.SetOotMainCodeAddress(
-            FileSys::OotHighRefreshStateInBss(bss_start, bss_start + data.bss_size)
-                ? load_base + module_start
-                : 0);
-        if (scale_address != 0) {
-            LOG_INFO(Loader, "Ocarina of Time: high refresh rate patch on, speed scale at {:#x}",
-                     scale_address);
-        }
+    if (frame_rate_unlocked) {
+        process.SetFrameRateUnlocked(true);
+    }
+    if (frame_interval_offset != 0) {
+        process.SetFrameIntervalAddresses(load_base + module_start + frame_interval_offset,
+                                          load_base + module_start + frame_interval_source_offset);
     }
     return load_base + image_size;
 }
@@ -426,6 +562,17 @@ AppLoader_NSO::LoadResult AppLoader_NSO::Load(Kernel::KProcess& process, Core::S
 
 ResultStatus AppLoader_NSO::ReadNSOModules(Modules& out_modules) {
     out_modules = this->modules;
+    return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_NSO::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    NSOHeader header{};
+    if (!file || file->ReadObject(&header) != sizeof(header) ||
+        header.magic != Common::MakeMagic('N', 'S', 'O', '0')) {
+        return ResultStatus::ErrorLoadingNSO;
+    }
+    build_id = header.build_id;
     return ResultStatus::Success;
 }
 

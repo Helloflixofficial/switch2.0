@@ -11,9 +11,6 @@
 #include "common/common_types.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
-#include "video_core/fritchii_e_split.h"
-#include "video_core/memstage_shadow.h"
-#include "video_core/vulkan_common/vulkan.h"
 
 namespace Tegra {
 namespace Control {
@@ -87,21 +84,11 @@ public:
 
     void InvalidateCommandBufferState() {
         (*flags) |= invalidation_flags;
-        VideoCommon::MemStageShadow::NoteFlagInvalidation();
-        VideoCommon::ESplit::NoteTrackerInvalidation(flags); // FRITCHII_ESPLIT_COUNT >= 2
         current_topology = INVALID_TOPOLOGY;
-        current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
         stencil_reset = true;
-        ++vertex_input_generation;
     }
 
-    /// EXP83: raised whenever the command buffer's vertex input state may no longer be what the
-    /// last SetVertexInputEXT set (new command buffer, input or whole state invalidated).
-    u64 vertex_input_generation{};
-
     void InvalidateInputState() {
-        ++vertex_input_generation;
-        VideoCommon::MemStageShadow::NoteFlagInvalidation();
         (*flags)[Dirty::VertexInput] = true;
         (*flags)[Dirty::PrimitiveRestartEnable] = true;
         for (std::size_t index = VideoCommon::Dirty::VertexBuffer0;
@@ -109,7 +96,6 @@ public:
             (*flags)[index] = true;
         }
         current_topology = INVALID_TOPOLOGY;
-        current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     }
 
     void InvalidateViewports() {
@@ -309,29 +295,16 @@ public:
         return has_changed;
     }
 
-    /// The topology last given to vkCmdSetPrimitiveTopologyEXT, which also follows the bound
-    /// pipeline's tessellation stages.
-    bool ChangeHostPrimitiveTopology(VkPrimitiveTopology new_topology) {
-        const bool has_changed = current_host_topology != new_topology;
-        current_host_topology = new_topology;
-        return has_changed;
-    }
-
     void SetupTables(Tegra::Control::ChannelState& channel_state);
 
     void ChangeChannel(Tegra::Control::ChannelState& channel_state);
 
-    void InvalidateState();
-
-    /// One follower (vk_one_follower_draw.cpp): the dirty flags this tracker reads and clears,
-    /// swapped for R's view engine's while R plays an unlent draw and back after (ChangeChannel
-    /// sets them as before). Returns the ones it had.
-    Tegra::Engines::Maxwell3D::DirtyState::Flags* ExchangeFlags(
-        Tegra::Engines::Maxwell3D::DirtyState::Flags* new_flags) noexcept {
-        Tegra::Engines::Maxwell3D::DirtyState::Flags* const previous = flags;
-        flags = new_flags;
-        return previous;
+    /// Stops using the bound channel's flags, for when it goes away.
+    void ClearChannel() {
+        flags = &default_flags;
     }
+
+    void InvalidateState();
 
 private:
     static constexpr auto INVALID_TOPOLOGY = static_cast<Maxwell::PrimitiveTopology>(~0u);
@@ -352,7 +325,6 @@ private:
     Tegra::Engines::Maxwell3D::DirtyState::Flags default_flags;
     Tegra::Engines::Maxwell3D::DirtyState::Flags invalidation_flags;
     Maxwell::PrimitiveTopology current_topology = INVALID_TOPOLOGY;
-    VkPrimitiveTopology current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     bool two_sided_stencil = false;
     StencilProperties front{};
     StencilProperties back{};

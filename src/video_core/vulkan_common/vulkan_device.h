@@ -11,7 +11,6 @@
 #include <mutex>
 #include <optional>
 #include <set>
-#include <source_location>
 #include <span>
 #include <string>
 #include "common/container/unordered_map.h"
@@ -20,11 +19,14 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/fsr4_support.h"
+#include "video_core/vulkan_common/descriptor_limits.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+
+#include <vulkan/vulkan_beta.h>
 
 VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaPool)
-struct VmaBudget;
 
 // Define all features which may be used by the implementation here.
 // Vulkan version in the macro describes the minimum version required for feature availability.
@@ -60,6 +62,7 @@ struct VmaBudget;
 #define FOR_EACH_VK_FEATURE_EXT(FEATURE)                                                           \
     FEATURE(EXT, BorderColorSwizzle, BORDER_COLOR_SWIZZLE, border_color_swizzle)                   \
     FEATURE(EXT, ColorWriteEnable, COLOR_WRITE_ENABLE, color_write_enable)                         \
+    FEATURE(KHR, ComputeShaderDerivatives, COMPUTE_SHADER_DERIVATIVES, compute_shader_derivatives) \
     FEATURE(EXT, CustomBorderColor, CUSTOM_BORDER_COLOR, custom_border_color)                      \
     FEATURE(EXT, DepthBiasControl, DEPTH_BIAS_CONTROL, depth_bias_control)                         \
     FEATURE(EXT, DepthClipControl, DEPTH_CLIP_CONTROL, depth_clip_control)                         \
@@ -67,6 +70,7 @@ struct VmaBudget;
     FEATURE(EXT, ExtendedDynamicState, EXTENDED_DYNAMIC_STATE, extended_dynamic_state)             \
     FEATURE(EXT, ExtendedDynamicState2, EXTENDED_DYNAMIC_STATE_2, extended_dynamic_state2)         \
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
+    FEATURE(EXT, ImageCompressionControl, IMAGE_COMPRESSION_CONTROL, image_compression_control)    \
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
@@ -75,17 +79,17 @@ struct VmaBudget;
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
-    FEATURE(EXT, ShaderAtomicFloat, SHADER_ATOMIC_FLOAT, shader_atomic_float)                      \
     FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
+    FEATURE(NV, CooperativeMatrix2, COOPERATIVE_MATRIX_2, cooperative_matrix2)                     \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
+    FEATURE(KHR, PipelineBinary, PIPELINE_BINARY, pipeline_binary)                                 \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
-    FEATURE(KHR, PresentId, PRESENT_ID, present_id)                                                \
-    FEATURE(KHR, PresentWait, PRESENT_WAIT, present_wait)                                          \
+    FEATURE(KHR, ShaderIntegerDotProduct, SHADER_INTEGER_DOT_PRODUCT, shader_integer_dot_product)  \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
     FEATURE(KHR, ShaderMaximalReconvergence, SHADER_MAXIMAL_RECONVERGENCE,                        \
             shader_maximal_reconvergence)                                                        \
@@ -99,6 +103,7 @@ struct VmaBudget;
     EXTENSION(EXT, CONDITIONAL_RENDERING, conditional_rendering)                                   \
     EXTENSION(EXT, CONSERVATIVE_RASTERIZATION, conservative_rasterization)                         \
     EXTENSION(EXT, DEPTH_RANGE_UNRESTRICTED, depth_range_unrestricted)                             \
+    EXTENSION(EXT, HDR_METADATA, hdr_metadata)                                                     \
     EXTENSION(EXT, MEMORY_BUDGET, memory_budget)                                                   \
     EXTENSION(EXT, ROBUSTNESS_2, robustness_2)                                                     \
     EXTENSION(EXT, SAMPLER_FILTER_MINMAX, sampler_filter_minmax)                                   \
@@ -220,7 +225,6 @@ struct VmaBudget;
 namespace Vulkan {
 
 class NsightAftermathTracker;
-class KeptBlocks;
 
 /// Format usage descriptor.
 enum class FormatType { Linear, Optimal, Buffer };
@@ -258,9 +262,10 @@ public:
     bool IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags wanted_usage,
                            FormatType format_type) const;
 
-    /// Reports a device loss and ends the process. It never returns: the first thread to get here
-    /// writes the report, any other waits for the end.
-    void ReportLoss(std::source_location where = std::source_location::current()) const;
+    /// Logs a device loss and what the driver knows about it, then ends the process. Nothing can
+    /// run on a lost device, and the vk::Exception a caller would throw ends it anyway, as an
+    /// unhandled exception on whichever thread saw the loss (#1934).
+    [[noreturn]] void ReportLoss() const;
 
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
@@ -281,23 +286,6 @@ public:
         return allocator;
     }
 
-    /// FRITCHII_MEMSTAGE_SPLIT_ALLOC (boot, default on): the buffer cache's own VMA allocator, or
-    /// the main one when the split is off.
-    VmaAllocator GetBufferAllocator() const {
-        return buffer_allocator != nullptr ? buffer_allocator : allocator;
-    }
-
-    [[nodiscard]] bool HasSplitAllocators() const noexcept {
-        return buffer_allocator != nullptr;
-    }
-
-    /// EDEN_NX2_ASYNC_IMAGE_FREE (boot, default on; =0 off): the allocator was made without
-    /// VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so VMA locks internally and images may be
-    /// destroyed off the GPU thread (TextureCacheRuntime's image free queue).
-    [[nodiscard]] bool IsAllocatorThreadSafe() const noexcept {
-        return allocator_thread_safe;
-    }
-
     /// Allocations kept out of the default blocks, which then hold images only: churned buffers
     /// and long-lived sparse pages left holes the texture cache's collector couldn't drain.
     enum class SeparatePool : u32 {
@@ -305,17 +293,9 @@ public:
         DeviceBuffers,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
-    /// Block size of the DeviceBuffers pools; allocations over half of it take the default
-    /// blocks. FRITCHII_BUFFER_POOL_BLOCK_MB (boot, default 0 = SeparatePoolBlockSize): buffer
-    /// cache buffers live a few per block, so 16 MiB blocks can stay pinned mostly empty.
-    static VkDeviceSize DeviceBufferBlockSize() noexcept;
 
-    /// The pool of that kind for a memory type in `owner` (GetAllocator or GetBufferAllocator),
-    /// created on first use (null if that failed).
-    VmaPool GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const;
-
-    /// That pool if it was made already, else null (never makes one).
-    VmaPool PeekSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const;
+    /// The pool of that kind for a memory type, created on first use (null if that failed).
+    VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
 
     /// Returns the logical device.
     const vk::Device& GetLogical() const {
@@ -345,38 +325,6 @@ public:
     vk::Queue GetPresentQueue() const {
         return present_queue;
     }
-
-    /// FRITCHII_READ_SIDE_COPY >= 2 (boot): a second queue of the graphics family (its index 1),
-    /// for read downloads that wait only for their writer. Null without one.
-    vk::Queue GetSideQueue() const {
-        return side_queue;
-    }
-    bool HasSideQueue() const {
-        return has_side_queue;
-    }
-
-    /// Whether the device is made with the side queue (the switch, and a graphics family of two
-    /// queues or more). Decided once, before the device is made.
-    bool WantsSideQueue() const;
-
-    /// FRITCHII_SIM_LINK_HOG: the queue family the copy load gets. Decided once, before the
-    /// device is made.
-    [[nodiscard]] std::optional<u32> LinkHogFamily() const;
-
-    /// FRITCHII_SIM_LINK_HOG (boot, test): a queue of a transfer family for the copy load.
-    vk::Queue GetLinkHogQueue() const {
-        return link_hog_queue;
-    }
-    bool HasLinkHogQueue() const {
-        return has_link_hog_queue;
-    }
-    u32 GetLinkHogFamily() const {
-        return link_hog_family;
-    }
-
-    /// FRITCHII_DESCRIPTOR_SETS (boot): draws and dispatches take descriptor sets from pools
-    /// instead of push descriptors or the descriptor buffer ring. Decided once.
-    [[nodiscard]] bool PrefersDescriptorSets() const;
 
     /// Returns main graphics queue family index.
     u32 GetGraphicsFamily() const {
@@ -408,8 +356,8 @@ public:
         return properties.properties.vendorID;
     }
 
-    /// Returns the pipeline cache UUID (it names the driver build that compiles pipelines).
-    std::span<const u8> GetPipelineCacheUUID() const {
+    /// Returns the UUID the driver's pipeline cache data is valid for.
+    std::span<const u8, VK_UUID_SIZE> GetPipelineCacheUUID() const {
         return properties.properties.pipelineCacheUUID;
     }
 
@@ -421,14 +369,6 @@ public:
     /// Returns the driver ID.
     VkDriverIdKHR GetDriverID() const {
         return properties.driver.driverID;
-    }
-
-    /// Whether the device runs on an AMD driver: AMD's own (Windows, AMDVLK) or RADV. Gates
-    /// AMD-only workarounds so other vendors (NVIDIA above all) keep their path unchanged.
-    bool IsAmdDriver() const {
-        const VkDriverIdKHR id = GetDriverID();
-        return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-               id == VK_DRIVER_ID_MESA_RADV;
     }
 
     bool IsSparseBindingSupported() const {
@@ -462,20 +402,10 @@ public:
                id != VK_DRIVER_ID_MESA_RADV;
     }
 
-    /// Whether pipelines linked from graphics pipeline libraries without link time optimization
-    /// draw correctly. On AMD's Windows driver such links draw white fringes around alpha blended
-    /// effects (clouds, particles and glows in a test title, RX 7800 XT), while optimized links
-    /// and monolithic pipelines from the same SPIR-V do not, so libraries are linked optimized
-    /// there. EDEN_NX2_GPL_FAST_LINK=1 allows fast links on any driver, =0 on none.
-    bool CanFastLinkGraphicsLibraries() const {
-        static const char forced = [] {
-            const char* value = std::getenv("EDEN_NX2_GPL_FAST_LINK");
-            return value == nullptr ? '\0' : value[0];
-        }();
-        if (forced == '0' || forced == '1') {
-            return forced == '1';
-        }
-        return GetDriverID() != VK_DRIVER_ID_AMD_PROPRIETARY;
+    /// Whether a pipeline cache can be read while pipelines build into it, as Vulkan allows. Intel's
+    /// Windows driver crashes in vkGetPipelineCacheData when a build is running.
+    bool CanReadPipelineCacheDuringBuilds() const {
+        return GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
     }
 
     /// Returns true for tile-based deferred renderers.
@@ -501,11 +431,6 @@ public:
     /// Returns storage alignment requirement.
     VkDeviceSize GetStorageBufferAlignment() const {
         return properties.properties.limits.minStorageBufferOffsetAlignment;
-    }
-
-    /// Returns how many samplers may exist at once.
-    u32 GetMaxSamplerAllocationCount() const {
-        return properties.properties.limits.maxSamplerAllocationCount;
     }
 
     /// Returns the maximum range for storage buffers.
@@ -592,6 +517,12 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.shaderStorageTexelBufferArrayNonUniformIndexing;
     }
 
+    /// Returns true if storage buffer pointers can be chosen per invocation and decorated NonUniform.
+    bool IsNonUniformStorageBufferPointerSupported() const {
+        return features.variable_pointer.variablePointersStorageBuffer &&
+               (instance_version >= VK_API_VERSION_1_2 || extensions.descriptor_indexing);
+    }
+
     /// Returns true if the device supports float64 natively.
     bool IsFloat64Supported() const {
         return features.features.shaderFloat64;
@@ -600,6 +531,12 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports float16 natively.
     bool IsFloat16Supported() const {
         return float16_math;
+    }
+
+    /// Whether host-only shaders (frame generation) may use float16. Unlike IsFloat16Supported, it
+    /// stays on under the NVIDIA Ampere workaround, which concerns guest shaders only.
+    bool IsHostFloat16Supported() const {
+        return host_float16_supported;
     }
 
     /// Returns true if the device can run shaders built against the Vulkan memory model.
@@ -642,48 +579,12 @@ FN_MAX_LIMIT_LIST
         return is_warp_potentially_bigger;
     }
 
-    /// Returns true if the device can be forced to use the guest warp size.
+    /// Returns true if the device can be forced to use the guest warp size. Lavapipe's
+    /// subgroups are 8 wide and can't be forced to 32.
     bool IsGuestWarpSizeSupported(VkShaderStageFlagBits stage) const {
-        return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
-    }
-
-    /// Returns true if a pipeline stage can be built with requiredSubgroupSize = GuestWarpSize.
-    bool CanRequireGuestWarpSize(VkShaderStageFlagBits stage) const {
         const auto& control = properties.subgroup_size_control;
-        return extensions.subgroup_size_control && IsGuestWarpSizeSupported(stage) &&
+        return (control.requiredSubgroupSizeStages & stage) != 0 &&
                control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
-    }
-
-    /// The subgroup size to require for compute shaders without warp-width operations, 0 for the
-    /// driver's choice. Intel (Xe2) compiles large compute shaders SIMD32 with register spills
-    /// (5.7 KB of scratch for Ocarina of Time's global memory shaders) after also compiling them
-    /// SIMD16: 16 lanes build ~2.6x faster without spills, but run slower (Hyrule Field on a
-    /// B580: ~35 instead of ~39.5 fps; f84d5909908cc5ea 0.14 instead of 0.07 ms a dispatch), so
-    /// it is off unless asked for. EDEN_NX2_INTEL_COMPUTE_SIMD16: 0 (default) off, 1 shaders with
-    /// global memory accesses, 2 every shader without warp operations.
-    u32 NarrowComputeSubgroupSize(bool uses_global_memory) const {
-        constexpr u32 narrow = 16;
-        static const int mode = [] {
-            const char* value = std::getenv("EDEN_NX2_INTEL_COMPUTE_SIMD16");
-            return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : 0;
-        }();
-        const auto& control = properties.subgroup_size_control;
-        const bool applies = mode == 2 || (mode == 1 && uses_global_memory);
-        return applies && properties.properties.vendorID == 0x8086 &&
-                       extensions.subgroup_size_control &&
-                       IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) &&
-                       control.minSubgroupSize <= narrow && narrow <= control.maxSubgroupSize
-                   ? narrow
-                   : 0;
-    }
-
-    /// Returns true if a stage may run in subgroups narrower than the guest's warp (Intel runs
-    /// fragment and vertex shaders SIMD8 or SIMD16, and those cannot be given a size).
-    bool IsWarpSizePotentiallySmallerThanGuest() const {
-        const u32 min_size = extensions.subgroup_size_control
-                                 ? properties.subgroup_size_control.minSubgroupSize
-                                 : properties.subgroup_properties.subgroupSize;
-        return min_size != 0 && min_size < GuestWarpSize;
     }
 
     /// Returns true if the device supports the provided subgroup feature.
@@ -703,6 +604,17 @@ FN_MAX_LIMIT_LIST
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return properties.push_descriptor.maxPushDescriptors;
+    }
+
+    SampledDescriptorLimits CoreSampledLimits() const {
+        return CoreSampledDescriptorLimits(properties.properties.limits);
+    }
+
+    /// Returns the sampled descriptor limits of sets from update-after-bind pools, when they are
+    /// larger than the core limits.
+    std::optional<SampledDescriptorLimits> UpdateAfterBindSampledLimits() const {
+        return UpdateAfterBindSampledDescriptorLimits(properties.properties.limits,
+                                                      properties.descriptor_indexing);
     }
 
     /// Returns true if robust buffer access is enabled on the device.
@@ -725,23 +637,9 @@ FN_MAX_LIMIT_LIST
         return extensions.buffer_device_address;
     }
 
-    /// FRITCHII_OCCL_FLAG: the buffer device address feature is enabled for the flag pipelines
-    /// alone (IsBufferDeviceAddressSupported stays false for everything else).
-    bool IsOcclFlagDeviceAddressEnabled() const {
-        return occl_flag_device_address || extensions.buffer_device_address;
-    }
-
     /// Returns true if formatless image load is supported.
     bool IsFormatlessImageLoadSupported() const {
-        // FRITCHII_FORMATLESS_13 (boot, default 0): Vulkan 1.3 allows formatless reads per format
-        // even when the global feature is false (Intel on Windows, where every typeless image
-        // read became a constant 0 and scenes rendered black). Off, as before.
-        static const bool formatless_13 = [] {
-            const char* value = std::getenv("FRITCHII_FORMATLESS_13");
-            return value != nullptr && std::atoi(value) != 0;
-        }();
-        return features.features.shaderStorageImageReadWithoutFormat ||
-               (formatless_13 && instance_version >= VK_API_VERSION_1_3);
+        return features.features.shaderStorageImageReadWithoutFormat;
     }
 
     /// Returns true if storage images of the extended formats (e.g. R16F, RG16F, R8) are supported.
@@ -809,6 +707,28 @@ FN_MAX_LIMIT_LIST
         return extensions.swapchain_mutable_format;
     }
 
+    /// Returns true if presents can carry an id and be waited for, through either version of
+    /// the extensions. A swapchain may still have neither (Swapchain::HasPresentIds).
+    bool IsPresentWaitEnabled() const {
+        return IsKhrPresentWaitEnabled() || IsKhrPresentWait2Enabled();
+    }
+
+    /// Returns true if VK_KHR_present_id and VK_KHR_present_wait are enabled.
+    bool IsKhrPresentWaitEnabled() const {
+        return present_id_features.presentId && present_wait_features.presentWait;
+    }
+
+    /// Returns true if VK_KHR_present_id2 and VK_KHR_present_wait2 are enabled. The surface still
+    /// has to support them.
+    bool IsKhrPresentWait2Enabled() const {
+        return present_id2_features.presentId2 && present_wait2_features.presentWait2;
+    }
+
+    /// Returns true if VK_EXT_hdr_metadata is enabled.
+    bool IsExtHdrMetadataEnabled() const {
+        return extensions.hdr_metadata;
+    }
+
     /// Returns true if VK_KHR_shader_float_controls is enabled.
     bool IsKhrShaderFloatControlsSupported() const {
         return extensions.shader_float_controls;
@@ -843,12 +763,6 @@ FN_MAX_LIMIT_LIST
         return cooperative_hmma_16x16x16;
     }
 
-    /// Returns true if the guest's HMMA can run through shared memory as two 8x16x16 cooperative
-    /// matrix products of 16-bit floats, with compute subgroups forced to the guest's 32 lanes.
-    bool IsCooperativeHmma8x16x16Supported() const {
-        return cooperative_hmma_8x16x16;
-    }
-
     /// Returns true if the device supports VK_KHR_shader_quad_control.
     bool IsKhrShaderQuadControlSupported() const {
         return extensions.shader_quad_control && features.shader_quad_control.shaderQuadControl;
@@ -865,32 +779,6 @@ FN_MAX_LIMIT_LIST
     }
 
     /// Returns true if the device supports task and mesh shaders (VK_EXT_mesh_shader).
-    bool IsPipelineStatisticsQuerySupported() const {
-        return features.features.pipelineStatisticsQuery;
-    }
-
-    /// Whether presents can carry ids and be waited on until shown (the host frame pacer).
-    bool IsKhrPresentWaitSupported() const {
-        return extensions.present_id && extensions.present_wait;
-    }
-
-    /// FRITCHII_PIPELINE_BINARY is on and the device has VK_KHR_pipeline_binary (with
-    /// maintenance5): Fritchii keeps the compiled pipelines itself (vk_pipeline_binary.h).
-    bool IsKhrPipelineBinaryEnabled() const {
-        return pipeline_binary_enabled;
-    }
-
-    /// The driver's VK_KHR_pipeline_binary properties (zero when it doesn't offer it).
-    const VkPhysicalDevicePipelineBinaryPropertiesKHR& PipelineBinaryProperties() const {
-        return pipeline_binary_properties;
-    }
-
-    /// EDEN_NX2_GPL=1 and the device has VK_EXT_graphics_pipeline_library with fast linking:
-    /// graphics pipelines are linked from per-stage libraries.
-    bool IsExtGraphicsPipelineLibrarySupported() const {
-        return graphics_pipeline_library_enabled;
-    }
-
     bool IsExtMeshShaderSupported() const {
         return extensions.mesh_shader && features.mesh_shader.taskShader &&
                features.mesh_shader.meshShader;
@@ -1026,6 +914,13 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_EXT_color_write_enable.
     bool IsExtColorWriteEnableSupported() const {
         return extensions.color_write_enable;
+    }
+
+    /// Returns true if colour images are created without delta colour compression (RADV before
+    /// GFX10: images in the GENERAL layout are never DCC compressed there, and every transfer
+    /// layout round trip decompresses them in full).
+    bool DisablesColorCompression() const {
+        return extensions.image_compression_control;
     }
 
     /// Returns true if the device supports VK_EXT_border_color_swizzle.
@@ -1183,12 +1078,6 @@ FN_MAX_LIMIT_LIST
                features.shader_atomic_int64.shaderSharedInt64Atomics;
     }
 
-    /// Returns true if storage buffer float32 atomic add runs in hardware (VK_EXT_shader_atomic_float).
-    bool IsFloat32AtomicAddSupported() const {
-        return extensions.shader_atomic_float &&
-               features.shader_atomic_float.shaderBufferFloat32AtomicAdd;
-    }
-
     bool IsExtConditionalRendering() const {
         return extensions.conditional_rendering;
     }
@@ -1230,6 +1119,18 @@ FN_MAX_LIMIT_LIST
         return has_renderdoc || has_nsight_graphics || has_radeon_gpu_profiler;
     }
 
+    /// Whether resources get debug names: for an attached tool, or for the device address map
+    /// (EDEN_NX2_FAULT_MAP) to name what a fault hit.
+    bool NamesObjects() const {
+        return HasDebuggingToolAttached() || address_binding_report;
+    }
+
+    /// Returns true when RADV saves a GPU hang report (RADV_DEBUG=hang), which keeps the SPIR-V of
+    /// the pipelines bound at the hang.
+    bool HasRadvHangReport() const {
+        return radv_hang_report;
+    }
+
     /// @returns True if compute pipelines can cause crashing.
     bool HasBrokenCompute() const {
         return has_broken_compute;
@@ -1238,13 +1139,6 @@ FN_MAX_LIMIT_LIST
     /// Returns true when the device does not properly support cube compatibility.
     bool HasBrokenCubeImageCompatibility() const {
         return has_broken_cube_compatibility;
-    }
-
-    /// Returns true for AMD GCN4 and older (Polaris and earlier, found by device ID or by the
-    /// lack of float16) on AMD's own drivers (CheezyEmu 132cc46c9e). Their driver uses a lot of
-    /// RAM per compile of a large Switch 2 shader, so pipelines build on fewer threads there.
-    bool IsAmdLegacyGcn() const {
-        return is_amd_legacy_gcn;
     }
 
     /// Returns true if parallel shader compiling has issues with the current driver.
@@ -1266,33 +1160,17 @@ FN_MAX_LIMIT_LIST
         return device_access_memory;
     }
 
+    /// Size of the largest device-local heap (with EDEN_NX2_VRAM_LIMIT_MIB applied). Unlike
+    /// GetDeviceLocalMemory() this is the card's memory, not a budget with a reserve taken off.
+    u64 GetDeviceLocalHeapSize() const {
+        return main_heap_size;
+    }
+
     bool CanReportMemoryUsage() const {
         return extensions.memory_budget;
     }
 
     u64 GetDeviceMemoryUsage() const;
-    /// GetDeviceMemoryUsage without EXP29's reuse: always asks the driver.
-    u64 QueryDeviceMemoryUsage() const;
-    /// The last GetDeviceMemoryUsage() answer.
-    [[nodiscard]] u64 LastDeviceMemoryUsage() const noexcept {
-        return memory_usage_value.load(std::memory_order_relaxed);
-    }
-
-    /// FRITCHII_KEEP_BLOCKS (vulkan_kept_blocks.h): the most the kept blocks may hold, from the
-    /// texture cache's budget check: half the room between the cache's critical use and the
-    /// budget, plus what the live usage leaves under the critical use.
-    void LimitKeptBlocks(u64 budget, u64 critical) const;
-    /// Gives every kept block back now (memory pressure); returns the bytes.
-    u64 ReleaseKeptBlocks() const;
-    /// Once a frame from the texture cache runtime: trims and logs the kept blocks.
-    void TickKeptBlocks() const;
-    /// Bytes the kept blocks hold (counted as free by GetDeviceMemoryUsage).
-    [[nodiscard]] u64 KeptBlockBytes() const noexcept;
-
-    /// The buffer allocator's heap budgets: VMA's at FRITCHII_MEMSTAGE_THREAD=0, as its user
-    /// published them at 1 (vulkan_device.cpp).
-    void BufferHeapBudgets(VmaBudget* budgets) const;
-    void PublishBufferHeapBudgets() const;
 
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
     /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its
@@ -1300,32 +1178,13 @@ FN_MAX_LIMIT_LIST
     /// subtracted: see GetDeviceMemorySlack().
     u64 GetDeviceMemoryBudget() const;
 
+    /// GetDeviceMemoryBudget() before the cap an integrated GPU gets: the heap's own budget.
+    u64 GetDeviceHeapMemoryBudget() const;
+
     /// Memory the allocator holds from the driver in the main device-local heap but has no
     /// allocation in (the unused part of its blocks). GetDeviceMemoryUsage() does not count it,
     /// yet the driver does: with the heap at its budget it is not available to new images.
     u64 GetDeviceMemorySlack() const;
-
-    /// FRITCHII_VRAM_REPORT: the main device-local heap's usage and budget as the driver reports
-    /// them (all of this process's memory in it, the unused part of blocks included), the budget
-    /// at most the EDEN_NX2_VRAM_LIMIT_MIB limit. False without VK_EXT_memory_budget.
-    bool MainHeapUsage(u64& usage, u64& budget) const;
-
-    /// FRITCHII_VRAM_BUDGET_MODE: MainHeapUsage plus the main heap's size (at most the
-    /// EDEN_NX2_VRAM_LIMIT_MIB limit). False without VK_EXT_memory_budget.
-    bool MainHeapNumbers(u64& size, u64& usage, u64& budget) const;
-
-    /// FRITCHII_VRAM_BUDGET_MODE=os: the adapter's LUID, to find its OS counters. False when the
-    /// driver gives none.
-    bool GetDeviceLuid(u32& low, s32& high) const;
-
-    /// The largest device-local heap, where images live.
-    size_t GetMainHeap() const {
-        return main_heap;
-    }
-
-    /// Boot: one line per memory heap (size, kind, the driver's budget and usage) and one line
-    /// with every memory type (flags and heap).
-    void LogMemoryHeaps() const;
 
     u32 GetSetsPerPool() const {
         return sets_per_pool;
@@ -1393,6 +1252,12 @@ FN_MAX_LIMIT_LIST
         return extensions.maintenance4;
     }
 
+    /// Returns true if VK_KHR_pipeline_binary is enabled: only shader cache v2 enables it, on
+    /// drivers that don't prefer their own cache.
+    bool IsKhrPipelineBinarySupported() const {
+        return extensions.pipeline_binary;
+    }
+
     /// Returns true if the device supports VK_KHR_maintenance5.
     bool IsKhrMaintenance5Supported() const {
         return extensions.maintenance5;
@@ -1436,6 +1301,9 @@ FN_MAX_LIMIT_LIST
                features.bit16_storage.storageBuffer16BitAccess;
     }
 
+    /// What the fsr4-vk FSR 4 port needs, as enabled on this device.
+    [[nodiscard]] VideoCommon::Fsr4PortDevice Fsr4PortDevice() const;
+
     [[nodiscard]] static constexpr bool CheckBrokenCompute(VkDriverId driver_id,
                                                            u32 driver_version) {
         if (driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
@@ -1456,8 +1324,21 @@ FN_MAX_LIMIT_LIST
         return properties.driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
     }
 
+    /// NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own, so the
+    /// emulator keeps none on top: a VkPipelineCache only kept every pipeline the title ever built
+    /// in host memory (title 1: a 245 MB file, ~0.35 GB of RAM for the session) and copied it whole
+    /// at each save, which stalled frames, and pipelines built no slower without it. RADV keeps
+    /// one too through Mesa's shader cache, unless it is disabled.
+    bool DriverCachesPipelines() const noexcept;
+
     bool IsMoltenVK() const noexcept {
         return properties.driver.driverID == VK_DRIVER_ID_MOLTENVK;
+    }
+
+    /// Samplers may use a nonzero mipLodBias (false on portability subset devices without it).
+    bool SupportsSamplerMipLodBias() const {
+        return !loaded_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME) ||
+               portability_subset_features.samplerMipLodBias == VK_TRUE;
     }
 
     /// The multiple vertex input binding strides must be. Metal needs 4 bytes, which MoltenVK
@@ -1516,28 +1397,13 @@ private:
 private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
-    VmaAllocator buffer_allocator{}; ///< See GetBufferAllocator; null when not split.
-    /// BufferHeapBudgets at FRITCHII_MEMSTAGE_THREAD=1: per heap block count, allocation count,
-    /// block bytes, allocation bytes, usage, budget; and the allocator's finished-operation count
-    /// they were taken at. Published and read under buffer_budgets_mutex.
-    void PublishBufferHeapBudgetsLocked() const;
-    mutable std::mutex buffer_budgets_mutex;
-    mutable std::array<std::array<u64, 6>, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
-    mutable u64 buffer_budget_ops{~u64{0}};
-    bool allocator_thread_safe{}; ///< See IsAllocatorThreadSafe.
     mutable std::mutex separate_pools_mutex;
-    /// [allocator: main, buffers][SeparatePool][memory type]
-    mutable std::array<std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2>, 2> separate_pools{};
+    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
-    vk::Queue side_queue;        ///< FRITCHII_READ_SIDE_COPY >= 2: graphics family, index 1.
-    bool has_side_queue{};
-    vk::Queue link_hog_queue;    ///< FRITCHII_SIM_LINK_HOG: a transfer family's queue.
-    bool has_link_hog_queue{};
-    u32 link_hog_family{};
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
@@ -1583,11 +1449,12 @@ private:
         VkPhysicalDeviceSubgroupProperties subgroup_properties{};
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
-        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library{};
+        VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
@@ -1600,24 +1467,16 @@ private:
     Features features{};
     Properties properties{};
 
-    /// EDEN_NX2_GPL: kept out of the extension tables so a run without the switch creates the
-    /// device exactly as before.
-    bool graphics_pipeline_library_requested{};
-    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library_features{};
-    bool graphics_pipeline_library_enabled{};
-
-    /// FRITCHII_PIPELINE_BINARY: kept out of the extension tables like EDEN_NX2_GPL, so a run
-    /// without the switch creates the device exactly as before.
-    bool pipeline_binary_offered{};
-    bool pipeline_binary_requested{};
-    VkPhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary_features{};
-    VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary_properties{};
-    bool pipeline_binary_enabled{};
-
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
-    /// FRITCHII_VA_REPORT=1: VK_EXT_device_address_binding_report (vulkan_debug_callback.h).
     VkPhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report_features{};
+    bool address_binding_report{};
+    VkPhysicalDevicePresentIdFeaturesKHR present_id_features{};
+    VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features{};
+    VkPhysicalDevicePresentId2FeaturesKHR present_id2_features{};
+    VkPhysicalDevicePresentWait2FeaturesKHR present_wait2_features{};
+    /// Enabled as the driver reports them (VK_KHR_portability_subset devices only).
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portability_subset_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features
@@ -1628,18 +1487,19 @@ private:
     bool float16_math{};                       ///< Shaders may do float16 arithmetic.
     bool cooperative_hmma_16x8x16{};           ///< HMMA runs on the guest's matrix shape.
     bool cooperative_hmma_16x16x16{};          ///< HMMA runs on 16x16x16 matrices.
-    bool cooperative_hmma_8x16x16{};           ///< HMMA runs on two 8x16x16 products.
+    bool fp8_matrix_shapes{}; ///< 16x16x16 FP16 and FP8 matrices with FP32 results (fsr4-vk).
     bool is_integrated{};                      ///< Is GPU an iGPU.
     bool is_virtual{};                         ///< Is GPU a virtual GPU.
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
     bool has_broken_compute{};                 ///< Compute shaders can cause crashes
     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
+    bool host_float16_supported{};             ///< shaderFloat16 for host-only shaders
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
-    bool is_amd_legacy_gcn{};                  ///< AMD GCN4 or older on an AMD driver.
     bool has_renderdoc{};                      ///< Has RenderDoc attached
     bool has_nsight_graphics{};                ///< Has Nsight Graphics attached
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.
+    bool radv_hang_report{};                   ///< RADV_DEBUG=hang is set.
     bool supports_d24_depth{};                 ///< Supports D24 depth buffers.
     bool must_emulate_scaled_formats{};        ///< Requires scaled vertex format emulation
     bool dynamic_state3_blending{};            ///< Has blending features of dynamic_state3.
@@ -1653,8 +1513,6 @@ private:
     bool dynamic_state3_alpha_to_one{};
     bool supports_conditional_barriers{};      ///< Allows barriers in conditional control flow.
     mutable std::atomic<size_t> custom_border_color_samplers_used{};
-    mutable std::atomic<u64> memory_usage_value{}; ///< EXP29 & 1: last GetDeviceMemoryUsage()
-    mutable std::atomic<s64> memory_usage_time{};  ///< When it was taken (steady clock ns)
     u64 device_access_memory{};                ///< Total size of device local memory in bytes.
     u32 sets_per_pool{};                       ///< Sets per Description Pool
     NvidiaArchitecture nvidia_arch{NvidiaArchitecture::Arch_AmpereOrNewer};
@@ -1662,46 +1520,18 @@ private:
     // Telemetry parameters
     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
-    bool occl_flag_device_address{}; ///< FRITCHII_OCCL_FLAG kept the BDA feature
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
+    u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;
 
     /// Nsight Aftermath GPU crash tracker
     std::unique_ptr<NsightAftermathTracker> nsight_aftermath_tracker;
-
-    /// FRITCHII_KEEP_BLOCKS: VMA's freed device-local blocks (vulkan_kept_blocks.h).
-    void CreateKeptBlocks();
-    std::unique_ptr<KeptBlocks> kept_blocks;
 };
-
-/// What the graphics card pick looks at for one Vulkan physical device.
-struct PhysicalDeviceSummary {
-    std::string name;     ///< VkPhysicalDeviceProperties::deviceName
-    VkPhysicalDeviceType type{};
-    u64 local_memory{};   ///< Largest device-local heap, in bytes
-};
-
-/// The card a game runs on, and why (for the log).
-struct PhysicalDevicePick {
-    size_t index{};
-    std::string_view reason;
-};
-
-std::vector<PhysicalDeviceSummary> SummarizePhysicalDevices(
-    const vk::InstanceDispatch& dld, std::span<const VkPhysicalDevice> devices);
-
-/// Fritchii's graphics card pick. A saved name (vulkan_device_name) is the player's choice and
-/// is found again by name when the device order changes. Without one, a saved index other than
-/// 0 is an earlier choice too; index 0 is the default, and there the discrete card with the most
-/// device-local memory wins over an integrated GPU (a 5600G + Arc B580 PC landed on the 5600G's
-/// iGPU). A saved card that is gone falls back to the same automatic pick.
-PhysicalDevicePick PickPhysicalDevice(std::span<const PhysicalDeviceSummary> devices,
-                                      u32 saved_index, std::string_view saved_name);
 
 } // namespace Vulkan

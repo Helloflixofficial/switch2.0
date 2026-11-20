@@ -2,26 +2,43 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "common/common_types.h"
 #include "common/range_sets.h"
 #include "common/range_sets.inc"
-#include "video_core/buffer_cache/gpu_written_mirror.h"
 
 namespace VideoCommon {
 
 class ReadTrapTracker {
 public:
+    /// Arms this page-aligned range. Calls `arm(address, size)` for each part that was not armed
+    /// yet, the parts the core must be notified of, and returns whether there was any.
+    template <typename Func>
+    bool Arm(DAddr address, u64 size, Func&& arm) {
+        const DAddr end = address + size;
+        DAddr next = address;
+        bool any = false;
+        ranges.ForEachInRange(address, size, [&](DAddr lower, DAddr upper) {
+            if (lower > next) {
+                arm(next, lower - next);
+                any = true;
+            }
+            next = (std::max)(next, upper);
+        });
+        if (next < end) {
+            arm(next, end - next);
+            any = true;
+        }
+        if (any) {
+            ranges.Add(address, size);
+        }
+        return any;
+    }
+
     /// Returns whether the core must be notified to arm this page-aligned range.
     bool Arm(DAddr address, u64 size) {
-        u64 armed_bytes = 0;
-        ranges.ForEachInRange(address, size, [&](DAddr lower, DAddr upper) {
-            armed_bytes += upper - lower;
-        });
-        if (armed_bytes == size) {
-            return false;
-        }
-        ranges.Add(address, size);
-        return true;
+        return Arm(address, size, [](DAddr, u64) {});
     }
 
     /// A CPU read consumes the core's trap; unmapping also forgets the range.
@@ -29,18 +46,8 @@ public:
         ranges.Subtract(address, size);
     }
 
-    /// Whether any armed byte lies in [address, address + size) (EXP86's verify).
-    [[nodiscard]] bool Intersects(DAddr address, u64 size) const {
-        return ranges.Intersects(address, size);
-    }
-
-    /// EXP86 (fable52_answer_gpuwritten 2.1): keep `bitmap` equal to "a byte armed on the page".
-    void AttachMirror(PageBitmap* bitmap, MirrorSeq* seq) {
-        ranges.Attach(bitmap, seq);
-    }
-
 private:
-    MirroredRangeSet<DAddr> ranges;
+    Common::RangeSet<DAddr> ranges;
 };
 
 } // namespace VideoCommon

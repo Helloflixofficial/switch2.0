@@ -10,7 +10,6 @@
 
 #include "common/common_types.h"
 #include <ranges>
-#include "video_core/churn_counters.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -32,7 +31,8 @@ bool DescriptorBankInfo::IsSuperset(const DescriptorBankInfo& subset) const noex
     return uniform_buffers >= subset.uniform_buffers && storage_buffers >= subset.storage_buffers &&
            texture_buffers >= subset.texture_buffers && image_buffers >= subset.image_buffers &&
            textures >= subset.textures && images >= subset.images &&
-           sampled_images >= subset.sampled_images && samplers >= subset.samplers;
+           sampled_images >= subset.sampled_images && samplers >= subset.samplers &&
+           update_after_bind == subset.update_after_bind;
 }
 
 template <typename Descriptors>
@@ -44,8 +44,8 @@ static u32 Accumulate(const Descriptors& descriptors) {
     return count;
 }
 
-static DescriptorBankInfo MakeBankInfo(std::span<const Shader::Info> infos) {
-    DescriptorBankInfo bank;
+static DescriptorBankInfo MakeBankInfo(std::span<const Shader::Info> infos, bool update_after_bind) {
+    DescriptorBankInfo bank{.update_after_bind = update_after_bind};
     for (const Shader::Info& info : infos) {
         bank.uniform_buffers += Accumulate(info.constant_buffer_descriptors);
         bank.storage_buffers += Accumulate(info.storage_buffers_descriptors);
@@ -80,11 +80,12 @@ static void AllocatePool(const Device& device, DescriptorBank& bank) {
     add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info.images);
     add(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, info.sampled_images);
     add(VK_DESCRIPTOR_TYPE_SAMPLER, info.samplers);
-    VideoCommon::Churn::Add(VideoCommon::Churn::DescriptorPools);
     bank.pools.push_back(device.GetLogical().CreateDescriptorPool({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
-        .flags = 0,
+        .flags = info.update_after_bind
+                     ? VkDescriptorPoolCreateFlags{VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT}
+                     : VkDescriptorPoolCreateFlags{},
         .maxSets = sets_per_pool,
         .poolSizeCount = static_cast<u32>(pool_cursor),
         .pPoolSizes = std::data(pool_sizes),
@@ -99,12 +100,9 @@ DescriptorAllocator::DescriptorAllocator(const Device& device_, MasterSemaphore&
 VkDescriptorSet DescriptorAllocator::Commit() {
     const size_t index = CommitResource();
     const size_t pool_idx = index / SETS_GROW_RATE;
-    const size_t sub_idx = index % SETS_GROW_RATE;
-    if (pool_idx < sets.size() && sub_idx < sets[pool_idx].size()) {
-        return sets[pool_idx][sub_idx];
-    }
-    if (!sets.empty() && !sets[0].empty()) {
-        return sets[0][0];
+    const size_t set_idx = index % SETS_GROW_RATE;
+    if (pool_idx < sets.size() && set_idx < sets[pool_idx].size()) {
+        return sets[pool_idx][set_idx];
     }
     return VK_NULL_HANDLE;
 }
@@ -122,60 +120,39 @@ vk::DescriptorSets DescriptorAllocator::AllocateDescriptors(size_t count) {
         .descriptorSetCount = static_cast<u32>(count),
         .pSetLayouts = layouts.data(),
     };
-    try {
-        vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
-        if (!new_sets.IsOutOfPoolMemory() && !new_sets.empty()) {
-            return new_sets;
-        }
-    } catch (const vk::Exception&) {}
-
+    vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
+    if (!new_sets.IsOutOfPoolMemory()) {
+        return new_sets;
+    }
     // Our current pool is out of memory. Allocate a new one and retry
+    AllocatePool(*device, *bank);
+    allocate_info.descriptorPool = *bank->pools.back();
+    new_sets = bank->pools.back().Allocate(allocate_info);
+    if (!new_sets.IsOutOfPoolMemory()) {
+        return new_sets;
+    }
+    // Try one more fallback pool allocation before failing
     try {
         AllocatePool(*device, *bank);
         allocate_info.descriptorPool = *bank->pools.back();
-        vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
-        if (!new_sets.IsOutOfPoolMemory() && !new_sets.empty()) {
+        new_sets = bank->pools.back().Allocate(allocate_info);
+        if (!new_sets.IsOutOfPoolMemory()) {
             return new_sets;
         }
-    } catch (const vk::Exception&) {}
-
-    // Fallback: If bank pool still cannot satisfy allocation, allocate an emergency pool
-    try {
-        std::array<VkDescriptorPoolSize, 8> fallback_sizes = {{
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<u32>(count * 32)},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<u32>(count * 32)},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, static_cast<u32>(count * 32)},
-            {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, static_cast<u32>(count * 32)},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<u32>(count * 32)},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, static_cast<u32>(count * 32)},
-            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, static_cast<u32>(count * 32)},
-            {VK_DESCRIPTOR_TYPE_SAMPLER, static_cast<u32>(count * 32)},
-        }};
-        bank->pools.push_back(device->GetLogical().CreateDescriptorPool({
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .maxSets = static_cast<u32>(count * 4),
-            .poolSizeCount = static_cast<u32>(fallback_sizes.size()),
-            .pPoolSizes = fallback_sizes.data(),
-        }));
-        allocate_info.descriptorPool = *bank->pools.back();
-        vk::DescriptorSets new_sets = bank->pools.back().Allocate(allocate_info);
-        return new_sets;
-    } catch (const vk::Exception&) {}
-
-    return {};
+    } catch (...) {}
+    LOG_CRITICAL(Render_Vulkan, "Descriptor pool exhausted, could not allocate {} sets", count);
+    return new_sets;
 }
 
 DescriptorPool::DescriptorPool(const Device& device_, Scheduler& scheduler) {}
 DescriptorPool::~DescriptorPool() = default;
 
-DescriptorAllocator DescriptorPool::Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, std::span<const Shader::Info> infos) {
-    return Allocator(device, scheduler, layout, MakeBankInfo(infos));
+DescriptorAllocator DescriptorPool::Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, std::span<const Shader::Info> infos, bool update_after_bind) {
+    return Allocator(device, scheduler, layout, MakeBankInfo(infos, update_after_bind));
 }
 
-DescriptorAllocator DescriptorPool::Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, const Shader::Info& info) {
-    return Allocator(device, scheduler, layout, MakeBankInfo(std::array{info}));
+DescriptorAllocator DescriptorPool::Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, const Shader::Info& info, bool update_after_bind) {
+    return Allocator(device, scheduler, layout, MakeBankInfo(std::array{info}, update_after_bind));
 }
 
 DescriptorAllocator DescriptorPool::Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, const DescriptorBankInfo& info) {

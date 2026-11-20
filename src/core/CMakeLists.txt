@@ -20,6 +20,7 @@ add_library(core STATIC
     game_settings.h
     core_timing.cpp
     core_timing.h
+    host_wait_margin.h
     cpu_manager.cpp
     cpu_manager.h
     launch_params.cpp
@@ -34,6 +35,8 @@ add_library(core STATIC
     crypto/key_manager.h
     crypto/ncz_decompressor.cpp
     crypto/ncz_decompressor.h
+    crypto/ncz_cache.cpp
+    crypto/ncz_cache.h
     crypto/partition_data_manager.cpp
     crypto/partition_data_manager.h
     crypto/xts_encryption_layer.cpp
@@ -45,10 +48,14 @@ add_library(core STATIC
     debugger/gdbstub.h
     debugger/gdbstub_arch.cpp
     debugger/gdbstub_arch.h
+    debugger/nx2_bug_bundle.cpp
+    debugger/nx2_bug_bundle.h
     debugger/nx2_debug_server.cpp
     debugger/nx2_debug_server.h
     debugger/nx2_debug_tools.cpp
     debugger/nx2_debug_tools.h
+    debugger/nx2_zip.cpp
+    debugger/nx2_zip.h
     device_memory.cpp
     device_memory.h
     device_memory_manager.h
@@ -139,8 +146,6 @@ add_library(core STATIC
     file_sys/registered_cache.h
     file_sys/nup_container.cpp
     file_sys/nup_container.h
-    file_sys/nx2_shader_extract.cpp
-    file_sys/nx2_shader_extract.h
     file_sys/nup_writer.cpp
     file_sys/nup_writer.h
     file_sys/romfs.cpp
@@ -382,8 +387,6 @@ add_library(core STATIC
     hle/kernel/svc/svc_light_ipc.cpp
     hle/kernel/svc/svc_lock.cpp
     hle/kernel/svc/svc_memory.cpp
-    hle/kernel/svc/svc_nx2_oot_poll.cpp
-    hle/kernel/svc/svc_nx2_oot_present.cpp
     hle/kernel/svc/svc_physical_memory.cpp
     hle/kernel/svc/svc_port.cpp
     hle/kernel/svc/svc_power_management.cpp
@@ -410,6 +413,8 @@ add_library(core STATIC
     hle/service/acc/async_context.cpp
     hle/service/acc/async_context.h
     hle/service/acc/errors.h
+    hle/service/acc/nextendo_id_token.cpp
+    hle/service/acc/nextendo_id_token.h
     hle/service/acc/profile_manager.cpp
     hle/service/acc/profile_manager.h
     hle/service/am/am.cpp
@@ -663,6 +668,9 @@ add_library(core STATIC
     hle/service/filesystem/fsp/fs_i_save_data_info_reader.h
     hle/service/filesystem/fsp/fs_i_storage.cpp
     hle/service/filesystem/fsp/fs_i_storage.h
+    hle/service/filesystem/fsp/fs_read_throttle.h
+    hle/service/filesystem/fsp/fs_read_trace.cpp
+    hle/service/filesystem/fsp/fs_read_trace.h
     hle/service/filesystem/fsp/fsp_ldr.cpp
     hle/service/filesystem/fsp/fsp_ldr.h
     hle/service/filesystem/fsp/fsp_pr.cpp
@@ -738,8 +746,12 @@ add_library(core STATIC
     hle/service/kernel_helpers.h
     hle/service/lbl/lbl.cpp
     hle/service/lbl/lbl.h
+    hle/service/ldn/direct_lan.cpp
+    hle/service/ldn/direct_lan.h
     hle/service/ldn/lan_discovery.cpp
     hle/service/ldn/lan_discovery.h
+    hle/service/ldn/lan_protocol.cpp
+    hle/service/ldn/lan_protocol.h
     hle/service/ldn/ldn.cpp
     hle/service/ldn/ldn.h
     hle/service/ldn/ldn_results.h
@@ -846,6 +858,8 @@ add_library(core STATIC
     hle/service/ns/ns.h
     hle/service/ns/ns_results.h
     hle/service/ns/ns_types.h
+    hle/service/ns/font_merge.cpp
+    hle/service/ns/font_merge.h
     hle/service/ns/platform_service_manager.cpp
     hle/service/ns/platform_service_manager.h
     hle/service/ns/query_service.cpp
@@ -1061,6 +1075,9 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_fence_action.h
+    hle/service/nx2_frame_interval.h
+    hle/service/nx2_movie_clock.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
     hle/service/nx2_present_pacer.h
@@ -1095,6 +1112,10 @@ add_library(core STATIC
     hle/service/sockets/bsd.h
     hle/service/sockets/nsd.cpp
     hle/service/sockets/nsd.h
+    hle/service/sockets/nextendo_redirect.cpp
+    hle/service/sockets/nextendo_redirect.h
+    hle/service/sockets/numeric_name_info.cpp
+    hle/service/sockets/numeric_name_info.h
     hle/service/sockets/sfdnsres.cpp
     hle/service/sockets/sfdnsres.h
     hle/service/sockets/sockets.cpp
@@ -1155,6 +1176,8 @@ add_library(core STATIC
     hle/service/wlan/wlan.h
     internal_network/emu_net_state.cpp
     internal_network/emu_net_state.h
+    internal_network/local_redirect.cpp
+    internal_network/local_redirect.h
     internal_network/network.cpp
     internal_network/network.h
     internal_network/network_interface.cpp
@@ -1219,6 +1242,10 @@ if (WIN32)
         target_link_libraries(core PRIVATE iw)
         message(STATUS "Linking 'core' with iw on Linux.")
     endif()
+endif()
+
+if (APPLE)
+    target_link_libraries(core PRIVATE "-framework SystemConfiguration" "-framework CoreFoundation")
 endif()
 
 if (MSVC)
@@ -1293,8 +1320,6 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
         arm/dynarmic/arm_dynarmic_64.h
         arm/dynarmic/arm_dynarmic_32.cpp
         arm/dynarmic/arm_dynarmic_32.h
-        arm/dynarmic/host_routines.cpp
-        arm/dynarmic/host_routines.h
         arm/dynarmic/dynarmic_cp15.cpp
         arm/dynarmic/dynarmic_cp15.h
         arm/dynarmic/dynarmic_exclusive_monitor.cpp
@@ -1318,13 +1343,6 @@ endif()
 if (ENABLE_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     # Fibers can migrate between host threads; keep kernel TLS lookups outside LTO callers.
     set_source_files_properties(hle/kernel/kernel.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
-elseif (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS_RELEASE MATCHES "-flto")
-    # The same for clang-cl builds that pass -flto=thin in their flags (the PGO release build), for
-    # the whole kernel: with a newer Ocarina profile, ThinLTO dropped k_thread.cpp's and
-    # k_scheduler.cpp's definitions (KThread::Run, ~KThread, GetCurrentThread, ... undefined at the
-    # link, though the archive index lists them). The kernel isn't hot for Ocarina.
-    file(GLOB lichii_kernel_sources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hle/kernel/*.cpp)
-    set_source_files_properties(${lichii_kernel_sources} PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
 create_target_directory_groups(core)

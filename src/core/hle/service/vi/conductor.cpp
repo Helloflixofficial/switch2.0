@@ -102,7 +102,7 @@ s64 Conductor::GetNextTicks() const {
     const auto& settings = Settings::values;
     auto speed_scale = 1.f;
     if (settings.use_multi_core.GetValue()) {
-        if (Settings::SpeedLimitEnabled()) {
+        if (settings.use_speed_limit.GetValue()) {
             // Scales the speed based on speed_limit setting on MC. SC is handled by
             // SpeedLimiter::DoSpeedLimiting.
             speed_scale = 100.f / Settings::SpeedLimit();
@@ -129,7 +129,7 @@ s64 Conductor::GetFramePeriodNs() const {
     f32 speed_scale = 1.f;
     bool unlocked = false;
     if (settings.use_multi_core.GetValue()) {
-        if (Settings::SpeedLimitEnabled()) {
+        if (settings.use_speed_limit.GetValue()) {
             speed_scale = 100.f / Settings::SpeedLimit();
         } else {
             unlocked = true;

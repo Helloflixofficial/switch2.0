@@ -133,9 +133,9 @@ Module::Module(Core::System& system)
     Tegra::Nx2ClearSemaphoreRegions();
     Tegra::Nx2ClearSparseRegions();
     Tegra::Nx2ClearGpuWrittenPages();
-    Tegra::Nx2SemaphoreWaiters::Get().Clear();
     Devices::g_nx2_driver = false;
     Tegra::g_nx2_ampere = false;
+    Tegra::g_nx2_guest_frame_interval_ns = 0;
     Core::g_nx2_present_count = 0;
     nx2_stub_builder = [this, &system](DeviceFD fd, const std::string& name) {
         auto device = std::make_shared<Devices::nx2_stub_device>(system, name);

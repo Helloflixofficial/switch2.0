@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -92,28 +93,23 @@ struct InputStep {
 /// nothing before start and from the end of the last step on.
 [[nodiscard]] std::optional<HID::InjectedInput> InputAt(std::span<const InputStep> steps, u64 start,
                                                        u64 now);
+/// Guest-present intervals within [begin_ns, end_ns], using only retained ring timestamps;
+/// intervals_ms lists the last recent_limit of them.
+[[nodiscard]] nlohmann::json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns,
+                                          double refresh_hz, size_t recent_limit = 120);
 
-/// Where each step ends: start plus the frames of the steps up to and including it.
-[[nodiscard]] std::vector<u64> InputStepEnds(std::span<const InputStep> steps, u64 start);
+/// A PNG and its size.
+struct Png {
+    std::vector<u8> bytes;
+    u32 width;
+    u32 height;
+};
 
-/// InputAt with the ends precomputed by InputStepEnds: a binary search, so a long replay costs
-/// little on every npad read.
-[[nodiscard]] std::optional<HID::InjectedInput> InputAt(std::span<const InputStep> steps,
-                                                       std::span<const u64> ends, u64 now);
-
-/// What input_record keeps of one present: the buttons ParseInputStep accepts and both sticks,
-/// always set, quantized to 1/1024 of full scale with |v| < 0.02 as 0.
-[[nodiscard]] HID::InjectedInput RecordedInput(HID::NpadButton buttons,
-                                               const HID::AnalogSticks& sticks);
-
-/// Appends frames presents of input, extending the last step when it holds the same input, and
-/// starting a new step whenever one would exceed the frames ParseInputStep accepts.
-void AppendRecordedInput(std::vector<InputStep>& steps, const HID::InjectedInput& input,
-                         u64 frames);
-
-/// The step as ParseInputStep reads it, sticks quantized as RecordedInput does; buttons are left
-/// out when none are held.
-[[nodiscard]] nlohmann::json InputStepJson(const InputStep& step);
+/// The next presented frame as a PNG, height pixels high at 16:9 (the debug server's screenshot).
+/// Throws std::runtime_error when no frame is presented within timeout (paused or loading), when
+/// stop is set first, or when another screenshot request is pending.
+[[nodiscard]] Png CaptureScreenshot(System& system, u32 height, std::chrono::seconds timeout,
+                                    const std::atomic<bool>& stop);
 
 /// The service when EDEN_NX2_DEBUG_SERVER is set and it can listen, otherwise null.
 [[nodiscard]] std::unique_ptr<Service> MaybeStartService(System& system, std::string title,

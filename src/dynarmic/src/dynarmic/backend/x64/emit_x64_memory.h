@@ -15,7 +15,6 @@
 #include "dynarmic/backend/x64/a32_emit_x64.h"
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
-#include "dynarmic/common/fritchii_cheap_barriers.h"
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/ir/acc_type.h"
@@ -29,6 +28,12 @@ using namespace Xbyak::util;
 constexpr size_t page_table_const_bits = 12;
 constexpr size_t page_table_const_size = 1 << page_table_const_bits;
 constexpr size_t page_table_const_mask = (1 << page_table_const_bits) - 1;
+
+/// Where cold deferred code goes: the far region when there is one.
+template<typename Ctx>
+std::vector<std::function<void()>>& ColdEmits(BlockOfCode& code, Ctx& ctx) {
+    return code.HasFarCode() ? ctx.far_deferred_emits : ctx.deferred_emits;
+}
 
 template<typename EmitContext>
 void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, Xbyak::Reg64 tmp) {
@@ -61,7 +66,7 @@ void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsi
         code.jnz(*detect_boundary, code.T_NEAR);
         code.L(*resume);
 
-        ctx.deferred_emits.emplace_back([=, &code] {
+        ColdEmits(code, ctx).emplace_back([=, &code] {
             code.L(*detect_boundary);
             code.mov(tmp, vaddr);
             code.and_(tmp, page_align_mask);
@@ -247,81 +252,50 @@ template<>
 
 template<std::size_t bitsize>
 const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
-    // FRITCHII_JIT_CHEAP_BARRIERS=1 or 2 (zortos293/Lichii #1327): an x86 load is already ordered
-    // before later loads and stores (acquire), and ordered stores are xchg, which drains the store
-    // buffer, so an ordered or exclusive load of up to 64 bits is a plain mov. The locked xadd took
-    // the cache line exclusively on every core that only read it, and faulted on pages that are not
-    // writable. The 128-bit ordered load keeps lock cmpxchg16b.
-    if (bitsize != 128 && ordered && Fritchii::PlainOrderedLoads()) {
-        ordered = false;
-    }
-    if (ordered) {
-        if constexpr (bitsize != 128) {
-            code.xor_(Xbyak::Reg32(value_idx), Xbyak::Reg32(value_idx));
-        } else {
-            code.xor_(eax, eax);
-            code.xor_(ebx, ebx);
-            code.xor_(ecx, ecx);
-            code.xor_(edx, edx);
-        }
+    // An x86 load is already ordered before later loads and stores (acquire), and ordered stores
+    // are xchg, which drains the store buffer: an ordered or exclusive load of up to 64 bits is a
+    // plain mov (from Lichii #161). A locked xadd took the cache line exclusively on every core
+    // that read it, and faulted on pages that are not writable.
+    if (ordered && bitsize == 128) {
+        code.xor_(eax, eax);
+        code.xor_(ebx, ebx);
+        code.xor_(ecx, ecx);
+        code.xor_(edx, edx);
 
         const void* fastmem_location = code.getCurr();
-        switch (bitsize) {
-        case 8:
-            code.lock();
-            code.xadd(code.byte[addr], Xbyak::Reg32(value_idx).cvt8());
-            break;
-        case 16:
-            code.lock();
-            code.xadd(word[addr], Xbyak::Reg64(value_idx).cvt16());
-            break;
-        case 32:
-            code.lock();
-            code.xadd(dword[addr], Xbyak::Reg64(value_idx).cvt32());
-            break;
-        case 64:
-            code.lock();
-            code.xadd(qword[addr], Xbyak::Reg64(value_idx));
-            break;
-        case 128:
-            code.lock();
-            code.cmpxchg16b(xword[addr]);
-            if (code.HasHostFeature(HostFeature::SSE41)) {
-                code.movq(Xbyak::Xmm(value_idx), rax);
-                code.pinsrq(Xbyak::Xmm(value_idx), rdx, 1);
-            } else {
-                code.movq(Xbyak::Xmm(value_idx), rax);
-                code.movq(xmm0, rdx);
-                code.punpcklqdq(Xbyak::Xmm(value_idx), xmm0);
-            }
-            break;
-        default:
-            UNREACHABLE();
-        }
-        return fastmem_location;
-    } else {
-        const void* fastmem_location = code.getCurr();
-        switch (bitsize) {
-        case 8:
-            code.movzx(Xbyak::Reg64(value_idx).cvt32(), code.byte[addr]);
-            break;
-        case 16:
-            code.movzx(Xbyak::Reg64(value_idx).cvt32(), word[addr]);
-            break;
-        case 32:
-            code.mov(Xbyak::Reg64(value_idx).cvt32(), dword[addr]);
-            break;
-        case 64:
-            code.mov(Xbyak::Reg64(value_idx), qword[addr]);
-            break;
-        case 128:
-            code.movups(Xbyak::Xmm(value_idx), xword[addr]);
-            break;
-        default:
-            UNREACHABLE();
+        code.lock();
+        code.cmpxchg16b(xword[addr]);
+        if (code.HasHostFeature(HostFeature::SSE41)) {
+            code.movq(Xbyak::Xmm(value_idx), rax);
+            code.pinsrq(Xbyak::Xmm(value_idx), rdx, 1);
+        } else {
+            code.movq(Xbyak::Xmm(value_idx), rax);
+            code.movq(xmm0, rdx);
+            code.punpcklqdq(Xbyak::Xmm(value_idx), xmm0);
         }
         return fastmem_location;
     }
+    const void* fastmem_location = code.getCurr();
+    switch (bitsize) {
+    case 8:
+        code.movzx(Xbyak::Reg64(value_idx).cvt32(), code.byte[addr]);
+        break;
+    case 16:
+        code.movzx(Xbyak::Reg64(value_idx).cvt32(), word[addr]);
+        break;
+    case 32:
+        code.mov(Xbyak::Reg64(value_idx).cvt32(), dword[addr]);
+        break;
+    case 64:
+        code.mov(Xbyak::Reg64(value_idx), qword[addr]);
+        break;
+    case 128:
+        code.movups(Xbyak::Xmm(value_idx), xword[addr]);
+        break;
+    default:
+        UNREACHABLE();
+    }
+    return fastmem_location;
 }
 
 template<std::size_t bitsize>
@@ -420,25 +394,6 @@ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak:
 
     code.mov(tmp, 0xDEAD'DEAD'DEAD'DEAD);
     const size_t processor_count = GetExclusiveMonitorProcessorCount(conf.global_monitor);
-    if (code.StateRefsMode() != 0) {
-        // Fritchii (FRITCHII_JIT_STATE_REFS): the same code on every core. Every reservation on
-        // the address is cleared, this core's too, as ExclusiveMonitor::CheckAndClear does: its
-        // own was just found equal to vaddr, and with exclusive_state 0 nothing reads it before
-        // the next exclusive load sets it again. Addressed from the monitor's lock (the same
-        // immediate on every core).
-        const u64 base = std::bit_cast<u64>(GetExclusiveMonitorLockPointer(conf.global_monitor));
-        code.mov(pointer, base);
-        for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {
-            const s64 disp = s64(std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, processor_index)) - base);
-            ASSERT(disp >= -0x80000000LL && disp <= 0x7FFFFFFFLL);
-            Xbyak::Label ok;
-            code.cmp(qword[pointer + s32(disp)], vaddr);
-            code.jne(ok, code.T_NEAR);
-            code.mov(qword[pointer + s32(disp)], tmp);
-            code.L(ok);
-        }
-        return;
-    }
     for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {
         if (processor_index == conf.processor_id) {
             continue;
@@ -450,6 +405,11 @@ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak:
         code.mov(qword[pointer], tmp);
         code.L(ok);
     }
+}
+
+/// A folded address displacement as an Xbyak displacement (sign-extended).
+inline size_t FoldedDisp(s32 disp) {
+    return static_cast<size_t>(static_cast<s64>(disp));
 }
 
 inline bool IsOrdered(IR::AccType acctype) {

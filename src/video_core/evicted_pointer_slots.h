@@ -47,22 +47,6 @@ public:
         return std::move(node.mapped());
     }
 
-    /// The slots kept for this pipeline, still kept: a translation that may be queued again
-    /// (asynchronous translation) reads them until its pipeline is made, then calls Forget
-    [[nodiscard]] const Slots* Find(u64 key_hash) const {
-        if (entries.empty()) {
-            return nullptr;
-        }
-        const auto it = entries.find(key_hash);
-        return it != entries.end() ? &it->second : nullptr;
-    }
-
-    void Forget(u64 key_hash) {
-        if (!entries.empty()) {
-            entries.erase(key_hash);
-        }
-    }
-
     [[nodiscard]] size_t Size() const noexcept {
         return entries.size();
     }

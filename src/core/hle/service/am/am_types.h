@@ -201,7 +201,7 @@ enum class ProgramSpecifyKind : u32 {
     RestartProgram = 2,
 };
 
-// TODO: Use enums for zindex instead of using random zindex numbers
+// Maufeat: Use enums for zindex instead of using random zindex numbers
 enum AppletZIndex : s32 {
     Background = 0,
     Foreground = 1,

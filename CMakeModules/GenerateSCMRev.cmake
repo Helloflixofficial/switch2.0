@@ -13,23 +13,8 @@ endfunction()
 
 get_timestamp(BUILD_DATE)
 
-# Fritchii (the Frizti fork, named Frizti v1..v3.5 before v4) releases are numbered v1, v2, v3.5, v4...:
-# dist/frizti_version.txt holds the number.
-set(FRIZTI_VERSION_FILE "${CMAKE_SOURCE_DIR}/dist/frizti_version.txt")
-if (EXISTS "${FRIZTI_VERSION_FILE}")
-    file(STRINGS "${FRIZTI_VERSION_FILE}" FRIZTI_VERSION LIMIT_COUNT 1 REGEX "^[0-9]+([.][0-9]+)?([.][0-9]+)?$")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FRIZTI_VERSION_FILE}")
-    # The log names the commit: reconfigure when HEAD moves (commit, checkout, merge, revert).
-    if (EXISTS "${CMAKE_SOURCE_DIR}/.git/logs/HEAD")
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/.git/logs/HEAD")
-    endif()
-endif()
-
 if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
     set(BUILD_VERSION "${LICHII_BUILD_TAG}")
-    set(IS_DEV_BUILD false)
-elseif (FRIZTI_VERSION)
-    set(BUILD_VERSION "v${FRIZTI_VERSION}")
     set(IS_DEV_BUILD false)
 elseif (DEFINED GIT_RELEASE)
     set(BUILD_VERSION "${GIT_TAG}")
@@ -47,12 +32,7 @@ else()
     set(IS_NIGHTLY_BUILD false)
 endif()
 
-if (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
-    # Logs keep the commit: "Fritchii vN | <branch>-<commit>".
-    string(SUBSTRING ${GIT_COMMIT} 0 10 GIT_DESC)
-else()
-    set(GIT_DESC ${BUILD_VERSION})
-endif()
+set(GIT_DESC ${BUILD_VERSION})
 
 # Generate cpp with Git revision from template
 
@@ -63,23 +43,8 @@ set(BUILD_AUTO_UPDATE_WEBSITE "https://github.com")
 set(BUILD_AUTO_UPDATE_REPO "zortos293/Lichii")
 if (NIGHTLY_BUILD)
     set(REPO_NAME "Lichii Nightly")
-elseif (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
-    set(REPO_NAME "Fritchii")
 else()
     set(REPO_NAME "Lichii")
-endif()
-
-# What players see (title bar, About, update messages): dist/frizti_version_label.txt when it
-# exists (v6: "v6.0 Beta", the .0 for 60 fps), else the version. The number in
-# dist/frizti_version.txt stays what updaters parse (N.0 is spelled N there).
-set(BUILD_LABEL "${BUILD_VERSION}")
-set(FRIZTI_LABEL_FILE "${CMAKE_SOURCE_DIR}/dist/frizti_version_label.txt")
-if (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$" AND EXISTS "${FRIZTI_LABEL_FILE}")
-    file(STRINGS "${FRIZTI_LABEL_FILE}" FRIZTI_LABEL LIMIT_COUNT 1)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FRIZTI_LABEL_FILE}")
-    if (FRIZTI_LABEL)
-        set(BUILD_LABEL "${FRIZTI_LABEL}")
-    endif()
 endif()
 
 set(BUILD_ID ${GIT_REFSPEC})

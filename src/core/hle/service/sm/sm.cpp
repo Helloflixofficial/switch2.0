@@ -39,6 +39,36 @@ ServiceManager::ServiceManager(Kernel::KernelCore& kernel_) : kernel{kernel_} {
     controller_interface = std::make_unique<Controller>(kernel.System());
 }
 
+bool ServiceManager::WaitForService(const std::string& name) {
+    // Only for services on host threads (audio, vi). They wait on the host, not with SleepThread:
+    // that sleep ends on the emulated timer, which stops once emulation is suspended at shutdown.
+    // A guest thread must not wait here, it would block its emulated core.
+    DEBUG_ASSERT(Kernel::GetCurrentThread(kernel).IsDummyThread());
+    std::unique_lock l{lock};
+    ++service_waiters;
+    SCOPE_EXIT {
+        --service_waiters;
+        waiters_changed.notify_all();
+    };
+    while (registered_services.find(name) == registered_services.end()) {
+        if (closing) {
+            LOG_INFO(Service_SM, "Gave up waiting for {}: the services are closing", name);
+            return false;
+        }
+        // Checks again every 100 ms, or at once when Close runs.
+        waiters_changed.wait_for(l, std::chrono::milliseconds{100});
+    }
+    return true;
+}
+
+void ServiceManager::Close() {
+    std::unique_lock l{lock};
+    closing = true;
+    // Waiters wake on the host at once, see closing and leave: no waiter outlives the manager.
+    waiters_changed.notify_all();
+    waiters_changed.wait(l, [this] { return service_waiters == 0; });
+}
+
 ServiceManager::~ServiceManager() {
     for (auto& [name, port] : service_ports) {
         port->Close(kernel);
@@ -223,7 +253,7 @@ Result SM::GetServiceImpl(Kernel::KClientSession** out_client_session, HLEReques
     }
 
     if (port_result != ResultSuccess) {
-        // Switch 2 programs also ask for services the emulator does not have at all (newer Mario Kart
+        // Switch 2 programs also ask for services Eden does not have at all (newer Mario Kart
         // World updates open chat:u, GameChat, while booting). Nothing ever registers those, so
         // waiting would hang them for good: hand out a placeholder whose commands are all
         // auto-stubbed, like their unknown commands on existing services.

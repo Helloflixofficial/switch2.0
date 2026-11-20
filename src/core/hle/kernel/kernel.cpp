@@ -6,8 +6,6 @@
 #include <array>
 #include <atomic>
 #include <bitset>
-#include <cstdint>
-#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -52,25 +50,6 @@
 #include "core/memory.h"
 
 namespace Kernel {
-
-namespace {
-
-// EDEN_NX2_FAST_TLS=1 (boot switch, off by default; ported from a build where it is on):
-// plain (constinit, trivially destructible) copies of the hot fields of ThreadLocalData.
-// ThreadLocalData holds an optional KThread, so its thread_local has a non-trivial destructor
-// and every access may go through the TLS init guard or wrapper; SVCs, scheduler locks and memory
-// traps read the current thread and the host thread ID many times each. The copies are written
-// wherever the originals are set (and the dummy-thread fallback fills the current thread one in
-// the fast path), and are only read with the switch on.
-constinit thread_local KThread* t_nx2_current_thread = nullptr;
-constinit thread_local u8 t_nx2_host_thread_id = UINT8_MAX;
-
-bool FastTlsEnabled() {
-    const char* value = std::getenv("EDEN_NX2_FAST_TLS");
-    return value != nullptr && value[0] != '\0' && value[0] != '0';
-}
-
-} // Anonymous namespace
 
 // Can only be used by a single implementation PER THREAD
 struct ThreadLocalData {
@@ -119,7 +98,6 @@ struct KernelCore::Impl {
         // Derive the initial memory layout from the emulated board
         Init::InitializeSlabResourceCounts(kernel);
         DeriveInitialMemoryLayout();
-        CommitKernelMemory();
         Init::InitializeSlabHeaps(system, *memory_layout);
 
         // Initialize kernel memory and resources.
@@ -238,12 +216,32 @@ struct KernelCore::Impl {
 
         hardware_timer->Finalize();
         hardware_timer.reset();
+
+        // Servers may run again, for the next process.
+        std::scoped_lock lk{server_lock};
+        services_closed = false;
     }
 
     void CloseServices() {
-        // Ensures all servers gracefully shutdown.
-        std::scoped_lock lk{server_lock};
-        server_managers.clear();
+        // Ensures all servers gracefully shutdown. They are stopped without the server lock held:
+        // the services on guest cores all run on core 3, so one still starting would block that
+        // core on the lock in RunServer, and the servers waited on here could never stop (a close
+        // while the boot shader cache loads starts the guest cores just then). Servers that start
+        // from now on are refused, and kept until the kernel shuts down (the call from Shutdown).
+        std::vector<std::unique_ptr<Service::ServerManager>> managers;
+        {
+            std::scoped_lock lk{server_lock};
+            services_closed = true;
+            managers = std::move(server_managers);
+            server_managers.clear();
+            for (auto& refused : refused_servers) {
+                managers.push_back(std::move(refused));
+            }
+            refused_servers.clear();
+        }
+        for (auto& manager : managers) {
+            manager.reset();
+        }
     }
 
     void InitializePhysicalCores() {
@@ -407,15 +405,11 @@ struct KernelCore::Impl {
         // The first four slots are reserved for CPU core threads
         ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
         tls_data.host_thread_id = u8(core_id);
-        t_nx2_host_thread_id = u8(core_id);
         return tls_data.host_thread_id;
     }
 
     /// Gets the host thread ID for the caller
     u32 GetHostThreadId() const {
-        if (fast_tls) {
-            return t_nx2_host_thread_id;
-        }
         return tls_data.host_thread_id;
     }
 
@@ -470,19 +464,8 @@ struct KernelCore::Impl {
         return t.current_thread ? t.current_thread : (t.current_thread = GetHostDummyThread(t, nullptr));
     }
 
-    /// EDEN_NX2_FAST_TLS: the current thread without touching ThreadLocalData once it is known.
-    KThread* GetCurrentEmuThreadFast() {
-        if (KThread* const cached = t_nx2_current_thread; cached != nullptr) [[likely]] {
-            return cached;
-        }
-        KThread* const thread = GetCurrentEmuThread(tls_data);
-        t_nx2_current_thread = thread;
-        return thread;
-    }
-
     void SetCurrentEmuThread(KThread* thread) {
         tls_data.current_thread = thread;
-        t_nx2_current_thread = thread;
     }
 
     void DeriveInitialMemoryLayout() {
@@ -779,25 +762,6 @@ struct KernelCore::Impl {
                                                          linear_region_start);
     }
 
-    /// EDEN_NX2_SEC_RESERVE (Common::HostMemory::Commit): the kernel uses its own memory (slab
-    /// heaps, page table heap, pool management) without allocating it, so everything outside the
-    /// user pools is committed before the slab heaps are set up in it. Pool pages are committed
-    /// as the memory manager hands them out.
-    void CommitKernelMemory() {
-        auto& buffer = system.DeviceMemory().buffer;
-        if (!buffer.CommitsOnUse()) {
-            return;
-        }
-        std::vector<std::pair<size_t, size_t>> pools;
-        for (const auto& region : memory_layout->GetPhysicalMemoryRegionTree()) {
-            if (region.IsDerivedFrom(KMemoryRegionType_DramUserPool)) {
-                pools.emplace_back(region.GetAddress() - Core::DramMemoryMap::Base,
-                                   region.GetSize());
-            }
-        }
-        buffer.CommitAllBut(pools);
-    }
-
     void InitializeMemoryLayout() {
         // Initialize the memory manager.
         memory_manager.emplace(system);
@@ -867,13 +831,16 @@ struct KernelCore::Impl {
 
     std::mutex server_lock;
     std::vector<std::unique_ptr<Service::ServerManager>> server_managers;
+    bool services_closed{}; ///< Set once CloseServices ran, guarded by server_lock
+    /// Servers refused while services close, kept until the kernel shuts down: their handlers stay
+    /// reachable through sm (glue's time manager calls psc's time:m, which registers services on
+    /// its server). Guarded by server_lock.
+    std::vector<std::unique_ptr<Service::ServerManager>> refused_servers;
 
     std::array<std::optional<Kernel::PhysicalCore>, Core::Hardware::NUM_CPU_CORES> cores;
 
     // Next host thead ID to use, 0-3 IDs represent core threads, >3 represent others
     std::atomic<u32> next_host_thread_id{Core::Hardware::NUM_CPU_CORES};
-    // EDEN_NX2_FAST_TLS, read when the kernel is made (after main() applied nx2_switches.txt).
-    const bool fast_tls{FastTlsEnabled()};
 
     // Kernel memory management
     std::optional<KMemoryManager> memory_manager;
@@ -1075,13 +1042,24 @@ void KernelCore::UnregisterInUseObject(KAutoObject* object) {
 void KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_manager) {
     auto* manager = server_manager.get();
 
+    bool refused = false;
     {
         std::scoped_lock lk{impl->server_lock};
-        if (impl->is_shutting_down) {
-            return;
+        if (impl->is_shutting_down || impl->services_closed) {
+            refused = true;
+        } else {
+            impl->server_managers.emplace_back(std::move(server_manager));
         }
+    }
 
-        impl->server_managers.emplace_back(std::move(server_manager));
+    if (refused) {
+        // Services are closing: this server never runs. It stays ours until SkipLoop is done, so a
+        // CloseServices running meanwhile can't destroy it under us. Then the kernel keeps it until
+        // it shuts down.
+        manager->SkipLoop();
+        std::scoped_lock lk{impl->server_lock};
+        impl->refused_servers.emplace_back(std::move(server_manager));
+        return;
     }
 
     manager->LoopProcess();
@@ -1215,9 +1193,6 @@ u32 KernelCore::GetCurrentHostThreadID() const {
 }
 
 KThread* KernelCore::GetCurrentEmuThread() const {
-    if (impl->fast_tls) {
-        return impl->GetCurrentEmuThreadFast();
-    }
     return impl->GetCurrentEmuThread(Impl::tls_data);
 }
 

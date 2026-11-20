@@ -8,6 +8,9 @@
 #include <chrono>
 #include <cstddef>
 #include <mutex>
+#include <optional>
+#include <span>
+#include <vector>
 #include "common/common_types.h"
 
 namespace Core {
@@ -21,6 +24,38 @@ struct PerfStatsResults {
     double frametime;
     /// Ratio of walltime / emulated time elapsed
     double emulation_speed;
+};
+
+struct FrameTimeSummary {
+    float min_ms;
+    float median_ms;
+    float max_ms;
+};
+
+/// Min, median and max of frame times in milliseconds; nullopt when there are none.
+std::optional<FrameTimeSummary> Summarize(std::span<const float> frame_times_ms);
+
+/// The last few seconds of present-to-present intervals, for the performance overlay.
+class FrameTimeHistory {
+public:
+    using Clock = std::chrono::steady_clock;
+    static constexpr std::size_t Capacity = 2048;
+
+    struct Entry {
+        Clock::time_point end;
+        float ms;
+    };
+
+    void Push(Clock::time_point end, float ms);
+    void Clear();
+
+    /// Entries that ended within `window` of the newest one, oldest first.
+    std::vector<Entry> Recent(Clock::duration window) const;
+
+private:
+    std::array<Entry, Capacity> entries{};
+    std::size_t next{};
+    std::size_t count{};
 };
 
 /**
@@ -51,6 +86,12 @@ public:
      */
     double GetLastFrameTimeScale() const;
 
+    /// Starts or stops recording each present's interval. Starting clears the old entries.
+    void SetFrameTimeHistoryEnabled(bool enabled);
+
+    /// Present intervals that ended within `window` of the newest one, oldest first.
+    std::vector<FrameTimeHistory::Entry> GetRecentFrameTimes(Clock::duration window) const;
+
 private:
     mutable std::mutex object_mutex;
 
@@ -61,6 +102,9 @@ private:
     /// Stores an hour of historical frametime data useful for processing and tracking performance
     /// regressions with code changes.
     std::array<double, 216000> perf_history{};
+
+    FrameTimeHistory frame_time_history;
+    bool frame_time_history_enabled{};
 
     /// Point when the cumulative counters were reset
     Clock::time_point reset_point = Clock::now();
@@ -82,18 +126,6 @@ private:
     Clock::duration previous_frame_length = Clock::duration::zero();
     /// Previously computed fps
     double previous_fps = 0;
-
-    /// Whole-run frame times for the "Run summary:" line at game stop (1% and 0.1% lows): 0.25 ms
-    /// buckets like the test scripts' histograms, the last one holds every frame of 1 s or more.
-    /// Unlike perf_history it never fills up.
-    static constexpr std::size_t RunBucketUs = 250;
-    static constexpr std::size_t RunBuckets = 4000;
-    std::array<u32, RunBuckets> run_buckets{};
-    u64 run_frames = 0;
-    Clock::duration run_time = Clock::duration::zero();
-    Clock::duration run_longest = Clock::duration::zero();
-    u64 run_over_100ms = 0;
-    void LogRunSummary() const;
 };
 
 class SpeedLimiter {

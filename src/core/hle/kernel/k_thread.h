@@ -17,7 +17,6 @@
 #include "common/intrusive_list.h"
 
 #include "common/intrusive_red_black_tree.h"
-#include "common/nx2_timeline.h"
 #include "common/scratch_buffer.h"
 #include "core/arm/arm_interface.h"
 #include "core/hle/kernel/k_affinity_mask.h"
@@ -131,18 +130,6 @@ KProcess* GetCurrentProcessPointer(KernelCore& kernel);
 KProcess& GetCurrentProcess(KernelCore& kernel);
 s32 GetCurrentCoreId(KernelCore& kernel);
 Core::Memory::Memory& GetCurrentMemory(KernelCore& kernel);
-
-/// The hang report (FRITCHII_HANG_REPORT_S): the game's threads now in a kernel wait, longest
-/// first, each with what it waits on (a mutex or condition variable key, an arbitration address,
-/// the first object of a WaitSynchronization, an IPC reply, a sleep) and for how long. Read only,
-/// lock free; HLE service threads (dummy threads) are left out.
-[[nodiscard]] std::string DescribeGuestWaits();
-/// Forgets every recorded wait (the session's threads are gone).
-void ClearGuestWaitsForHangReport();
-/// A guest thread stopped for good (a prefetch abort or breakpoint without a debugger): the hang
-/// report's "game threads in kernel waits" line names the newest, as a freeze after it is the
-/// game's crash, not a lost wake-up. `what` must be a string literal.
-void NoteGuestCrashForHangReport(u64 thread_id, u64 pc, const char* what);
 
 class KThread final : public KAutoObjectWithSlabHeapAndContainer<KThread, KWorkerTask>,
                       public Common::IntrusiveListBaseNode<KThread>,
@@ -396,24 +383,6 @@ public:
         m_schedule_count = count;
     }
 
-    // EXP98 (k_scheduler.cpp): the last yield that found nothing to do, stamped under the
-    // scheduler lock with its core and that core's change counter. Kind 1 = same core (no
-    // rotation), 2 = also no migration. Only the thread itself reads or writes these.
-    s32 GetYieldCore() const {
-        return m_yield_core;
-    }
-    u8 GetYieldKind() const {
-        return m_yield_kind;
-    }
-    u64 GetYieldGen() const {
-        return m_yield_gen;
-    }
-    void SetYieldCache(s32 core, u64 gen, u8 kind) {
-        m_yield_core = static_cast<s8>(core);
-        m_yield_gen = gen;
-        m_yield_kind = kind;
-    }
-
     void WaitCancel(KernelCore& kernel);
 
     bool IsWaitCancelled() const {
@@ -617,17 +586,8 @@ public:
         return this->GetDpc() != 0;
     }
 
-    /// Every wait sets its reason right after BeginWait, under the scheduler lock: the timeline's
-    /// "guest wait" marker (EDEN_NX2_TIMELINE_GUEST) is recorded here. `timeline_key` is what a
-    /// Synchronization wait waits on (its first object), which the thread does not keep.
-    void SetWaitReasonForDebugging(ThreadWaitReasonForDebugging reason,
-                                   const void* timeline_key = nullptr) {
+    void SetWaitReasonForDebugging(ThreadWaitReasonForDebugging reason) {
         m_wait_reason_for_debugging = reason;
-        NoteWaitForHangReport(reason, timeline_key);
-        if (Common::Nx2Timeline::Guest() && reason != ThreadWaitReasonForDebugging::None)
-            [[unlikely]] {
-            RecordWaitForTimeline(reason, timeline_key);
-        }
     }
 
     ThreadWaitReasonForDebugging GetWaitReasonForDebugging() const {
@@ -931,13 +891,6 @@ public:
     LockWithPriorityInheritanceInfo* FindHeldLock(KernelCore& kernel, KProcessAddress address_key, bool is_kernel_address_key);
 
 private:
-    /// SetWaitReasonForDebugging's "guest wait" marker: the thread, the reason and what it waits
-    /// on (see k_thread.cpp).
-    void RecordWaitForTimeline(ThreadWaitReasonForDebugging reason, const void* timeline_key) const;
-    /// DescribeGuestWaits' table: this thread's wait begins (or ends, reason None).
-    void NoteWaitForHangReport(ThreadWaitReasonForDebugging reason,
-                               const void* timeline_key) const;
-
     using LockWithPriorityInheritanceInfoList =
         Common::IntrusiveListBaseTraits<LockWithPriorityInheritanceInfo>::ListType;
 
@@ -955,9 +908,6 @@ private:
     KLightLock m_activity_pause_lock;
     SyncObjectBuffer m_sync_object_buffer{};
     s64 m_schedule_count{};
-    u64 m_yield_gen{};
-    s8 m_yield_core{-1};
-    u8 m_yield_kind{};
     s64 m_last_scheduled_tick{};
     std::vector<KThread*> m_pending_started_threads;
     std::atomic<bool> m_entered_kernel{false};
@@ -1048,12 +998,6 @@ public:
     ConditionVariableThreadTree* GetConditionVariableTree() const {
         return m_condvar_tree;
     }
-
-    /// EDEN_NX2_ARB_SPIN (KAddressArbiter): how well this thread's pre-wait spins paid off
-    /// lately (0-16), and a counter that probes again now and then while it is 0. Touched only
-    /// by the thread itself, in its own SVCs.
-    u8 m_nx2_arb_spin_credit{8};
-    u8 m_nx2_arb_spin_probe{};
 };
 
 class KScopedDisableDispatch {

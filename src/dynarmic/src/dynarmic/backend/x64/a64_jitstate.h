@@ -12,7 +12,9 @@
 
 #include "common/common_types.h"
 
+#include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/nzcv_util.h"
+#include "dynarmic/backend/x64/stack_layout.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 
 namespace Dynarmic::Backend::X64 {
@@ -24,6 +26,12 @@ class BlockOfCode;
 #    pragma warning(disable : 4324)  // Structure was padded due to alignment specifier
 #endif
 
+/// UserConfig::host_call_return: per guest call, the host return address, the location descriptor
+/// of the guest return address and the callee's shadow space.
+constexpr size_t HostCallFrameSize = 16 + ABI_SHADOW_SPACE;
+/// Guest call depth kept on the host stack; a deeper call drops all frames.
+constexpr size_t HostCallMaxDepth = 512;
+
 struct A64JitState {
     using ProgramCounterType = u64;
 
@@ -32,7 +40,7 @@ struct A64JitState {
     // Exclusive state stuff
     static constexpr u64 RESERVATION_GRANULE_MASK = 0xFFFF'FFFF'FFFF'FFF0ull;
     // Return stack buffer
-    static constexpr size_t RSB_SIZE = 8;  // MUST be a power of 2.
+    static constexpr size_t RSB_SIZE = 32;  // MUST be a power of 2. UserConfig::rsb_size picks how many are used.
     static constexpr size_t RSB_PTR_MASK = RSB_SIZE - 1;
 
     std::array<u64, 31> reg{};
@@ -55,32 +63,13 @@ struct A64JitState {
     u32 rsb_ptr = 0;
     std::array<u64, RSB_SIZE> rsb_location_descriptors;
     std::array<u64, RSB_SIZE> rsb_codeptrs;
-    /// Fritchii (FRITCHII_JIT_VERIFY): pinned registers found different from this block's copy;
-    /// must stay 0. Written by generated code only.
-    u64 pin_mismatches = 0;
-    /// Fritchii (FRITCHII_JIT_PIN_STATS): guest register reads (0..31, 31 = SP), then writes.
-    std::array<u64, 64> pin_stats{};
-    /// Fritchii (FRITCHII_JIT_VERIFY=2): while generated code runs, a pinned register's own slot
-    /// (reg[i] / sp) holds PinPoison(i) and this shadow holds the write-through copy (one per pin,
-    /// in PinConfig order). The counters below are written by generated code only; all must be 0.
-    static constexpr size_t max_pins = 8;
-    std::array<u64, max_pins> pin_shadow{};
-    u64 pin_reads_checked = 0;    ///< pinned reads compared with their shadow (proof the check runs)
-    u64 pin_read_mismatches = 0;  ///< a pinned read whose host register differed from the shadow
-    u64 pin_slot_written = 0;     ///< a checkpoint found a pinned slot not holding the poison
-    u64 pin_store_missed = 0;     ///< the reload after a call out found the poison (no store before it)
-    /// The value a pinned register's slot holds while FRITCHII_JIT_VERIFY=2 generated code runs
-    /// (index 0..30, 31 = SP): high half 0xBAD0BAD0, low half the register number.
-    static constexpr u64 PinPoison(size_t index) {
-        return 0xBAD0BAD000000000ull | u64(index);
-    }
-    /// Fritchii (FRITCHII_JIT_STATE_REFS): this core's own addresses (callbacks object, JIT,
-    /// config, TPIDR registers, exclusive monitor slots, dispatch table, indirect slots and
-    /// counters), read by generated code through the state register instead of being written
-    /// into it as immediates. Indexed by BlockOfCode's CoreRef; set once by the JIT and kept
-    /// across Reset. Last in the struct, so no other field moves. Two spare.
-    static constexpr size_t core_ref_count = 13;
-    std::array<u64, core_ref_count> core_refs{};
+
+    // UserConfig::host_call_return: the register allocator's spill slots and the check bit
+    // live here instead of on the host stack, whose depth then follows the guest's calls.
+    alignas(16) std::array<std::array<u64, 2>, SpillCount> spill{};
+    u64 host_stack_base = 0;   // rsp with no guest call frames
+    u64 host_stack_limit = 0;  // a call below this drops all frames
+    u8 check_bit = 0;
 
     u32 GetPstate() const {
         return NZCV::FromX64(cpsr_nzcv);
