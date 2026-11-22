@@ -285,6 +285,11 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            relaxed.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            relaxed.preferredFlags = 0;
+            result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        }
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         pressure_events.fetch_add(1, std::memory_order_relaxed);

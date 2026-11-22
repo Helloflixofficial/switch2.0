@@ -1297,8 +1297,13 @@ void TextureCache<P>::TickFrame() {
         if (!native_thresholds_applied && gpu_memory != nullptr && gpu_memory->UsesNativeTiling()) {
             native_thresholds_applied = true;
             const u64 device_local = runtime.GetDeviceLocalMemory();
-            critical_memory = (std::max)(critical_memory, device_local - 256_MiB);
-            expected_memory = (std::max)(expected_memory, device_local - 1280_MiB);
+            if (device_local <= 4500_MiB) {
+                critical_memory = (std::min)(device_local * 55 / 100, device_local - 900_MiB);
+                expected_memory = (std::min)(expected_memory, critical_memory - 384_MiB);
+            } else {
+                critical_memory = (std::max)(critical_memory, device_local - 256_MiB);
+                expected_memory = (std::max)(expected_memory, device_local - 1280_MiB);
+            }
             ApplyThresholdOverrides();
             native_critical_memory = critical_memory;
             native_expected_memory = expected_memory;
@@ -1416,7 +1421,8 @@ void TextureCache<P>::TickFrame() {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 retention_limit = 0;
                 if (budget > 2_GiB) {
-                    const u64 margin = (std::min)(budget / 8, 1_GiB);
+                    const u64 margin = budget <= 4500_MiB ? (std::max)(budget / 8, u64{900_MiB})
+                                                          : (std::min)(budget / 8, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
