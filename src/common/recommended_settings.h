@@ -35,8 +35,8 @@ void ForEachRecommendedSetting(Values& settings, Func&& func) {
     entry(settings.renderer_force_max_clock, false);
     entry(settings.use_disk_shader_cache, true);
     entry(settings.use_vulkan_driver_pipeline_cache, true);
-    entry(settings.native_async_draws, NativeAsyncDraws::Bounded);
-    entry(settings.native_pipeline_wait_ms, 8);
+    entry(settings.native_async_draws, NativeAsyncDraws::Skip);
+    entry(settings.native_pipeline_wait_ms, 0);
     entry(settings.precache_shaders, PrecacheShaders::Off);
     entry(settings.use_video_framerate, false);
     entry(settings.mkw_30fps, false);

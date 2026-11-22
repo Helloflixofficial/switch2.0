@@ -86,7 +86,23 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 #endif
 }
 
-#if defined(__unix__) && !defined(__APPLE__) && !defined(__ANDROID__)
+#ifdef _WIN32
+/// On NVIDIA, give the application its own persistent shader cache folder, isolated from other
+/// Windows applications, and raise the limit to 10 GiB so pipelines are never evicted.
+static void SetUpNvidiaShaderDiskCache() {
+    if (std::getenv("__GL_SHADER_DISK_CACHE_PATH") == nullptr) {
+        const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+        const auto folder = shader_dir / "nvidia";
+        std::error_code ec;
+        std::filesystem::create_directories(folder, ec);
+        if (!ec) {
+            _putenv_s("__GL_SHADER_DISK_CACHE_PATH", folder.string().c_str());
+        }
+    }
+    _putenv_s("__GL_SHADER_DISK_CACHE_SIZE", "10737418240");
+    _putenv_s("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1");
+}
+#elif defined(__unix__) && !defined(__APPLE__) && !defined(__ANDROID__)
 /// On NVIDIA, Lichii keeps no driver pipeline cache of its own (DriverCachesPipelines) and relies on
 /// the driver's disk cache, whose default limit is 1 GiB for the whole cache folder. A large Ocarina
 /// of Time cache (~20,000 pipelines) fills it, and every boot then compiles the pipelines that no
@@ -117,7 +133,7 @@ static void SetUpNvidiaShaderDiskCache() {
 #endif
 
 int main(int argc, char* argv[]) {
-#if defined(__unix__) && !defined(__APPLE__) && !defined(__ANDROID__)
+#if defined(_WIN32) || (defined(__unix__) && !defined(__APPLE__) && !defined(__ANDROID__))
     SetUpNvidiaShaderDiskCache();
 #endif
     LoadNx2Switches(argv[0]);

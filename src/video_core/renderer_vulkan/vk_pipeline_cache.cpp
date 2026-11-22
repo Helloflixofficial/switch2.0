@@ -872,12 +872,8 @@ namespace {
 constexpr u8 UsedPipelinesMaxAge = 16;
 constexpr u8 UsedPipelinesMaxAgeMoltenVK = 8;
 
-// Loading Shaders always waits for the pipelines the last two sessions used. Those of older
-// sessions go first in the background prebuild, and the load waits for them only while it has
-// run less than OlderUsedPipelinesWait: where the driver's cache misses
-// (AMD's Windows driver after a new build or driver changed the SPIR-V: ~70 ms a pipeline, an
-// Ocarina used list of 14,687 took ~18 min) the game starts and they keep building.
-constexpr u8 AwaitedUsedSessions = 2;
+// Loading Shaders waits for the pipelines all recent sessions used (UsedPipelinesMaxAge).
+constexpr u8 AwaitedUsedSessions = UsedPipelinesMaxAge;
 constexpr std::chrono::seconds OlderUsedPipelinesWait{60};
 
 u8 MaxUsedPipelineAge(const Device& device) {
